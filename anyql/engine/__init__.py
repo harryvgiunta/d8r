@@ -8,8 +8,10 @@ Three seams, no UI:
   reached over its API.
 * `expression` — payload -> ibis expression (`build`) and SQL rendering for any
   advertised dialect (`compile_sql`).
-* `execute` — running a payload (`execute`, `execute_remote`) and the rows that
-  come back in the shape a result pane renders.
+* `execute` — running a payload (`execute`, `execute_remote`, `materialize`)
+  and the rows that come back in the shape a result pane renders.
+* `tx` — the statements a payload cannot carry: transactions, savepoints,
+  and the temp tables a document keeps (`anyql.engine.tx`).
 
 Everything a caller needs is re-exported here. Two faults are the user's to
 read and nothing else: `PayloadError` for a bad payload or dialect choice, and
@@ -39,8 +41,20 @@ from .datasources import (
     type_name,
     write_mock_data,
 )
-from .execute import execute, execute_remote
+from .execute import execute, execute_remote, materialize
 from .expression import PayloadError, build, compile_sql
+from .tx import (
+    begin,
+    commit,
+    create_temp,
+    drop_temp,
+    engine_of,
+    release,
+    rollback,
+    rollback_to,
+    savepoint,
+    temp_handle,
+)
 
 __all__ = [
     "CAPABILITIES",
@@ -56,16 +70,27 @@ __all__ = [
     "PayloadError",
     "add_d1_live_source",
     "add_sqlite_source",
+    "begin",
     "build",
     "capabilities_for",
     "column_values",
+    "commit",
     "compile_sql",
+    "create_temp",
     "dialect_for",
+    "drop_temp",
+    "engine_of",
     "ensure_mock_data",
     "execute",
     "execute_remote",
     "load",
+    "materialize",
+    "release",
+    "rollback",
+    "rollback_to",
+    "savepoint",
     "schema_connection",
+    "temp_handle",
     "type_name",
     "write_mock_data",
 ]

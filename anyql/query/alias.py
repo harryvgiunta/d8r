@@ -29,16 +29,20 @@ def auto_alias(fn: str, arg: str) -> str:
 def effective_alias(item: SelectItem) -> str | None:
     """The output name a select item answers to downstream (orderBy, the result).
 
-    Its explicit alias, else the derived auto-alias for aggregates and
-    temporals, else the rank name, else `None` (a plain column keeps its own
-    name).
+    Its explicit alias, else a literal or scalar call's original text, else the
+    derived alias for aggregates, temporals and regex calls, else the rank name,
+    else `None` (a plain column keeps its own name).
     """
     if item.alias:
         return item.alias
+    if item.literal is not None or item.scalar is not None:
+        return item.raw
     if item.rank:
         return item.rank.fn
     if item.aggregate:
         return auto_alias(item.aggregate.fn, item.aggregate.arg)
     if item.temporal:
         return auto_alias(item.temporal.fn, item.temporal.arg)
+    if item.regex:
+        return auto_alias(item.regex.fn, item.regex.arg)
     return None

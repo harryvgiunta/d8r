@@ -80,13 +80,28 @@ Screen {
     layers: base overlay;
 }
 
+#document-actions {
+    height: 1;
+    background: $panel-darken-1;
+}
+
+#document-actions .pane-title {
+    width: 1fr;
+}
+
+#document-actions Button, #results-actions Button {
+    height: 1;
+    min-width: 12;
+    margin: 0 1 0 0;
+}
+
 #editor {
     height: 1fr;
     border: none;
     background: $surface;
 }
 
-#palette {
+CommandPalette {
     layer: overlay;
     position: absolute;
     /* The palette re-places itself under the caret on every keystroke; these
@@ -100,7 +115,7 @@ Screen {
     padding: 0 1;
 }
 
-#palette.open {
+CommandPalette.open {
     display: block;
 }
 
@@ -108,6 +123,12 @@ Screen {
 
 #result-tabs {
     height: 1fr;
+}
+
+#results-actions {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
 }
 
 #results-table {
@@ -204,6 +225,8 @@ AddSourceModal {
 }
 
 #add-source-buttons {
+    dock: bottom;
+    background: $surface;
     height: auto;
     padding: 1 0 0 0;
 }
@@ -231,8 +254,48 @@ SettingsScreen {
     color: $accent;
 }
 
-#settings-crumb {
+#settings-workspace {
+    height: 1fr;
+    margin-top: 1;
+}
+
+#settings-sidebar-pane {
+    width: 26;
+    max-width: 35%;
+    height: 1fr;
+    padding-right: 1;
+    border-right: solid $panel-lighten-2;
+}
+
+#settings-nav-title {
     height: 1;
+    padding-left: 1;
+    margin-bottom: 1;
+    color: $text-muted;
+}
+
+#settings-sidebar {
+    height: 1fr;
+    background: $background;
+    border: none;
+}
+
+#settings-content {
+    width: 1fr;
+    min-width: 0;
+    height: 1fr;
+    padding-left: 2;
+}
+
+#settings-heading {
+    height: auto;
+    text-style: bold;
+    color: $accent;
+}
+
+#settings-description {
+    height: auto;
+    margin: 1 0;
     color: $text-muted;
 }
 
@@ -242,8 +305,215 @@ SettingsScreen {
     border: round $panel-lighten-2;
 }
 
+#settings-menu:focus {
+    border: round $accent;
+}
+
 #settings-hint {
-    height: 1;
+    height: auto;
     padding: 1 0 0 0;
     color: $text-muted;
+}
+
+/* -- function library (\\fn) -------------------------------------------- */
+
+FnScreen {
+    align: center middle;
+    background: $background;
+}
+
+#fn {
+    width: 100%;
+    height: 100%;
+    padding: 1 2;
+}
+
+#fn-list-pane {
+    width: 42;
+    height: 1fr;
+    border-right: solid $panel-lighten-2;
+}
+
+#fn-title {
+    height: 1;
+    text-style: bold;
+    color: $accent;
+}
+
+#fn-list {
+    height: 1fr;
+    background: $surface;
+    border: round $panel-lighten-2;
+}
+
+#fn-param-guide {
+    height: 32;
+    max-height: 70%;
+    padding: 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+#fn-param-guide .guide-title {
+    color: $accent;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#fn-hint {
+    height: auto;
+    padding: 1 0 0 0;
+    color: $text-muted;
+}
+
+#fn-content {
+    width: 1fr;
+    height: 1fr;
+    padding-left: 2;
+}
+
+#fn.ai-open #fn-list-pane, #fn.ai-open #fn-editor, #fn.ai-open #fn-buttons {
+    display: none;
+}
+
+#fn.ai-open #fn-content {
+    padding: 0;
+}
+
+#fn-ai-panel {
+    width: 100%;
+    min-width: 0;
+    border: none;
+}
+
+#fn-editor {
+    width: 1fr;
+    height: 1fr;
+    padding: 0;
+}
+
+#fn-editor .field-label {
+    padding: 1 0 0 0;
+    color: $text-muted;
+}
+
+#fn-status {
+    height: 1;
+    color: $text-muted;
+}
+
+#fn-status.error {
+    color: $error;
+}
+
+#fn-body-pane {
+    height: 12;
+    layers: base overlay;
+}
+
+#fn-body {
+    height: 1fr;
+    background: $surface;
+    border: round $panel-lighten-2;
+}
+
+#fn-buttons {
+    height: auto;
+    padding: 1 0 0 0;
+}
+
+#fn-buttons Button {
+    margin: 0 1 0 0;
+}
+
+#fn-grid {
+    height: 1fr;
+    min-height: 8;
+    margin-top: 1;
+}
+
+/* -- in-layout AI assistant --------------------------------------------- */
+
+AIPanel {
+    width: 44%;
+    min-width: 38;
+    height: 1fr;
+    border-left: solid $accent;
+    padding: 0 1;
+    background: $surface;
+}
+
+AIPanel .ai-notice {
+    height: auto;
+    max-height: 3;
+    color: $text-muted;
+}
+
+AIPanel #ai-review {
+    height: 1fr;
+}
+
+AIPanel #ai-conversation {
+    height: 1fr;
+    min-height: 3;
+    margin-top: 1;
+}
+
+AIPanel #ai-transcript {
+    height: auto;
+}
+
+AIPanel #ai-status {
+    height: auto;
+    max-height: 4;
+    color: $text-muted;
+    margin: 1 0;
+}
+
+AIPanel #ai-proposal {
+    height: 35%;
+    min-height: 4;
+    border: round $accent;
+}
+
+AIPanel #ai-input {
+    height: 30%;
+    min-height: 6;
+    max-height: 12;
+    padding: 0 1;
+    border: round $panel-lighten-2;
+    margin-top: 1;
+}
+
+AIPanel .ai-buttons {
+    height: 3;
+}
+
+AIPanel Button {
+    min-width: 8;
+    width: 1fr;
+}
+
+AIPanel #ai-function-details {
+    height: auto;
+    color: $accent;
+}
+
+#fn-ai-panel #ai-status {
+    margin: 0;
+}
+
+#fn-ai-panel #ai-conversation {
+    height: auto;
+    max-height: 3;
+    margin-top: 0;
+    min-height: 1;
+}
+
+#fn-ai-panel #ai-proposal {
+    height: 10;
+}
+
+#fn-ai-panel #ai-input {
+    margin-top: 0;
 }

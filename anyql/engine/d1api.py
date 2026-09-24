@@ -7,9 +7,8 @@ payload is built against *unbound* ibis tables carrying the D1 database's real
 schemas, compiled to the SQLite dialect, and the resulting SQL text is POSTed to
 the API — which runs it on the actual D1 engine and answers with the rows.
 
-This module owns exactly two things: the HTTPS round-trip, and turning D1's
-declared-type introspection into ibis schemas. No SQL is hand-written here; the
-SQL it ships is whatever `anyql.engine.expression` compiled.
+This module owns the HTTPS round-trip and schema introspection. User queries
+come from `anyql.engine.expression`; discovery issues read-only SQLite SQL.
 
 Credentials are request-scoped and never persisted: the API token lives only in
 the in-memory source that "Add data source" builds, is used per query, and is
@@ -19,11 +18,16 @@ never returned to the UI or written anywhere.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import batched
+from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 import ibis
 
 D1_API_ROOT = "https://api.cloudflare.com/client/v4"
+# Cloudflare's SQLite runtime caps UNION/INTERSECT/EXCEPT at five terms.
+_COUNT_BATCH_SIZE = 5
 
 
 class D1Error(Exception):
@@ -60,14 +64,14 @@ def _ibis_type(declared: str, notnull: int) -> str:
 
 @dataclass
 class CloudflareD1:
-    """A live Cloudflare D1 connection: three creds + a resolved database uuid.
+    """A live Cloudflare D1 connection with an in-memory token and database uuid.
 
     `transport` lets tests inject an `httpx.MockTransport` so the real
     request/response handling is exercised with no network.
     """
 
     account_id: str
-    api_token: str
+    api_token: str = field(repr=False)
     database: str  # what the user typed: a database name or a uuid
     database_uuid: str = ""  # resolved uuid (empty until `_resolve`)
     _client: httpx.Client = field(default=None, repr=False, compare=False)
@@ -77,41 +81,45 @@ class CloudflareD1:
             if not (value or "").strip():
                 raise D1Error(f"{label} is required")
         self.account_id = self.account_id.strip()
+        self.api_token = self.api_token.strip()
         self.database = self.database.strip()
         self._client = self._client or httpx.Client(timeout=30.0)
 
     # -- transport --------------------------------------------------------
     def _post(self, endpoint: str, sql: str) -> dict:
-        url = f"{D1_API_ROOT}/accounts/{self.account_id}/d1/database/{self._db()}/{endpoint}"
+        url = f"{D1_API_ROOT}/accounts/{quote(self.account_id, safe='')}/d1/database/{self._db()}/{endpoint}"
         try:
             resp = self._client.post(url, headers=self._headers(), json={"sql": sql})
-        except httpx.HTTPError as exc:
-            raise D1Error(f"could not reach Cloudflare: {exc}") from exc
+        except httpx.HTTPError:
+            raise D1Error("Could not reach Cloudflare. Check your network connection and try again.") from None
         return self._result(resp)
 
-    def _get(self, path: str) -> list[dict]:
+    def _get(self, path: str, params: dict) -> list[dict]:
         url = f"{D1_API_ROOT}{path}"
         try:
-            resp = self._client.get(url, headers=self._headers())
-        except httpx.HTTPError as exc:
-            raise D1Error(f"could not reach Cloudflare: {exc}") from exc
-        body = self._envelope(resp)
-        result = body.get("result")
-        return result if isinstance(result, list) else []
+            resp = self._client.get(url, headers=self._headers(), params=params)
+        except httpx.HTTPError:
+            raise D1Error("Could not reach Cloudflare. Check your network connection and try again.") from None
+        result = self._envelope(resp).get("result")
+        if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
+            raise D1Error("Cloudflare D1 returned an invalid database list")
+        return result
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_token}"}
 
     def _db(self) -> str:
-        return self.database_uuid or self.database
+        return self.database_uuid or self.resolve()
 
     def _envelope(self, resp: httpx.Response) -> dict:
         try:
             body = resp.json()
         except ValueError as exc:
             raise D1Error(f"invalid response from Cloudflare (HTTP {resp.status_code})") from exc
+        if not isinstance(body, dict):
+            raise D1Error(f"invalid response from Cloudflare (HTTP {resp.status_code})")
         if resp.status_code != 200 or body.get("success") is not True:
-            raise D1Error(_api_error(body, resp.status_code))
+            raise D1Error(self._safe_error(body, resp.status_code))
         return body
 
     def _result(self, resp: httpx.Response) -> dict:
@@ -120,9 +128,14 @@ class CloudflareD1:
         if not isinstance(items, list) or not items:
             raise D1Error("Cloudflare D1 returned no result")
         item = items[0]
+        if not isinstance(item, dict):
+            raise D1Error("Cloudflare D1 returned an invalid result")
         if item.get("success") is False:
-            raise D1Error(_api_error(item, resp.status_code))
+            raise D1Error(self._safe_error(item, resp.status_code))
         return item
+
+    def _safe_error(self, node: dict, status: int) -> str:
+        return _api_error(node, status).replace(self.api_token, "[redacted]")
 
     # -- statements -------------------------------------------------------
     def query(self, sql: str) -> list[dict]:
@@ -139,25 +152,30 @@ class CloudflareD1:
 
     # -- introspection ----------------------------------------------------
     def resolve(self) -> str:
-        """Resolve a typed database name to its uuid (a pasted uuid passes through).
-
-        D1's query endpoint accepts a binding name in the URL path, but resolving
-        the uuid makes the "which database am I talking to" label truthful and
-        fails fast (404) on a typo before any SQL runs.
-        """
+        """Resolve a database name to a UUID; a binding is not an API identifier."""
         if _looks_like_uuid(self.database):
-            self.database_uuid = self.database
+            self.database_uuid = str(UUID(self.database))
             return self.database_uuid
-        rows = self._get(f"/accounts/{self.account_id}/d1/database?name={self.database}")
-        for row in rows:
-            if row.get("name") == self.database:
-                self.database_uuid = str(row.get("uuid") or "")
-                if not self.database_uuid:
-                    raise D1Error(f"database {self.database!r} has no uuid")
-                return self.database_uuid
-        # Not a registered name; assume a uuid/binding and let the first query speak.
-        self.database_uuid = self.database
-        return self.database_uuid
+        page = 1
+        while True:
+            rows = self._get(
+                f"/accounts/{quote(self.account_id, safe='')}/d1/database",
+                {"name": self.database, "page": page, "per_page": 1000},
+            )
+            for row in rows:
+                if row.get("name") == self.database:
+                    uuid = str(row.get("uuid") or "")
+                    if not _looks_like_uuid(uuid):
+                        raise D1Error("Cloudflare returned a database without a valid UUID")
+                    self.database_uuid = str(UUID(uuid))
+                    return self.database_uuid
+            if len(rows) < 1000:
+                break
+            page += 1
+        raise D1Error(
+            "No D1 database matched that name in this account. Check the Account ID "
+            "and database name, or paste the database UUID from Workers & Pages → D1."
+        )
 
     def schemas(self) -> dict[str, dict[str, str]]:
         """table → {column: ibis dtype} for every user table/view, in one query.
@@ -168,7 +186,7 @@ class CloudflareD1:
         same set D1's own console hides.
         """
         sql = (
-            "select m.name as source_table, p.cid as cid, p.name as name, p.type as type, p.notnull as notnull "
+            'select m.name as source_table, p.cid as cid, p.name as name, p.type as type, p."notnull" as "notnull" '
             "from sqlite_schema m join pragma_table_info(m.name) p "
             "where m.type in ('table', 'view') "
             "and substr(m.name, 1, 7) != 'sqlite_' and substr(m.name, 1, 4) != '_cf_' "
@@ -185,13 +203,12 @@ class CloudflareD1:
         return tables
 
     def row_counts(self, tables: list[str]) -> dict[str, int]:
-        """Row count for every table in one UNION ALL query (not one request each)."""
-        if not tables:
-            return {}
-        parts = [f"select {_lit(t)} as dataset, count(*) as n from {_quote(t)}" for t in tables]
+        """Count every table in batches within Cloudflare's five-term SQL limit."""
         counts: dict[str, int] = {}
-        for row in self.query(" union all ".join(parts)):
-            counts[str(row.get("dataset"))] = int(row.get("n") or 0)
+        for batch in batched(tables, _COUNT_BATCH_SIZE):
+            parts = (f"select {_lit(t)} as dataset, count(*) as n from {_quote(t)}" for t in batch)
+            for row in self.query(" union all ".join(parts)):
+                counts[str(row.get("dataset"))] = int(row.get("n") or 0)
         return counts
 
     def close(self) -> None:
@@ -203,8 +220,11 @@ def _lit(text: str) -> str:
 
 
 def _looks_like_uuid(text: str) -> bool:
-    cleaned = text.replace("-", "")
-    return len(cleaned) == 32 and all(c in "0123456789abcdefABCDEF" for c in cleaned)
+    try:
+        UUID(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _api_error(node: dict, status: int) -> str:

@@ -1,15 +1,27 @@
 \with recent
   \from orders
   \where status = "paid"
+\begin
 \from recent
+\join lateral (\from spend_log \where campaign_id = recent.campaign_id \order day desc \limit 2) as last_two on recent.campaign_id = last_two.campaign_id
 \select customer_id
 \select month(placed_at)
 \select sum(amount) over (partition by customer_id) as customer_total
+\select sum(amount) over (order by placed_at range between unbounded preceding and current row) as running_total
 \select rank() over (order by placed_at desc) as recency_rank
+\select regexp_extract(sku, "SKU-([0-9]+)", 1) as sku_number
+\select (\from staging \select max(amount)) as peak_amount
 \case flag = when amount > 100 then "high" else "low"
+\where customer_id in (\from customers \select customer_id \where region = "us")
 \union archived
-\union all events
+\union all (\from events \select customer_id)
 \intersect other
-\except staging
+\except (\from staging \select customer_id)
+\temp snapshot
+\drop previous
+\commit
 \order customer_total desc
 \limit 5
+\select '1' as text_one, 1 as number_one, 'x' as marker, null as missing
+\select concat(upper(sku), '-', string(customer_id)) as customer_sku
+\distinct

@@ -9,6 +9,7 @@ AST -> payload mapping alike); the contract is `docs/AST.md`, pinned by the
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -17,48 +18,67 @@ from .ast import (
     AggCall,
     CaseBranch,
     CaseClause,
+    ColumnRef,
+    DropClause,
+    FrameBounds,
     FromClause,
     GroupTerm,
     JoinClause,
+    LiteralValue,
     OrderTerm,
     QueryAST,
     QueryError,
     RankCall,
+    RegexCall,
+    ScalarCall,
     SelectItem,
     SetOpClause,
+    TempClause,
     TemporalCall,
+    TxDirective,
     WhereClause,
     WindowFrame,
     WindowOrder,
     WithClause,
 )
-from .schema import AGGREGATES, TEMPORAL, open_tables_of, schema_tables, table_by_name
+from .functions import SCALAR_FUNCTIONS
+from .schema import (
+    AGGREGATES,
+    TEMPORAL,
+    open_tables_of,
+    schema_tables,
+    table_by_name,
+    fn_by_name,
+    fns as fns_registry,
+)
 
 # A column reference: bare (`amount`) or qualified with one dot (`users.score`).
 _COL = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 _COL_RE = re.compile(rf"^{_COL}$")
 _AGG_RE = re.compile(rf"^([A-Za-z_][A-Za-z0-9_]*)\((\*|{_COL})\)$")
+_CALL_HEAD_RE = re.compile(rf"^({_IDENT})\s*\(")
 _AS_RE = re.compile(r"^(.*?)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
-_WHERE_RE = re.compile(rf"^({_COL})\s*(=|!=|>=|<=|>|<|like)\s*(.+)$", re.IGNORECASE)
-_ORDER_RE = re.compile(rf"^({_COL})(?:\s+(asc|desc))?$", re.IGNORECASE)
-# `\join <dataset> [as] <alias> on <left>[ = <right>]` — a bare identifier
-# between the dataset and `on` is the alias (`as` optional, `on` delimits).
-_JOIN_RE = re.compile(
-    r"^([A-Za-z_][A-Za-z0-9_]*)"  # 1: dataset
-    r"(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?"  # 2: optional [as] alias
-    r"\s+on\s+"
-    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"  # 3: left (identifier-qualified)
-    r"(?:\s*=\s*([A-Za-z_][A-Za-z0-9_]*))?$",  # 4: optional right
-    re.IGNORECASE,
+# `\where <column> <op> <tail>`; the tail is a value, or `( … )` for `in`/`not in`
+# and for the scalar-subquery form of a comparison.
+_WHERE_HEAD_RE = re.compile(
+    rf"^({_COL})\s+(not\s+in|in|!=|!~|>=|<=|like|~|=|>|<)\s*(.*)$", re.IGNORECASE
 )
-# `\from`/`\open <dataset> [as] <alias>` — a bare second identifier is the alias.
-_FROM_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?$", re.IGNORECASE)
+# The `\where` operators that take an inline subquery instead of a literal.
+SUBQUERY_OPS = frozenset({"in", "not in"})
+# The regex operators: POSIX-style matching, SQL's `~`/`!~`.
+REGEX_OPS = frozenset({"~", "!~"})
+_ORDER_RE = re.compile(rf"^({_COL})(?:\s+(asc|desc))?$", re.IGNORECASE)
+# The `on <col>[ = <col>]` tail of a `\join`, on its own (a lateral join's `on`
+# is optional, so the tail is matched separately from the source). Either side
+# may be identifier-qualified — the left usually is.
+_JOIN_ON_RE = re.compile(rf"^on\s+({_COL})(?:\s*=\s*({_COL}))?$", re.IGNORECASE)
 # `\union`/`\intersect`/`\except [all|distinct] <dataset>` — the modifier comes
 # first, and absent means SQL's default (`distinct`): rows are deduplicated.
-_SET_OP_RE = re.compile(r"^(?:(all|distinct)\s+)?([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
+_SET_OP_RE = re.compile(rf"^(?:(all|distinct)\s+)?({_IDENT})$", re.IGNORECASE)
 _CMD_RE = re.compile(r"^\\([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$")
 # `\case <alias> = when …` — the tail is scanned for when/then/else segments.
-_CASE_HEAD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+_CASE_HEAD_RE = re.compile(rf"^({_IDENT})\s*=\s*(.*)$")
 # `\select <expr> over ( [partition by <cols>] [order by <col> [asc|desc]] )`
 # — the frame is the LAST parenthesized tail of a select expression.
 _OVER_TAIL_RE = re.compile(r"^\s*(.*?)\s+over\s*\(\s*([^()]*)\s*\)\s*$", re.IGNORECASE)
@@ -68,10 +88,20 @@ _RANK_NAME_RE = re.compile(r"^(rank|dense_rank|row_number)$", re.IGNORECASE)
 # `over ( [partition by <cols>] [order by <col> [asc|desc]] )` — at least one.
 _PARTITION_RE = re.compile(r"^\s*partition\s+by\s+([\w.,\s]+?)\s*$", re.IGNORECASE | re.ASCII)
 _ORDER_TAIL_RE = re.compile(rf"^\s*order\s+by\s+({_COL})(?:\s+(asc|desc))?\s*$", re.IGNORECASE)
-# `\with <name>` CTE header — the name must not be empty.
-_WITH_NAME_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
+# `rows|range between <bound> and <bound>` — the window frame inside `over (...)`.
+_FRAME_HEAD_RE = re.compile(r"^(rows|range)\s+between\s+(.+?)\s+and\s+(.+)$", re.IGNORECASE | re.ASCII)
+_FRAME_BOUND_RE = re.compile(
+    r"^(?:unbounded\s+preceding|([0-9]+)\s+preceding|current\s+row|([0-9]+)\s+following|unbounded\s+following)$",
+    re.IGNORECASE | re.ASCII,
+)
+# `regexp_extract(<col>, <pattern>[, <group>])` / `regexp_replace(<col>, <pattern>, <replacement>)`.
+_REGEX_FN_RE = re.compile(r"^(regexp_extract|regexp_replace)\s*\((.*)\)$", re.IGNORECASE | re.ASCII)
+# `\with <name>` / `\temp <name>` / `\drop <name>` — a bare identifier argument.
+_WITH_NAME_RE = re.compile(rf"^({_IDENT})$", re.IGNORECASE)
 # `/^\d+$/` in TS is ASCII-only; Python's `\d` is not.
 _LIMIT_RE = re.compile(r"^[0-9]+$")
+_NUMBER_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+_STRING_RE = re.compile(r'''(?:'(?:[^']|'')*'|"(?:[^"]|"")*")''')
 _WHEN_HEAD_RE = re.compile(r"^when\b", re.IGNORECASE | re.ASCII)
 _INDENT_RE = re.compile(r"^\s", re.ASCII)
 
@@ -90,24 +120,52 @@ NEEDS_ARGS = frozenset(
         "limit",
         "case",
         "with",
+        "temp",
+        "drop",
+        "savepoint",
+        "release",
     }
 )
 
-# The set-operation commands. Each takes `[all|distinct] <dataset|cte>`.
+# The set-operation commands. Each takes `[all|distinct] <dataset|( … )>`.
 SET_OP_COMMANDS = frozenset({"union", "intersect", "except"})
+# Alternate command spellings share one clause identity in the editor.
+COMMAND_ALIASES = {"open": "from", "unique": "distinct"}
 # `\union all` on its own names nothing: a bare modifier is half a clause.
 SET_OP_MODIFIERS = frozenset({"all", "distinct"})
+
+# The transaction commands and the kind each maps to. `\rollback` and
+# `\rollback to <name>` are one command with two kinds.
+TX_COMMANDS: dict[str, str] = {
+    "begin": "begin",
+    "commit": "commit",
+    "rollback": "rollback",
+    "savepoint": "savepoint",
+    "release": "release",
+}
+# The ones that take no argument at all.
+TX_BARE = frozenset({"begin", "commit"})
 
 _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
 
 
-def split_top(text: str) -> list[str]:
-    """Split on commas at paren depth 0: `\\select a, sum(b) as x, c` → 3 segments."""
+def split_top(text: str, *, keep_empty: bool = False) -> list[str]:
+    """Split on commas at paren depth 0: `\\select a, sum(b) as x, c` → 3 segments.
+
+    Quoted strings are opaque — a comma inside one (`regexp_extract(p, "a,b")`)
+    is part of the value, not a separator.
+    """
     out: list[str] = []
     depth = 0
+    quote: str | None = None
     start = 0
     for i, ch in enumerate(text):
-        if ch == "(":
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
@@ -115,8 +173,8 @@ def split_top(text: str) -> list[str]:
             out.append(text[start:i].strip())
             start = i + 1
     out.append(text[start:].strip())
-    # Empty segments (leading/trailing commas) are simply not expressions.
-    return [s for s in out if s]
+    # Select lists tolerate empty segments; function arguments must preserve them.
+    return out if keep_empty else [s for s in out if s]
 
 
 def unquote(raw: str) -> str:
@@ -126,6 +184,22 @@ def unquote(raw: str) -> str:
         if len(text) >= 2 and text.startswith(quote) and text.endswith(quote):
             return text[1:-1]
     return text
+
+
+def parse_literal(text: str) -> LiteralValue | None:
+    """Read a scalar constant without coercing quoted numeric text."""
+    if _STRING_RE.fullmatch(text):
+        quote = text[0]
+        return LiteralValue(text[1:-1].replace(quote * 2, quote))
+    if _NUMBER_RE.fullmatch(text):
+        if not any(char in text.lower() for char in ".e"):
+            return LiteralValue(int(text))
+        value = float(text)
+        return LiteralValue(value) if math.isfinite(value) else None
+    keyword = text.lower()
+    if keyword in {"true", "false", "null"}:
+        return LiteralValue(None if keyword == "null" else keyword == "true")
+    return None
 
 
 def keyword_positions(text: str, keyword: str) -> list[int]:
@@ -158,6 +232,392 @@ def keyword_positions(text: str, keyword: str) -> list[int]:
                     continue
         i += 1
     return out
+
+
+def take_paren(text: str) -> tuple[str, str] | None:
+    """Split `( … ) rest` into the balanced body and what follows it.
+
+    Quote- and depth-aware, so a nested `( … )` or a quoted paren stays inside
+    the body. `None` when the text does not start a balanced group — a
+    half-typed line is normal, not an error to report.
+    """
+    s = text.strip()
+    if not s.startswith("("):
+        return None
+    depth = 0
+    quote: str | None = None
+    for i, ch in enumerate(s):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return s[1:i], s[i + 1 :].strip()
+    return None
+
+
+def parse_scalar_call(text: str) -> ScalarCall:
+    """Read only catalog calls; nesting never admits aggregates or subqueries."""
+    head = _CALL_HEAD_RE.match(text)
+    if head is None:
+        raise ValueError(f'cannot parse scalar expression "{text}"')
+    fn = head.group(1).lower()
+    signature = SCALAR_FUNCTIONS.get(fn)
+    if signature is None:
+        raise ValueError(f'unknown scalar function "{head.group(1)}"')
+    paren = take_paren(text[head.end() - 1 :])
+    if paren is None or paren[1]:
+        raise ValueError(f'{fn}() needs balanced parentheses with no trailing expression')
+    parts = split_top(paren[0], keep_empty=True) if paren[0].strip() else []
+    if any(not part for part in parts):
+        raise ValueError(f'{fn}() cannot contain an empty argument')
+    if not signature.accepts(len(parts)):
+        maximum = len(signature.parameters)
+        count = (
+            f"at least {signature.minimum}"
+            if signature.variadic
+            else str(maximum) if signature.minimum == maximum
+            else f"{signature.minimum} to {maximum}"
+        )
+        raise ValueError(f'{fn}() takes {count} argument(s) — got {len(parts)}')
+    args: list[ColumnRef | LiteralValue | ScalarCall] = []
+    for part in parts:
+        literal = parse_literal(part)
+        if literal is not None:
+            args.append(literal)
+        elif _COL_RE.fullmatch(part):
+            args.append(ColumnRef(part))
+        else:
+            args.append(parse_scalar_call(part))
+    return ScalarCall(fn=fn, args=args)
+
+
+def split_commands(body: str) -> list[str]:
+    """An inline `( … )` subquery body as command lines.
+
+    The body is the same `\\command` grammar on one document line, so it is cut
+    at every `\\` that sits at depth 0 outside quotes — a `\\` inside a nested
+    group or a quoted value belongs to that value. Each piece keeps its `\\`,
+    so the identical `parse_slice` reads it.
+    """
+    out: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = -1
+    for i, ch in enumerate(body):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            continue
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            continue
+        if ch == "\\" and depth == 0:
+            if start >= 0:
+                out.append(body[start:i].strip())
+            start = i
+    if start >= 0:
+        out.append(body[start:].strip())
+    return [s for s in out if s]
+
+
+def parse_subquery(body: str, line: int, opts: ParseOpts, outer: list[str] | None = None) -> QueryAST:
+    """Parse an inline `( … )` body as a query of its own, on the clause's line.
+
+    The same grammar, the same validator, the same errors — an inline subquery
+    is a query, not a second language. Every node reports the document line the
+    clause sits on (`fixed_line`), so a mistake inside it points at real text.
+    `outer` names identifiers the body may read from outside itself, which is
+    what makes a lateral body lateral; it is *this* body's, and not inherited by
+    a subquery nested inside it, because the engine correlates through the
+    immediate body's `\\where` alone.
+    """
+    commands = split_commands(body)
+    if not commands:
+        empty = QueryAST()
+        if line != opts.typing_line:
+            empty.errors.append(QueryError(line=line, message="a subquery body cannot be empty"))
+        return empty
+    return parse_slice(
+        commands,
+        ParseOpts(
+            fixed_line=line,
+            typing_line=opts.typing_line,
+            visible_ctes=visible_ctes_of(opts, ()),
+            top=False,
+            outer_idents=list(outer or []),
+        ),
+    )
+
+
+def absorb(ast: QueryAST, child: QueryAST) -> None:
+    """A nested query's errors belong to the document; the nested AST keeps none."""
+    ast.errors.extend(child.errors)
+    child.errors = []
+
+
+def visible_ctes_of(opts: ParseOpts, own: tuple[str, ...]) -> list[str]:
+    """The CTE names a slice may reference: the enclosing ones, then its own."""
+    return [*opts.visible_ctes, *own]
+
+
+def parse_frame_bounds(text: str) -> FrameBounds | None:
+    """`rows|range between <bound> and <bound>` → its two canonical bounds."""
+    head = _FRAME_HEAD_RE.match(text.strip())
+    if head is None:
+        return None
+    bounds: list[str] = []
+    for raw in (head.group(2), head.group(3)):
+        bound = raw.strip().lower()
+        if _FRAME_BOUND_RE.match(bound) is None:
+            return None
+        # `2  preceding` -> `2 preceding`: one spelling per bound in the AST.
+        bounds.append(re.sub(r"\s+", " ", bound))
+    return FrameBounds(kind=head.group(1).lower(), start=bounds[0], end=bounds[1])
+
+
+def parse_source(text: str) -> tuple[str, str | None, str | None] | None:
+    """`<dataset> [as] <alias>` or `( <commands> ) [as] <alias>` → its three parts.
+
+    Returns `(dataset, body_text, alias)`: `dataset` is empty when the source is
+    an inline subquery, whose `body_text` is then set. `None` when the text does
+    not parse — for a `\\join` the caller separates the `on …` tail first.
+    """
+    rest = text.strip()
+    dataset, body = "", None
+    if rest.startswith("("):
+        paren = take_paren(rest)
+        if paren is None:
+            return None
+        body, rest = paren[0], paren[1]
+    else:
+        m = re.match(rf"^({_IDENT})", rest)
+        if m is None:
+            return None
+        dataset, rest = m.group(1), rest[m.end() :].strip()
+    alias: str | None = None
+    am = re.match(rf"^(?:as\s+)?({_IDENT})$", rest, re.IGNORECASE)
+    if am is not None:
+        alias = am.group(1)
+        rest = ""
+    if rest.strip():
+        return None
+    return dataset, body, alias
+
+
+def is_identifier(text: str) -> bool:
+    """Whether `text` is exactly one bare identifier (a function or param name)."""
+    return re.fullmatch(_IDENT, text) is not None
+
+
+def param_spans(text: str) -> list[tuple[int, int, str]]:
+    """`@name` parameter tokens outside quotes, with their spans.
+
+    Quote-aware like the rest of the scanner family, so `email@host` inside a
+    quoted value is never a parameter — and a token glued to a word (`a@b`) is
+    skipped for the same reason. Inside parens it *is* a token (`limit(@n)`).
+    """
+    out: list[tuple[int, int, str]] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            continue
+        if ch == "@" and (i == 0 or not re.match(r"[A-Za-z0-9_]", text[i - 1])):
+            m = re.match(rf"@({_IDENT})", text[i:])
+            if m is not None:
+                out.append((i, i + m.end(), m.group(1)))
+                i += m.end()
+                continue
+        i += 1
+    return out
+
+
+def substitute_params(body: str, args: dict[str, str]) -> str | None:
+    """Replace every `@name` token in a body with its argument text verbatim.
+
+    `None` when the body names a parameter with no argument. The substitution
+    is textual on purpose: the engine sees literals, and ibis never learns a
+    function existed.
+    """
+    spans = param_spans(body)
+    if not spans:
+        return body
+    out: list[str] = []
+    cursor = 0
+    for start, end, name in spans:
+        raw = args.get(name)
+        if raw is None:
+            return None
+        out.append(body[cursor:start])
+        out.append(raw)
+        cursor = end
+    out.append(body[cursor:])
+    return "".join(out)
+
+
+def parse_fn_source(
+    rest: str,
+    line: int,
+    opts: ParseOpts,
+    outer: list[str] | None = None,
+    allow_alias: bool = True,
+) -> tuple[str, QueryAST | None, str, str] | None:
+    r"""`<fn>(<args>) [as] <alias>` at a source position → the call's expansion.
+
+    `None` means the text is not a call this registry can answer (the site
+    parses it as a plain source, exactly as before an entry exists). Otherwise
+    `(name, body, alias, message)`: a non-empty `message` is why the call was
+    refused; `body` is the substituted body parsed as a relation — the same
+    machinery as an inline subquery, on the call's line — and `alias` defaults
+    to the function name, so the body's columns qualify through it the way a
+    dataset's would.
+
+    An argument is a value or an inline `( \from … )` subquery, never a
+    command: text containing `\` is refused rather than spliced in.
+    """
+    head = re.match(rf"^({_IDENT})\s*\(", rest)
+    if head is None:
+        return None
+    name = head.group(1)
+    fn = fn_by_name(name)
+    known = fns_registry()
+    if fn is None:
+        if not known:
+            # Pure-parse regime: no registry loaded means no functions to find;
+            # the site's own dataset-name error is the honest one here.
+            return None
+        return (name, None, "", f'unknown function "{name}" — defined: ' + ", ".join(t.name for t in known))
+    paren = take_paren(rest[head.end() - 1 :])
+    if paren is None:
+        return (name, None, "", f'a function call needs a closing ")" — {name}(...)')
+    args = split_top(paren[0])
+    if len(args) != len(fn.params):
+        if not fn.params:
+            takes = "takes no arguments"
+        else:
+            plural = "s" if len(fn.params) != 1 else ""
+            takes = f"takes {len(fn.params)} argument{plural}"
+        got = f"got {len(args)}" if args else "got none"
+        return (name, None, "", f"{name}() {takes} — {got}")
+    if any("\\" in a for a in args):
+        return (
+            name,
+            None,
+            "",
+            f"an argument to {name}() cannot contain \\ — write a value or an inline ( \\from … ) subquery",
+        )
+    alias = name
+    if paren[1]:
+        am = re.match(rf"^(?:as\s+)?({_IDENT})$", paren[1], re.IGNORECASE)
+        if am is None:
+            return (name, None, "", f'cannot parse "{rest}"')
+        if not allow_alias:
+            return (name, None, "", "a set-operation source cannot be aliased")
+        alias = am.group(1)
+    mapping = dict(zip(fn.params, args))
+    text = substitute_params(fn.body, mapping)
+    if text is None:
+        missing = next(s[2] for s in param_spans(fn.body) if s[2] not in mapping)
+        return (
+            name,
+            None,
+            "",
+            f'function "{name}" uses unknown parameter "@{missing}"',
+        )
+    commands = split_commands(text)
+    if not commands:
+        return (name, None, "", f'function "{name}" has no query body')
+    body_ast = parse_slice(
+        commands,
+        ParseOpts(
+            fixed_line=line,
+            typing_line=opts.typing_line,
+            # A saved body is its own document: it references datasets, never
+            # the caller's CTEs.
+            visible_ctes=[],
+            top=False,
+            outer_idents=list(outer or []),
+        ),
+    )
+    return (name, body_ast, alias, "")
+
+
+def parse_body(text: str, params: list[str]) -> list[str]:
+    """Why a FN body text is not a usable relation, as error messages.
+
+    The editor runs this on save so a function that would only fail at a call
+    site is refused where it is written. The body is parsed exactly as a call
+    expands it (same grammar, same `top=False` regime that refuses `\\temp`,
+    `\\drop`, transactions, and nested CTEs), against the *live* schema so its
+    own column references are checked. Every `@token` is blanked first so the
+    grammar parses, and one that `params` does not declare is named — a call
+    could never bind it. An empty list means the body is a well-formed relation
+    whose every parameter is declared.
+    """
+    messages: list[str] = []
+    used = [name for _, _, name in param_spans(text)]
+    for name in dict.fromkeys(used):
+        if name not in params:
+            messages.append(f'unknown parameter "@{name}" — declare it or remove it')
+    probe = substitute_params(text, {name: "0" for name in used})
+    assert probe is not None  # every @token above is bound to itself
+    commands = split_commands(probe)
+    if not commands:
+        messages.append("a function body needs a query (a `\\from` line)")
+        return messages
+    ast = parse_slice(commands, ParseOpts(fixed_line=1, typing_line=0, visible_ctes=[], top=False))
+    if ast.from_ is None:
+        messages.append("a function body needs a query (a `\\from` line)")
+    messages.extend(error.message for error in ast.errors)
+    return messages
+
+
+def parse_regex_call(fn: str, args: list[str]) -> RegexCall | None:
+    """`regexp_extract(<col>, <pattern>[, <group>])` / `regexp_replace(<col>, <pattern>, <replacement>)`.
+
+    `None` when the arguments do not fit the function — the caller names the shape.
+    """
+    if not args or not _COL_RE.match(args[0]):
+        return None
+    column = args[0]
+    if fn == "regexp_extract":
+        if len(args) not in (2, 3) or not unquote(args[1]):
+            return None
+        group: int | None = None
+        if len(args) == 3:
+            if not _LIMIT_RE.match(args[2].strip()):
+                return None
+            group = int(args[2])
+        return RegexCall(fn="regexp_extract", arg=column, pattern=unquote(args[1]), group=group)
+    if len(args) != 3 or not unquote(args[1]):
+        return None
+    return RegexCall(
+        fn="regexp_replace",
+        arg=column,
+        pattern=unquote(args[1]),
+        replacement=unquote(args[2]),
+    )
 
 
 def parse_case_arg(rest: str) -> CaseClause | None:
@@ -199,13 +659,18 @@ def parse_case_arg(rest: str) -> CaseClause | None:
         then_val = seg[then_positions[0] + 4 :].strip()
         if not then_val:
             return None
-        cond_match = _WHERE_RE.match(cond)
+        cond_match = _WHERE_HEAD_RE.match(cond)
         if cond_match is None:
+            return None
+        # A `\case` branch carries a literal comparison (regex operators
+        # included); the subquery operators have no operand there.
+        op = re.sub(r"\s+", " ", cond_match.group(2).lower())
+        if op in SUBQUERY_OPS or not cond_match.group(3).strip():
             return None
         whens.append(
             CaseBranch(
                 column=cond_match.group(1),
-                op=cond_match.group(2).lower(),
+                op=op,
                 value=unquote(cond_match.group(3)),
                 then=unquote(then_val),
             )
@@ -216,9 +681,10 @@ def parse_case_arg(rest: str) -> CaseClause | None:
 
 
 def parse_over_frame(tail_raw: str) -> WindowFrame | None:
-    """Parse the inside of `over ( … )`: `[partition by <col>…] [order by <col> [asc|desc]]`.
+    """Parse the inside of `over ( … )`.
 
-    At least one of the two. Returns `None` when it doesn't parse.
+    `[partition by <col>…] [order by <col> [asc|desc]] [rows|range between <bound> and <bound>]`
+    — at least one of the first two. Returns `None` when it doesn't parse.
     """
     tail = tail_raw.strip()
     if not tail:
@@ -226,7 +692,22 @@ def parse_over_frame(tail_raw: str) -> WindowFrame | None:
 
     partition_by: list[str] = []
     order: WindowOrder | None = None
+    bounds: FrameBounds | None = None
     work = tail
+
+    frame_at = None
+    for keyword in ("rows", "range"):
+        found = keyword_positions(work, keyword)
+        if found:
+            frame_at = (found[0], keyword)
+            break
+    if frame_at is not None:
+        at, _ = frame_at
+        # A frame follows the ordering, so anything before it is partition/order.
+        bounds = parse_frame_bounds(work[at:])
+        if bounds is None:
+            return None
+        work = work[:at].strip()
 
     order_at = keyword_positions(work, "order")
     order_text = ""
@@ -256,7 +737,26 @@ def parse_over_frame(tail_raw: str) -> WindowFrame | None:
 
     if not partition_by and order is None:
         return None
-    return WindowFrame(partition_by=partition_by, order=order)
+    # A frame counts rows or values *relative to the ordering*: without one it
+    # would bound nothing, and every engine refuses it — so this parser does too.
+    if bounds is not None and order is None:
+        return None
+    return WindowFrame(partition_by=partition_by, order=order, frame=bounds)
+
+
+def over_frame_error(text: str) -> str:
+    """Why `over ( … )` did not parse.
+
+    A spelled frame is a shape of its own — an ordering to count from and two
+    bounds — so it gets its own message instead of the partition/order one.
+    """
+    if keyword_positions(text, "rows") or keyword_positions(text, "range"):
+        return (
+            "over (...) frame needs order by <col> [asc|desc] and bounds of "
+            "`<n> preceding`, `current row`, or `<n> following` "
+            "(either end may be `unbounded preceding` / `unbounded following`)"
+        )
+    return "over (...) needs partition by <cols> and/or order by <col> [asc|desc]"
 
 
 def block_extent(lines: list[str], header: int) -> int:
@@ -309,15 +809,15 @@ def block_bounds(lines: list[str], line: int) -> tuple[int, int]:
 def clause_line(doc: str, line: int, command: str) -> int | None:
     """The document line carrying that clause in the block that owns `line`.
 
-    `\\from` and `\\open` are the same clause, and a repeated clause answers
-    with its LAST line — the one a new item extends. `None` means this block
-    does not carry the clause yet. The palette's clause commands use this so
+    `\\from`/`\\open` and `\\distinct`/`\\unique` share clause identities;
+    a repeated clause answers with its LAST line — the one a new item extends.
+    `None` means this block has no such clause. The palette uses this so
     that asking for a clause never writes a second one beside the first.
     """
     lines = doc.split("\n")
     line = max(1, min(line, len(lines)))
     start, end = block_bounds(lines, line)
-    wanted = "from" if command.lower() == "open" else command.lower()
+    wanted = COMMAND_ALIASES.get(command.lower(), command.lower())
     found: int | None = None
     index = start
     while index < end:
@@ -332,7 +832,7 @@ def clause_line(doc: str, line: int, command: str) -> int | None:
                 found = index + 1
             index = block_extent(lines, index)
             continue
-        if ("from" if name == "open" else name) == wanted:
+        if COMMAND_ALIASES.get(name, name) == wanted:
             found = index + 1
         index += 1
     return found
@@ -346,8 +846,15 @@ class ParseOpts:
     typing_line: int = 0
     # CTE names visible to this slice (defined before it, in document order).
     visible_ctes: list[str] = field(default_factory=list)
-    # False inside a `\with` body: nested CTEs and a nested `\with` are errors.
+    # False inside a `\with` body or an inline subquery: nested CTEs, a nested
+    # `\with`, and the statement-level commands are errors there.
     top: bool = True
+    # Set for an inline `( … )` subquery: every node reports this document line,
+    # because the whole subquery sits on the clause's one line.
+    fixed_line: int | None = None
+    # A lateral body's visible outer identifiers: the tables accumulated to its
+    # left, which only a lateral body may read.
+    outer_idents: list[str] = field(default_factory=list)
 
 
 def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
@@ -365,7 +872,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
     # must still report its own errors.
     i = 0
     while i < len(lines):
-        line = i + 1 + opts.offset
+        line = opts.fixed_line if opts.fixed_line is not None else i + 1 + opts.offset
         text = lines[i].strip()
         if not text:
             i += 1
@@ -436,79 +943,263 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             continue
 
         if cmd in ("from", "open"):
-            f = _FROM_RE.match(rest)
-            if f is None:
+            # A registered call `\from <fn>(<args>)` expands to its body with
+            # the arguments substituted for `@params` — before anything else
+            # reads the text, so the AST, payload, and engine see a body.
+            fn = parse_fn_source(rest, line, opts)
+            if fn is not None:
+                name, fn_body, alias, message = fn
+                if message:
+                    err(message)
+                    i += 1
+                    continue
+                absorb(ast, fn_body)
+                ast.from_ = FromClause(line=line, table="", alias=alias, body=fn_body)
+                i += 1
+                continue
+            src = parse_source(rest)
+            if src is None:
                 err(f"\\{cmd} expects a dataset name")
                 i += 1
                 continue
-            ast.from_ = FromClause(line=line, table=f.group(1), alias=f.group(2) or None)
+            table, body_text, alias = src
+            body: QueryAST | None = None
+            if body_text is not None:
+                if alias is None:
+                    err("a subquery source needs an alias — write ( … ) as <name>")
+                    i += 1
+                    continue
+                body = parse_subquery(body_text, line, opts)
+                absorb(ast, body)
+            ast.from_ = FromClause(line=line, table=table, alias=alias, body=body)
             # Only complain about unknown tables once the schema has loaded —
             # while the backend is offline the registry is legitimately empty.
             # CTE names defined earlier in the document count as known tables.
             if (
-                schema_tables()
-                and not table_by_name(f.group(1))
-                and f.group(1) not in visible_ctes()
+                body is None
+                and schema_tables()
+                and not table_by_name(table)
+                and table not in visible_ctes()
             ):
                 err(
-                    f'unknown table "{f.group(1)}" — loaded datasets: '
+                    f'unknown table "{table}" — loaded datasets: '
                     + ", ".join(t.name for t in schema_tables())
                 )
             i += 1
             continue
 
         if cmd == "join":
-            jm = _JOIN_RE.match(rest)
-            if jm is None:
+            # `\join lateral ( … ) …` is the one source shape whose body may read
+            # the left side; the `on …` tail is cut first so a dataset name, a
+            # subquery body, and `on` cannot be mistaken for one another.
+            lateral_match = re.match(r"^lateral\s+", rest, re.IGNORECASE)
+            lateral = lateral_match is not None
+            clause = rest[lateral_match.end() :].strip() if lateral_match else rest
+            on_at = keyword_positions(clause, "on")
+            source_text, on_text = clause, ""
+            if on_at:
+                source_text, on_text = clause[: on_at[-1]].strip(), clause[on_at[-1] :].strip()
+            # A registered call at the source position expands like a lateral
+            # subquery whose body is the function's, arguments substituted.
+            outer = [
+                t.identifier for t in open_tables_of(ast.from_, ast.joins)
+            ] if lateral else None
+            fn = parse_fn_source(source_text, line, opts, outer)
+            if fn is not None:
+                name, fn_body, alias, message = fn
+                if not message and lateral:
+                    # Same ambiguity rule as a hand-written lateral body.
+                    clash = next(
+                        (
+                            t.identifier
+                            for t in open_tables_of(fn_body.from_, fn_body.joins)
+                            if t.identifier in (outer or [])
+                        ),
+                        "",
+                    )
+                    if clash:
+                        message = (
+                            f'duplicate table identifier "{clash}" — '
+                            "a lateral body cannot reuse a name from its left"
+                        )
+                if message:
+                    err(message)
+                    i += 1
+                    continue
+                absorb(ast, fn_body)
+                fn_left = fn_right = ""
+                if on_text:
+                    fn_on = _JOIN_ON_RE.match(on_text)
+                    if fn_on is None:
+                        err(
+                            "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
+                            if lateral
+                            else "\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"
+                        )
+                        i += 1
+                        continue
+                    fn_left = fn_on.group(1)
+                    fn_right = fn_on.group(2) or fn_on.group(1)
+                elif not lateral:
+                    err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
+                    i += 1
+                    continue
+                ast.joins.append(
+                    JoinClause(
+                        line=line,
+                        dataset="",
+                        alias=alias,
+                        left=fn_left,
+                        right=fn_right,
+                        lateral=lateral,
+                        body=fn_body,
+                    )
+                )
+                i += 1
+                continue
+            src = parse_source(source_text)
+            if src is None or (lateral and src[1] is None):
+                err(
+                    "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
+                    if lateral
+                    else "\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"
+                )
+                i += 1
+                continue
+            table, body_text, alias = src
+            body = None
+            if body_text is not None:
+                if alias is None:
+                    err("a subquery source needs an alias — write ( … ) as <name>")
+                    i += 1
+                    continue
+                # A lateral body reads the identifiers accumulated to its left.
+                body = parse_subquery(body_text, line, opts, outer)
+                absorb(ast, body)
+                if outer:
+                    # One identifier cannot mean two tables: a body table named
+                    # like one to its left would make every reference to it
+                    # ambiguous, so it is refused where it is written.
+                    clash = next(
+                        (
+                            t.identifier
+                            for t in open_tables_of(body.from_, body.joins)
+                            if t.identifier in outer
+                        ),
+                        "",
+                    )
+                    if clash:
+                        err(
+                            f'duplicate table identifier "{clash}" — '
+                            "a lateral body cannot reuse a name from its left"
+                        )
+                        i += 1
+                        continue
+            left_ref = right_ref = ""
+            if on_text:
+                on_match = _JOIN_ON_RE.match(on_text)
+                if on_match is None:
+                    err(
+                        "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
+                        if lateral
+                        else "\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"
+                    )
+                    i += 1
+                    continue
+                left_ref = on_match.group(1)
+                right_ref = on_match.group(2) or on_match.group(1)
+            elif not lateral:
                 err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
                 i += 1
                 continue
             ast.joins.append(
                 JoinClause(
                     line=line,
-                    dataset=jm.group(1),
-                    alias=jm.group(2) or None,
-                    left=jm.group(3),
-                    right=jm.group(4) or jm.group(3),
+                    dataset=table,
+                    alias=alias,
+                    left=left_ref,
+                    right=right_ref,
+                    lateral=lateral,
+                    body=body,
                 )
             )
             # Like `\from`: only complain once the schema has loaded.
             if (
-                schema_tables()
-                and not table_by_name(jm.group(1))
-                and jm.group(1) not in visible_ctes()
+                body is None
+                and schema_tables()
+                and not table_by_name(table)
+                and table not in visible_ctes()
             ):
                 err(
-                    f'unknown table "{jm.group(1)}" — loaded datasets: '
+                    f'unknown table "{table}" — loaded datasets: '
                     + ", ".join(t.name for t in schema_tables())
                 )
             i += 1
             continue
 
         if cmd in SET_OP_COMMANDS:
-            sm = _SET_OP_RE.match(rest)
-            modifier = sm.group(1).lower() if sm and sm.group(1) else ""
-            if sm is None or (not modifier and sm.group(2).lower() in SET_OP_MODIFIERS):
-                # `\union all` names nothing: a modifier is not the table.
-                err(f"\\{cmd} expects `[all|distinct] <dataset>`")
-                i += 1
-                continue
-            name = sm.group(2)
+            clause = rest
+            modifier = ""
+            mm = re.match(r"^(all|distinct)\s+", clause, re.IGNORECASE)
+            if mm is not None:
+                modifier = mm.group(1).lower()
+                clause = clause[mm.end() :].strip()
+            body = None
+            name = ""
+            fn = parse_fn_source(clause, line, opts, allow_alias=False)
+            if fn is not None:
+                _, fn_body, _, message = fn
+                if message:
+                    err(message)
+                    i += 1
+                    continue
+                absorb(ast, fn_body)
+                body = fn_body
+            elif clause.startswith("("):
+                paren = take_paren(clause)
+                if paren is None or paren[1]:
+                    err(f"\\{cmd} expects `[all|distinct] <dataset>` or `( … )`")
+                    i += 1
+                    continue
+                body = parse_subquery(paren[0], line, opts)
+                absorb(ast, body)
+            else:
+                sm = _SET_OP_RE.match(clause)
+                if sm is None or sm.group(2).lower() in SET_OP_MODIFIERS:
+                    # `\union all` names nothing: a modifier is not the table.
+                    err(f"\\{cmd} expects `[all|distinct] <dataset>` or `( … )`")
+                    i += 1
+                    continue
+                name = sm.group(2)
             ast.set_ops.append(
                 SetOpClause(
                     line=line,
                     op=cmd,  # type: ignore[arg-type]
                     dataset=name,
                     distinct=modifier != "all",
+                    body=body,
                 )
             )
             # Like `\from`/`\join`: only complain once the schema has loaded,
             # and a CTE defined earlier is a table for this purpose.
-            if schema_tables() and not table_by_name(name) and name not in visible_ctes():
+            if (
+                body is None
+                and schema_tables()
+                and not table_by_name(name)
+                and name not in visible_ctes()
+            ):
                 err(
                     f'unknown table "{name}" — loaded datasets: '
                     + ", ".join(t.name for t in schema_tables())
                 )
+            i += 1
+            continue
+
+        if cmd in ("distinct", "unique"):
+            if rest:
+                err(f"\\{cmd} takes no arguments")
+            else:
+                ast.distinct = True
             i += 1
             continue
 
@@ -518,6 +1209,22 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             # trailing `over ( … )` attaches a window frame to the expression.
             for expr in split_top(rest):
                 item = SelectItem(line=line, raw=expr)
+                # An inline `( … )` subquery is a whole expression, so it is read
+                # before anything meant for an expression: the body's own ` as `
+                # or ` over ( … )` must never be mistaken for this item's.
+                paren = take_paren(expr)
+                if paren is not None:
+                    body_text, after = paren
+                    alias_match = re.match(rf"^(?:as\s+)?({_IDENT})$", after, re.IGNORECASE)
+                    item.subquery = parse_subquery(body_text, line, opts)
+                    absorb(ast, item.subquery)
+                    item.alias = alias_match.group(1) if alias_match else None
+                    if after and alias_match is None:
+                        err(f'cannot parse expression "{expr}"')
+                    elif not item.alias:
+                        err("a scalar subquery needs an alias — write ( … ) as <name>")
+                    ast.select.append(item)
+                    continue
                 core = expr
                 as_match = _AS_RE.match(expr)
                 if as_match:
@@ -527,11 +1234,17 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 if over:
                     frame = parse_over_frame(over.group(2))
                     if frame is None:
-                        err("over (...) needs partition by <cols> and/or order by <col> [asc|desc]")
+                        err(over_frame_error(over.group(2)))
                         ast.select.append(item)
                         continue
                     item.window = frame
                     core = over.group(1).strip()
+                item.literal = parse_literal(core)
+                if item.literal is not None:
+                    if item.window:
+                        err("a literal cannot carry over (...) — wrap it in a function")
+                    ast.select.append(item)
+                    continue
                 # `\select *` — a whole star expansion, projectable only on its
                 # own (no alias, no frame). Qualified `t.*` is not supported.
                 if core == "*":
@@ -542,8 +1255,33 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         err("`*` cannot carry over (...)")
                     ast.select.append(item)
                     continue
+                regex = _REGEX_FN_RE.match(core)
                 rank = _RANK_RE.match(core)
-                if rank:
+                scalar_head = _CALL_HEAD_RE.match(core)
+                if scalar_head and scalar_head.group(1).lower() in SCALAR_FUNCTIONS:
+                    try:
+                        item.scalar = parse_scalar_call(core)
+                    except ValueError as exc:
+                        err(str(exc))
+                    if item.window:
+                        err(f'"{scalar_head.group(1).lower()}" is not a window function — use sum/avg/count/min/max')
+                    ast.select.append(item)
+                    continue
+                if regex:
+                    fn = regex.group(1).lower()
+                    args = split_top(regex.group(2))
+                    call = parse_regex_call(fn, args)
+                    if call is None:
+                        err(
+                            "regexp_extract expects `<column>, <pattern>[, <group>]`"
+                            if fn == "regexp_extract"
+                            else "regexp_replace expects `<column>, <pattern>, <replacement>`"
+                        )
+                    else:
+                        if item.window:
+                            err(f'"{fn}" is not a window function — use sum/avg/count/min/max')
+                        item.regex = call
+                elif rank:
                     fn = rank.group(1).lower()
                     item.rank = RankCall(fn=fn)  # type: ignore[arg-type]
                     if not item.window:
@@ -578,17 +1316,46 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             continue
 
         if cmd == "where":
-            wm = _WHERE_RE.match(rest)
+            wm = _WHERE_HEAD_RE.match(rest)
             if wm is None:
                 err("\\where expects `column op value`")
                 i += 1
                 continue
+            column = wm.group(1)
+            op = re.sub(r"\s+", " ", wm.group(2).lower())
+            tail = wm.group(3).strip()
+            if not tail:
+                err("\\where expects `column op value`")
+                i += 1
+                continue
+            subquery: QueryAST | None = None
+            value = tail
+            # An operand that is a command sequence is a subquery; a bare
+            # parenthesized literal (`= (3)`) stays the value it looks like, and
+            # so does one under an operator that takes text (`like`, `~`).
+            paren = take_paren(tail)
+            is_subquery = paren is not None and "\\" in paren[0] and not paren[1]
+            if op in SUBQUERY_OPS:
+                if not is_subquery:
+                    err(f"`{op}` expects an inline subquery — write ( \\from … )")
+                    i += 1
+                    continue
+                subquery = parse_subquery(paren[0], line, opts)
+                absorb(ast, subquery)
+                value = ""
+            elif is_subquery and op not in REGEX_OPS | {"like"}:
+                subquery = parse_subquery(paren[0], line, opts)
+                absorb(ast, subquery)
+                value = ""
+            else:
+                value = unquote(tail)
             ast.where = WhereClause(
                 line=line,
                 raw=rest,
-                column=wm.group(1),
-                op=wm.group(2).lower(),
-                value=unquote(wm.group(3)),
+                column=column,
+                op=op,
+                value=value,
+                subquery=subquery,
             )
             i += 1
             continue
@@ -645,6 +1412,57 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             i += 1
             continue
 
+        if cmd in ("temp", "drop"):
+            nm = _WITH_NAME_RE.match(rest)
+            if nm is None:
+                err(f"\\{cmd} expects a bare table name")
+                i += 1
+                continue
+            if not opts.top:
+                err(f"\\{cmd} is only allowed in the document")
+                i += 1
+                continue
+            # Whether the name is free is the session's to know (it owns the
+            # source's datasets and the temp tables this session made), so the
+            # parser only reads the name.
+            if cmd == "temp":
+                ast.temp = TempClause(line=line, name=nm.group(1))
+            else:
+                ast.drop = DropClause(line=line, name=nm.group(1))
+            i += 1
+            continue
+
+        if cmd in TX_COMMANDS:
+            if not opts.top:
+                err(f"\\{cmd} is only allowed in the document")
+                i += 1
+                continue
+            kind = TX_COMMANDS[cmd]
+            name: str | None = None
+            if cmd in TX_BARE:
+                if rest:
+                    err(f"\\{cmd} takes no arguments")
+                    i += 1
+                    continue
+            elif cmd == "rollback":
+                if rest:
+                    to_match = re.match(rf"^to\s+({_IDENT})$", rest, re.IGNORECASE)
+                    if to_match is None:
+                        err("\\rollback expects `[to <savepoint>]`")
+                        i += 1
+                        continue
+                    kind, name = "rollback_to", to_match.group(1)
+            else:
+                nm = _WITH_NAME_RE.match(rest)
+                if nm is None:
+                    err(f"\\{cmd} expects a savepoint name")
+                    i += 1
+                    continue
+                name = nm.group(1)
+            ast.tx.append(TxDirective(line=line, kind=kind, name=name))  # type: ignore[arg-type]
+            i += 1
+            continue
+
         err(f'unknown command "\\{cmd}"')
         i += 1
 
@@ -681,12 +1499,14 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
     # once the schema loaded (mirrors `\from`), and never on the typed line.
     if schema_tables():
         open_idents = [t.identifier for t in open_tables_of(ast.from_, ast.joins)]
+        # A lateral body may also read the identifiers outside it.
+        known_idents = [*open_idents, *opts.outer_idents]
 
         def check(ref_line: int, ref: str) -> None:
             if ref_line == opts.typing_line or "." not in ref:
                 return
             prefix = ref[: ref.index(".")]
-            if prefix not in open_idents:
+            if prefix not in known_idents:
                 listed = ", ".join(open_idents) or "(no \\from)"
                 ast.errors.append(
                     QueryError(
@@ -695,12 +1515,21 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
                     )
                 )
 
+        def check_scalar(ref_line: int, call: ScalarCall) -> None:
+            for arg in call.args:
+                if isinstance(arg, ColumnRef):
+                    check(ref_line, arg.column)
+                elif isinstance(arg, ScalarCall):
+                    check_scalar(ref_line, arg)
+
         for s in ast.select:
             check(s.line, s.column or "")
             if s.aggregate:
                 check(s.line, s.aggregate.arg)
             if s.temporal:
                 check(s.line, s.temporal.arg)
+            if s.scalar:
+                check_scalar(s.line, s.scalar)
             if s.window:
                 for p in s.window.partition_by:
                     check(s.line, p)
@@ -715,21 +1544,27 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
         for c in ast.cases:
             for w in c.whens:
                 check(c.line, w.column)
-        # A qualified `\join` left side names the accumulated left: identifiers
-        # established BEFORE this clause (the clause's own alias doesn't count).
+        # A qualified `\join on` side names whichever relation it points at: the
+        # accumulated left or this join's own table. `on a.k = b.k` and
+        # `on b.k = a.k` are the same equality, so both operands are checked
+        # against the identifiers open AT this clause — everything before it plus
+        # the alias the clause itself establishes (which the engine resolves too).
         sofar: list[str] = [ast.from_.alias or ast.from_.table] if ast.from_ else []
         for j in ast.joins:
-            if "." in j.left:
-                prefix = j.left[: j.left.index(".")]
-                if j.line != opts.typing_line and prefix not in sofar:
-                    listed = ", ".join(sofar) or "(no \\from)"
+            open_here = [*sofar, j.alias or j.dataset]
+            for side in (j.left, j.right):
+                if "." not in side:
+                    continue
+                prefix = side[: side.index(".")]
+                if j.line != opts.typing_line and prefix not in open_here:
+                    listed = ", ".join(open_here) or "(no \\from)"
                     ast.errors.append(
                         QueryError(
                             line=j.line,
-                            message=f'unknown column "{j.left}" — "{prefix}" is not an open table: {listed}',
+                            message=f'unknown column "{side}" — "{prefix}" is not an open table: {listed}',
                         )
                     )
-            sofar = [*sofar, j.alias or j.dataset]
+            sofar = open_here
 
     # Resolve order targets against the full select list (1-based, as
     # displayed). Alias-first, and aggregate auto-aliases count as real output
@@ -774,20 +1609,44 @@ def payload_from_ast(ast: QueryAST) -> dict:
     when unaliased). Aggregate select items carry the derived auto-alias
     (`auto_alias`) when the user gave none — the engine re-derives the same
     name for null aliases; sending it up front keeps the two layers identical.
+    `\\distinct`/`\\unique` normalize to the query's always-present `distinct`
+    boolean, independently of each set operation's deduplication flag.
+
+    Inline `( … )` subqueries embed as full payloads of their own (`body` on a
+    source/join/set-op, `subquery` on a select item or `\\where`), and the
+    statements the query cannot carry — `\\temp`, `\\drop`, the transaction
+    commands — ride along as `temp`, `drop` and `tx`, because running them is
+    the session's job, not the expression builder's.
     """
     return {
         "dataset": ast.from_.table if ast.from_ else "",
         "alias": ast.from_.alias if ast.from_ else None,
+        "body": payload_from_ast(ast.from_.body) if ast.from_ and ast.from_.body else None,
         "joins": [
-            {"dataset": j.dataset, "alias": j.alias, "left": j.left, "right": j.right}
+            {
+                "dataset": j.dataset,
+                "alias": j.alias,
+                "left": j.left,
+                "right": j.right,
+                "lateral": j.lateral,
+                "body": payload_from_ast(j.body) if j.body else None,
+            }
             for j in ast.joins
         ],
         "setOps": [
-            {"op": s.op, "dataset": s.dataset, "distinct": s.distinct} for s in ast.set_ops
+            {
+                "op": s.op,
+                "dataset": s.dataset,
+                "distinct": s.distinct,
+                "body": payload_from_ast(s.body) if s.body else None,
+            }
+            for s in ast.set_ops
         ],
         "select": [
             {
                 "column": s.column,
+                "literal": s.literal.to_json() if s.literal is not None else None,
+                "scalar": s.scalar.to_json() if s.scalar else None,
                 "star": s.star,
                 "aggregate": {"fn": s.aggregate.fn, "arg": s.aggregate.arg} if s.aggregate else None,
                 "temporal": {"fn": s.temporal.fn, "arg": s.temporal.arg} if s.temporal else None,
@@ -800,16 +1659,43 @@ def payload_from_ast(ast: QueryAST) -> dict:
                             if s.window.order
                             else None
                         ),
+                        "frame": (
+                            {
+                                "kind": s.window.frame.kind,
+                                "start": s.window.frame.start,
+                                "end": s.window.frame.end,
+                            }
+                            if s.window.frame
+                            else None
+                        ),
                     }
                     if s.window
                     else None
                 ),
+                "regex": (
+                    {
+                        "fn": s.regex.fn,
+                        "arg": s.regex.arg,
+                        "pattern": s.regex.pattern,
+                        "group": s.regex.group,
+                        "replacement": s.regex.replacement,
+                    }
+                    if s.regex
+                    else None
+                ),
+                "subquery": payload_from_ast(s.subquery) if s.subquery else None,
                 "alias": effective_alias(s),
             }
             for s in ast.select
         ],
+        "distinct": ast.distinct,
         "where": (
-            {"column": ast.where.column, "op": ast.where.op, "value": ast.where.value}
+            {
+                "column": ast.where.column,
+                "op": ast.where.op,
+                "value": ast.where.value,
+                "subquery": payload_from_ast(ast.where.subquery) if ast.where.subquery else None,
+            }
             if ast.where
             else None
         ),
@@ -826,6 +1712,9 @@ def payload_from_ast(ast: QueryAST) -> dict:
             }
             for c in ast.cases
         ],
+        "temp": ast.temp.name if ast.temp else None,
+        "drop": ast.drop.name if ast.drop else None,
+        "tx": [{"kind": t.kind, "name": t.name} for t in ast.tx],
         # A CTE body is a full payload minus its own (empty, by grammar) `with` list.
         "ctes": [{"name": c.name, "body": payload_from_ast(c.body)} for c in ast.with_],
     }

@@ -13,12 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from .functions import SCALAR_FUNCTIONS
+
 AGGREGATES: tuple[str, ...] = ("sum", "avg", "count", "min", "max")
 
 # Temporal extraction functions; the capability map selects by dtype family.
 TEMPORAL: tuple[str, ...] = ("year", "month", "day", "quarter", "hour", "minute", "second")
 
-DtypeFamily = Literal["timestamp", "date", "time"]
+DtypeFamily = Literal["timestamp", "date", "time", "string"]
 
 
 @dataclass
@@ -53,13 +55,15 @@ class Capabilities:
 
 
 def dtype_family(type: str) -> DtypeFamily | None:
-    """The dtype families recognized for temporal extraction."""
+    """The dtype families recognized by scalar function completion."""
     if type == "timestamp":
         return "timestamp"
     if type == "date":
         return "date"
     if type == "time":
         return "time"
+    if type == "string":
+        return "string"
     return None
 
 
@@ -71,10 +75,12 @@ DEFAULT_CAPABILITIES = Capabilities(
         "timestamp": ["year", "month", "day", "quarter", "hour", "minute", "second"],
         "date": ["year", "month", "day", "quarter"],
         "time": ["hour", "minute", "second"],
+        "string": [fn for fn in SCALAR_FUNCTIONS if fn != "string"],
+        "any": ["string"],
     },
     operators=["=", "!=", ">", ">=", "<", "<=", "like"],
     window_functions=["rank", "dense_rank", "row_number"],
-    supports={"groupBy": True, "orderBy": True, "limit": True, "like": True},
+    supports={"groupBy": True, "orderBy": True, "limit": True, "distinct": True, "like": True},
 )
 
 
@@ -84,6 +90,24 @@ class PoolColumn(ColumnDef):
 
     # Datasets defining this column, in load order.
     tables: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FnDef:
+    """A saved table-valued function: a named, parameterized query body.
+
+    The body is a document's worth of `\\command` text whose parameters are
+    written `@name`; calling the function substitutes the arguments for those
+    tokens and parses the result as a relation body, so the AST, payload, and
+    engine never learn a function exists. `params` is the positional signature
+    (names in argument order); `doc` is the one-line description the library
+    and the palette show.
+    """
+
+    name: str
+    params: list[str] = field(default_factory=list)
+    body: str = ""
+    doc: str = ""
 
 
 @dataclass
@@ -117,6 +141,29 @@ def set_schema_state(next_tables: list[TableDef], next_capabilities: Capabilitie
             else:
                 by_name[col.name] = PoolColumn(col.name, col.type, col.doc, col.values, [table.name])
     _pool = list(by_name.values())
+
+
+_fns: dict[str, FnDef] = {}
+
+
+def set_fns(next_fns: list[FnDef]) -> None:
+    """Install the live function registry (called on every refresh).
+
+    Independent of `set_schema_state`: functions belong to the session, not to
+    the active source, so switching sources keeps them. An empty list clears
+    them — which is also the pure-parse regime the canonical fixture runs in.
+    """
+    global _fns
+    _fns = {fn.name: fn for fn in next_fns}
+
+
+def fns() -> list[FnDef]:
+    """Every registered function, in definition order."""
+    return list(_fns.values())
+
+
+def fn_by_name(name: str) -> FnDef | None:
+    return _fns.get(name)
 
 
 def schema_tables() -> list[TableDef]:

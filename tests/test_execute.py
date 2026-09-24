@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from anyql.engine import expression
+from anyql.engine import add_sqlite_source, expression
 from anyql.engine.execute import execute
+from anyql.query import parse_query, payload_from_ast
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -66,6 +68,97 @@ def test_first10_execute_matches_fixture(con):
     assert result["columns"] == expected["columns"]
     assert result["rows"] == expected["rows"]
 
+@pytest.fixture
+def count_source(tmp_path):
+    path = tmp_path / "counts.sqlite"
+    with sqlite3.connect(path) as raw:
+        raw.execute("create table usage_events (id integer, project_id integer, total_tokens integer)")
+        raw.executemany(
+            "insert into usage_events values (?, ?, ?)",
+            [(11, 1, 10), (12, 1, None), (13, 2, None), (14, 3, 50), (15, 4, 100), (16, 1, 5)],
+        )
+        raw.execute("create table projects (id integer, name text, primary_email text, plan_id text)")
+        raw.executemany(
+            "insert into projects values (?, ?, ?, ?)",
+            [
+                (1, "First", None, "free"),
+                (1, "First", None, "free"),  # Each matching event contributes twice.
+                (2, "Second", "second@example.test", "free"),
+                (3, "Paid", "paid@example.test", "paid"),
+            ],
+        )
+    raw.close()
+    source = add_sqlite_source("counts", str(path))
+    try:
+        yield source.con
+    finally:
+        source.con.disconnect()
+
+
+COUNT_JOIN = (
+    "\\from usage_events as ue\n"
+    "\\join projects as p on ue.project_id = p.id\n"
+    "\\where p.plan_id = 'free'\n"
+)
+
+
+def test_count_star_groups_current_joined_filtered_relation(count_source):
+    ast = parse_query(
+        COUNT_JOIN
+        + "\\select p.id, p.name, p.primary_email, count(*) as total_requests, "
+        "sum(ue.total_tokens) as total_tokens\n"
+        "\\group p.id, p.name, p.primary_email\n"
+        "\\order total_requests desc\n\\limit 20"
+    )
+    assert ast.errors == []
+    result = execute(count_source, payload_from_ast(ast), dialect="sqlite")
+    assert result["columns"] == ["id", "name", "primary_email", "total_requests", "total_tokens"]
+    assert result["rows"] == [
+        [1, "First", None, 6, 30],
+        [2, "Second", "second@example.test", 1, None],
+    ]
+
+
+@pytest.mark.parametrize("plan, expected", [("free", [7, 4]), ("missing", [0, 0])])
+def test_count_star_global_keeps_null_rows_and_empty_input(count_source, plan, expected):
+    ast = parse_query(
+        COUNT_JOIN.replace("'free'", f"'{plan}'")
+        + "\\select count(*), count(ue.total_tokens) as nonnull\n\\order __count"
+    )
+    assert ast.errors == []
+    result = execute(count_source, payload_from_ast(ast), dialect="sqlite")
+    assert result["columns"] == ["__count", "nonnull"]
+    assert result["rows"] == [expected]
+
+
+def test_count_star_windows_count_joined_filtered_rows_and_respect_frames(count_source):
+    ast = parse_query(
+        COUNT_JOIN
+        + "\\select ue.id, p.id as project, count(*) over (partition by p.id), "
+        "count(ue.total_tokens) over (partition by p.id) as nonnull, "
+        "count(*) over (partition by p.id order by ue.id "
+        "range between unbounded preceding and current row) as running\n"
+        "\\order id"
+    )
+    assert ast.errors == []
+    result = execute(count_source, payload_from_ast(ast), dialect="sqlite")
+    assert result["columns"] == ["id", "project", "__count", "nonnull", "running"]
+    assert result["rows"] == [
+        [11, 1, 6, 4, 2], [11, 1, 6, 4, 2],
+        [12, 1, 6, 4, 4], [12, 1, 6, 4, 4],
+        [13, 2, 1, 0, 1],
+        [16, 1, 6, 4, 6], [16, 1, 6, 4, 6],
+    ]
+
+
+@pytest.mark.parametrize("call", ["sum(*)", "avg(*) over (partition by user_id)"])
+def test_non_count_aggregate_wildcard_is_an_aggregate_error(con, call):
+    ast = parse_query(f"\\from events\n\\select {call}\n\\limit 1")
+    assert ast.errors == []
+    with pytest.raises(expression.PayloadError, match="only count accepts"):
+        expression.build(con, payload_from_ast(ast))
+
+
 
 def test_payload_errors(con):
     with pytest.raises(expression.PayloadError, match="unknown dataset"):
@@ -79,7 +172,15 @@ def test_payload_errors(con):
             con,
             {
                 "dataset": "events",
-                "where": {"column": "user_id", "op": "~", "value": 1},
+                "where": {"column": "user_id", "op": "<>", "value": 1},
+            },
+        )
+    with pytest.raises(expression.PayloadError, match="needs a string column"):
+        expression.build(
+            con,
+            {
+                "dataset": "events",
+                "where": {"column": "user_id", "op": "~", "value": "1"},
             },
         )
     with pytest.raises(expression.PayloadError, match="unknown aggregate"):
@@ -452,3 +553,33 @@ def test_star_errors(con):
             },
         )
 
+
+def test_constant_projection_preserves_quoted_text_and_row_cardinality(con):
+    doc = """\\from events
+\\select '1', 'x', 1 as number, -2.5 as decimal, .5e2 as exponent, true as yes, false as no, null as missing, '' as empty, 'it''s, as over (x)' as quoted, "double" as double_text, user_id
+\\limit 2"""
+    ast = parse_query(doc)
+    assert ast.errors == []
+    result = execute(con, payload_from_ast(ast))
+    expected = ["1", "x", 1, -2.5, 50.0, True, False, None, "", "it's, as over (x)", "double"]
+    assert result["columns"] == ["'1'", "'x'", "number", "decimal", "exponent", "yes", "no", "missing", "empty", "quoted", "double_text", "user_id"]
+    assert [row[:-1] for row in result["rows"]] == [expected, expected]
+    assert result["rows"][0][0] == "1" and type(result["rows"][0][2]) is int
+
+
+def test_constants_do_not_turn_an_empty_global_aggregate_into_grouping(con):
+    doc = "\\from events\n\\select count(user_id) as n, 'x' as marker\n\\where user_id < 0"
+    result = execute(con, payload_from_ast(parse_query(doc)))
+    assert result["columns"] == ["n", "marker"]
+    assert result["rows"] == [[0, "x"]]
+
+    # Without aggregation, a constant still projects one value per source row.
+    doc = "\\from events\n\\select 'x' as marker\n\\where user_id < 0"
+    assert execute(con, payload_from_ast(parse_query(doc)))["rows"] == []
+
+
+def test_constants_compose_with_grouped_aggregates(con):
+    doc = "\\from events\n\\select event_type, count(user_id) as n, '1' as marker\n\\group event_type\n\\order event_type"
+    result = execute(con, payload_from_ast(parse_query(doc)))
+    baseline = execute(con, payload_from_ast(parse_query(doc.replace(", '1' as marker", ""))))
+    assert result["rows"] == [[*row, "1"] for row in baseline["rows"]]

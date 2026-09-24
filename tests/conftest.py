@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from anyql.engine import DataSource, datasources
+from anyql.query import set_schema_state, set_fns
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "anyql" / "engine" / "data"
@@ -51,6 +52,27 @@ ALIAS_REVENUE_PAYLOAD = {
     "orderBy": [{"target": "amount_sum", "direction": "desc"}],
     "limit": 5,
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_memory(tmp_path, monkeypatch):
+    """No test reads or writes the user's durable anyQL memory."""
+    monkeypatch.setenv("ANYQL_DATA_DIR", str(tmp_path / "anyql-data"))
+
+
+@pytest.fixture(autouse=True)
+def _clean_schema_registry():
+    """Every test starts (and ends) with the language's registries empty.
+
+    Both are module-level seams, so a file that installs a schema or a saved
+    function — the TUI's sessions, the parser's loaded regime — would otherwise
+    leak it into whatever runs next. A test that needs one installs it itself.
+    """
+    set_schema_state([])
+    set_fns([])
+    yield
+    set_schema_state([])
+    set_fns([])
 
 
 @pytest.fixture(scope="session")

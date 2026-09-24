@@ -8,16 +8,17 @@ it never re-implements a rule of the language or the engine.
 
 from __future__ import annotations
 
+import asyncio
+
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.content import Content, Text
-from textual.geometry import Size
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
+    Button,
     DataTable,
-    OptionList,
     Select,
     Static,
     TabbedContent,
@@ -26,13 +27,17 @@ from textual.widgets import (
     Tree,
 )
 
+from anyql.ai.context import AIProposal
 from anyql.engine import DIALECTS, DIALECT_BY_NAME, capabilities_for
 from anyql.query import ColumnDef, table_by_name
 
 from .add_source import AddSourceModal
-from .palette import CommandPalette
+from .ai import AIPanel, AITarget
+from .palette import CommandPalette, EditorPane
+from .results import ResultsTable
 from .session import RunOutcome, Session
 from .settings import SettingsScreen
+from .fn import FnScreen
 
 # The document a fresh session opens with: a real query against the demo
 # source, so `ctrl+enter` does something true on the very first keystroke.
@@ -46,82 +51,8 @@ WELCOME_DOCUMENT = """\\from events
 
 KEY_HINTS = "ctrl+enter run · ctrl+k compile · ctrl+o data source · ctrl+comma settings · \\ palette · ctrl+q quit"
 
-MIN_COLUMN_WIDTH = 4
 
 
-class EditorPane(Vertical):
-    """The document editor and its palette, and the owner of the palette's keys.
-
-    They are claimed here rather than on the editor itself for two reasons: a
-    TextArea's own key handler cannot be suppressed from a subclass (Textual
-    dispatches every `_on_key` in the MRO), and here they stay scoped — only
-    while the focus is inside this pane, so Enter keeps selecting rows in the
-    results table and every other widget keeps its own keys.
-    """
-
-    BINDINGS = [
-        Binding("up", "palette_up", "Cursor up", show=False, priority=True),
-        Binding("down", "palette_down", "Cursor down", show=False, priority=True),
-        Binding("enter", "palette_enter", "Newline", show=False, priority=True),
-        Binding("escape", "palette_escape", "Close the palette", show=False, priority=True),
-        # TextArea binds `home,ctrl+a` to "cursor line start"; in an editor the
-        # user means select all, and the pane claims the key to say so.
-        Binding("ctrl+a", "select_all", "Select all", show=False, priority=True),
-        Binding("tab", "palette_tab", "Accept suggestion", show=False, priority=True),
-    ]
-
-    @property
-    def editor(self) -> TextArea:
-        """The document editor."""
-        return self.query_one("#editor", TextArea)
-
-    @property
-    def palette(self) -> CommandPalette:
-        """The `\\` overlay."""
-        return self.query_one("#palette", CommandPalette)
-
-    def action_palette_up(self) -> None:
-        """Move the palette's highlight, or the caret when it is closed."""
-        if self.palette.is_open:
-            self.palette.move(-1)
-        else:
-            self.editor.action_cursor_up()
-
-    def action_palette_down(self) -> None:
-        """Move the palette's highlight, or the caret when it is closed."""
-        if self.palette.is_open:
-            self.palette.move(1)
-        else:
-            self.editor.action_cursor_down()
-
-    def action_palette_enter(self) -> None:
-        """Accept the highlighted suggestion, or insert a newline.
-
-        An accept that would change nothing is not an accept: the palette
-        closes and Enter means what it always means.
-        """
-        palette = self.palette
-        if palette.is_open and palette.accept_highlighted():
-            return
-        palette.close()
-        editor = self.editor
-        if editor.read_only:
-            return
-        start, end = editor.selection
-        editor.replace("\n", start, end, maintain_selection_offset=False)
-
-    def action_palette_escape(self) -> None:
-        """Escape shows and hides the popup; it does nothing else to the document."""
-        self.palette.escape()
-
-    def action_select_all(self) -> None:
-        """`ctrl+a` selects the whole document (TextArea would go to line start)."""
-        self.editor.select_all()
-
-    def action_palette_tab(self) -> None:
-        """`tab` accepts the highlighted suggestion — it never moves focus."""
-        if self.palette.is_open:
-            self.palette.accept_highlighted()
 
 
 class IdeScreen(Screen):
@@ -147,42 +78,6 @@ class IdeScreen(Screen):
         """Claim a key and do nothing with it (the pane above may have it)."""
 
 
-class ResultsTable(DataTable):
-    """The data explorer: DataTable plus keyboard column resizing.
-
-    Everything else here is Textual's: the cell cursor doubles as the column
-    cursor, arrows and page keys scroll both axes, and the view follows the
-    cursor. Resizing is the one thing DataTable leaves to its owner.
-    """
-
-    BINDINGS = [
-        Binding("shift+left", "narrow_column", "Narrow column", show=False),
-        Binding("shift+right", "widen_column", "Widen column", show=False),
-    ]
-
-    def action_narrow_column(self) -> None:
-        self._resize_column(-2)
-
-    def action_widen_column(self) -> None:
-        self._resize_column(2)
-
-    def _resize_column(self, delta: int) -> None:
-        columns = self.ordered_columns
-        if not columns:
-            return
-        index = min(self.cursor_column, len(columns) - 1)
-        column = columns[index]
-        before = column.get_render_width(self)
-        if column.auto_width:
-            # Pin the width it renders at today, then resize from there.
-            column.width = before - 2 * self.cell_padding
-            column.auto_width = False
-        column.width = max(MIN_COLUMN_WIDTH, column.width + delta)
-        after = column.get_render_width(self)
-        width, height = self.virtual_size
-        self.virtual_size = Size(width + after - before, height)
-        self._clear_caches()
-        self.refresh_column(index)
 
 
 def column_label(column: ColumnDef) -> Text:
@@ -221,7 +116,7 @@ class AnyqlApp(App):
     # Priority bindings so they win over the focused editor's own keys — the
     # editor claims ctrl+k for "delete to line end" and the app needs it.
     BINDINGS = [
-        Binding("ctrl+enter", "run", "Run", priority=True),
+        Binding("ctrl+enter", "run_or_chat", "Run", priority=True),
         Binding("f5", "run", "Run", priority=True, show=False),
         Binding("ctrl+k", "compile", "Compile", priority=True),
         Binding("f6", "compile", "Compile", priority=True, show=False),
@@ -236,6 +131,10 @@ class AnyqlApp(App):
         self.theme = "textual-dark"
         self.session = session if session is not None else Session()
         self.history_documents: list[str] = []
+        self._document_identity = 0
+        self.run_busy = False
+        self._run_task: asyncio.Task[RunOutcome] | None = None
+        self._closing = False
 
     def get_default_screen(self) -> Screen:
         """The IDE runs on `IdeScreen`, whose tab does not walk the panes."""
@@ -265,31 +164,48 @@ class AnyqlApp(App):
                 yield Tree(Text("datasets"), id="schema-tree")
             with Vertical(id="work-bench"):
                 with EditorPane(id="editor-pane"):
-                    yield Static("Document", classes="pane-title")
+                    with Horizontal(id="document-actions"):
+                        yield Static("Document", classes="pane-title")
+                        yield Button("To function", id="query-to-fn", compact=True)
                     yield TextArea(WELCOME_DOCUMENT, show_line_numbers=True, id="editor")
                     yield CommandPalette(self.session, id="palette", markup=False)
                 with TabbedContent(id="result-tabs"):
                     with TabPane("Results", id="tab-results"):
                         yield Static("", id="results-error", markup=False)
+                        with Horizontal(id="results-actions"):
+                            yield Button("Copy rows", id="results-copy", compact=True)
+                            yield Button("Export CSV…", id="results-export", compact=True)
                         yield ResultsTable(id="results-table", zebra_stripes=True, cursor_type="cell")
                         yield Static("", id="results-status", markup=False)
                     with TabPane("SQL", id="tab-sql"):
                         yield TextArea("", read_only=True, soft_wrap=False, id="sql-text")
                     with TabPane("History", id="tab-history"):
                         yield DataTable(id="history-table", zebra_stripes=True, cursor_type="row")
+            yield AIPanel(
+                self.session, self._ai_target, self._apply_ai_document,
+                lambda: self.editor.focus(), id="workspace-ai",
+            )
         with Vertical(id="footer"):
             yield Static(KEY_HINTS, id="keymap")
             yield Static("", id="status", markup=False)
 
     def on_mount(self) -> None:
-        self.palette.attach(self.editor)
         self._refresh_header()
         self._refresh_tree()
         self.query_one("#history-table", DataTable).add_columns(
             "time", "source", "dialect", "rows", "ms", "document"
         )
         self._set_status(f"ready · {self.session.active_id} · {self.session.dialect}")
+        if self.session.memory_error:
+            self._set_status(self.session.memory_error)
+            self.notify(self.session.memory_error, title="Saved data could not be loaded", severity="error", timeout=15)
         self.editor.focus()
+
+    def on_unmount(self) -> None:
+        self._closing = True
+        if self.run_busy and self._run_task is None:
+            self.run_busy = False
+            self.session.busy = ""
 
     # -- widgets ------------------------------------------------------------
 
@@ -302,6 +218,25 @@ class AnyqlApp(App):
     def palette(self) -> CommandPalette:
         """The `\\` overlay."""
         return self.query_one("#palette", CommandPalette)
+
+    @property
+    def ai_panel(self) -> AIPanel:
+        return self.query_one("#workspace-ai", AIPanel)
+
+    def _ai_target(self) -> AITarget:
+        return AITarget(
+            (self.session.active_id, self._document_identity),
+            self.session.active_id, self.editor.text,
+        )
+
+    def _apply_ai_document(self, proposal: AIProposal) -> None:
+        self.editor.load_text(proposal.body)
+        self.palette.close()
+        self._set_status("AI replacement applied · not executed")
+
+    @on(TextArea.Changed, "#editor")
+    def _ai_document_changed(self) -> None:
+        self.ai_panel.target_changed()
 
     def _source_options(self) -> list[tuple[Content, str]]:
         return [(Content(source.display), source.id) for source in self.session.sources.values()]
@@ -321,12 +256,14 @@ class AnyqlApp(App):
     def _sync_dialect_select(self) -> None:
         select = self.query_one("#dialect-select", Select)
         if select.value != self.session.dialect:
-            select.value = self.session.dialect
+            with self.prevent(Select.Changed):
+                select.value = self.session.dialect
 
     def _sync_source_select(self) -> None:
         select = self.query_one("#source-select", Select)
         if select.value != self.session.active_id:
-            select.value = self.session.active_id
+            with self.prevent(Select.Changed):
+                select.value = self.session.active_id
 
     def _refresh_tree(self) -> None:
         """Rebuild the explorer from the active source (columns load on expand)."""
@@ -336,8 +273,11 @@ class AnyqlApp(App):
         root.expand()
         datasets = self.session.source.datasets
         for name, entry in datasets.items():
+            label = dataset_label(name, int(entry["rows"]))
+            if entry.get("temp"):
+                label.append(Text("  temp", style="dim italic"))
             node = root.add(
-                dataset_label(name, int(entry["rows"])),
+                label,
                 data={"kind": "dataset", "name": name},
                 allow_expand=True,
             )
@@ -422,23 +362,80 @@ class AnyqlApp(App):
         """True while a modal screen owns the keyboard."""
         return isinstance(self.screen, ModalScreen)
 
+    def refuse_busy(self, action: str) -> bool:
+        """Refuse shared-state work without blocking editor/navigation events."""
+        if not self.session.busy:
+            return False
+        message = f"{action} unavailable · {self.session.busy}; wait for it to finish."
+        self._set_status(message)
+        self.notify(message, severity="warning")
+        return True
+
     # -- actions ------------------------------------------------------------
 
+    def action_run_or_chat(self) -> None:
+        """The app's priority key sends chat when its input owns focus."""
+        focused = self.screen.focused
+        if focused is not None:
+            for widget in (focused, *focused.ancestors):
+                if isinstance(widget, AIPanel):
+                    widget.action_send()
+                    return
+        self.action_run()
+
     def action_run(self) -> None:
-        """Parse the document and execute it; a user mistake never crashes."""
-        if self._modal_open():
+        """Capture this submission and reserve the session before dispatching it."""
+        if self._modal_open() or self.ai_panel.has_focus_within:
             return
+        if self.refuse_busy("Run"):
+            return
+        document = self.editor.text
         self.palette.close()
-        outcome = self.session.run(self.editor.text)
+        self.run_busy = True
+        self.session.busy = "Query running"
+        self._set_status(f"running · {self.session.active_id} · {self.session.dialect} · completion paused; editor and Settings remain available")
+        self.run_worker(
+            self._run_document(document), name="Run document", group="query",
+            exit_on_error=False,
+        )
+
+    async def _run_document(self, document: str) -> None:
+        self._run_task = asyncio.create_task(asyncio.to_thread(self.session.run, document))
+        self._run_task.add_done_callback(self._run_finished)
+        try:
+            # Textual cancels workers on exit, not database writes. Keep the
+            # real task alive; its callback releases ownership without touching
+            # widgets after shutdown. No replacement run cancels this worker.
+            await asyncio.shield(self._run_task)
+        except Exception:
+            pass  # _run_finished reports unexpected failures on the UI thread.
+
+    def _run_finished(self, task: asyncio.Task[RunOutcome]) -> None:
+        self._run_task = None
+        self.run_busy = False
+        self.session.busy = ""
+        if task.cancelled():
+            return
+        try:
+            outcome = task.result()
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            outcome = RunOutcome(status=message, error=message)
+        if self._closing or not self.is_running:
+            return
         self._set_error(outcome.error)
         self._render_results(outcome)
         self._refresh_history()
+        # Rollback or a partially successful document may also change tables.
+        self._refresh_tree()
         self._set_status(outcome.status)
         self._show_tab("tab-results")
 
     def action_compile(self) -> None:
         """Render the document as SQL for the active dialect — never executes."""
-        if self._modal_open():
+        if self._modal_open() or self.ai_panel.has_focus_within:
+            return
+        if self.refuse_busy("Compile"):
             return
         self.palette.close()
         sql, message = self.session.compile(self.editor.text)
@@ -452,6 +449,8 @@ class AnyqlApp(App):
     def action_add_source(self) -> None:
         """Open the add-source modal; the built source registers on `Add`."""
         if self._modal_open():
+            return
+        if self.refuse_busy("Add data source"):
             return
         self.palette.close()
         self.push_screen(AddSourceModal(self.session), self._source_added)
@@ -486,33 +485,60 @@ class AnyqlApp(App):
         self.palette.close()
         self.push_screen(SettingsScreen(self))
 
+    def action_fn(self) -> None:
+        """`\\fn` — open the function library."""
+        self._open_fn()
+
+    def action_query_to_fn(self) -> None:
+        """Open a new function draft without saving or rewriting the document."""
+        self._open_fn(new_body=self.editor.text)
+
+    @on(Button.Pressed, "#query-to-fn")
+    def _query_to_fn_clicked(self) -> None:
+        self.action_query_to_fn()
+
+    @on(Button.Pressed, "#results-copy")
+    def _copy_results_clicked(self) -> None:
+        self.query_one("#results-table", ResultsTable).action_copy_rows()
+
+    @on(Button.Pressed, "#results-export")
+    def _export_results_clicked(self) -> None:
+        self.action_export_results()
+
+    def action_export_results(self) -> None:
+        if self._modal_open():
+            return
+        self.palette.close()
+        self.query_one("#results-table", ResultsTable).action_export()
+
+    def action_ai(self) -> None:
+        """Open the in-layout assistant without changing the document."""
+        if self._modal_open():
+            return
+        self.palette.close()
+        self.ai_panel.open()
+
+    def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "") -> None:
+        """Open a saved function or a new draft with optional name and body."""
+        if self._modal_open():
+            return
+        if self.refuse_busy("Function library"):
+            return
+        self.palette.close()
+        self.push_screen(FnScreen(self, focus=focus, new_name=new_name, new_body=new_body))
+
     def _render_results(self, outcome: RunOutcome) -> None:
         table = self.query_one("#results-table", ResultsTable)
-        table.clear(columns=True)
-        if not outcome.error and outcome.columns:
-            table.add_columns(
-                *[
-                    Text.assemble(name, (" · " + dtype, "dim")) if dtype else Text(name)
-                    for name, dtype in zip(outcome.columns, outcome.dtypes)
-                ]
-            )
-            if outcome.rows:
-                table.add_rows([[self._cell(value) for value in row] for row in outcome.rows])
-                table.move_cursor(row=0, column=0)
+        table.show_result(outcome)
         self.query_one("#results-status", Static).update(outcome.status)
 
-    @staticmethod
-    def _cell(value) -> Text:
-        """One result cell; a null renders as NULL rather than as empty text."""
-        if value is None:
-            return Text("NULL", style="dim")
-        return Text(str(value))
 
     def _source_added(self, source) -> None:
         """Register a source the modal built, then re-point the whole app at it."""
         if source is None:
             return
         self.session.register(source)
+        self.ai_panel.target_changed()
         self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
         self._sync_dialect_select()
@@ -522,21 +548,6 @@ class AnyqlApp(App):
 
     # -- messages -----------------------------------------------------------
 
-    @on(TextArea.Changed, "#editor")
-    def _editor_changed(self) -> None:
-        """The document changed: the palette follows it, and offers on it."""
-        self.palette.sync()
-
-    @on(TextArea.SelectionChanged, "#editor")
-    def _editor_caret_moved(self) -> None:
-        """The caret moved on its own: an open palette follows it, and no more.
-
-        Summoning on every arrow key would put the popup in front of the
-        document's own navigation — moving the caret is not a request for
-        offers, and the palette's keys would swallow the next move.
-        """
-        if self.palette.is_open:
-            self.palette.sync()
 
     @on(Select.Changed, "#source-select")
     def _source_changed(self, event: Select.Changed) -> None:
@@ -552,7 +563,11 @@ class AnyqlApp(App):
         """
         if source_id not in self.session.sources or source_id == self.session.active_id:
             return
+        if self.refuse_busy("Change data source"):
+            self._sync_source_select()
+            return
         self.session.set_active(source_id)
+        self.ai_panel.target_changed()
         self._sync_source_select()
         self._refresh_header()
         self._refresh_tree()
@@ -571,6 +586,9 @@ class AnyqlApp(App):
         compiling never executes anything.
         """
         if name == self.session.dialect:
+            return
+        if self.refuse_busy("Change dialect"):
+            self._sync_dialect_select()
             return
         self.session.dialect = name
         self._sync_dialect_select()
@@ -591,6 +609,9 @@ class AnyqlApp(App):
         node = event.node
         data = node.data if isinstance(node.data, dict) else {}
         if data.get("kind") != "dataset" or data.get("loaded"):
+            return
+        if self.refuse_busy("Load schema columns"):
+            node.collapse()
             return
         node.remove_children()
         table = table_by_name(data["name"])
@@ -619,16 +640,13 @@ class AnyqlApp(App):
             self._load_document(self.history_documents[event.cursor_row])
 
     def _load_document(self, document: str) -> None:
+        self._document_identity += 1
         self.editor.load_text(document)
         self.palette.close()
         self.editor.focus()
+        self.ai_panel.target_changed()
         self._set_status("document loaded from history")
 
-    @on(OptionList.OptionSelected, "#palette")
-    def _palette_clicked(self, event: OptionList.OptionSelected) -> None:
-        """A click accepts that row, exactly like Enter on the highlight."""
-        self.palette.accept(event.option_index)
-        self.editor.focus()
 
     @on(CommandPalette.ActionPerformed)
     def _palette_action(self, event: CommandPalette.ActionPerformed) -> None:
@@ -641,7 +659,17 @@ class AnyqlApp(App):
             "toggle-sql": self.action_toggle_sql,
             "toggle-schema": self.action_toggle_schema,
             "settings": self.action_settings,
+            "fn": self.action_fn,
+            "query-to-fn": self.action_query_to_fn,
+            "export-results": self.action_export_results,
+            "ai": self.action_ai,
         }
+        if event.action.startswith("fn-open:"):
+            self._open_fn(focus=event.action[len("fn-open:") :])
+            return
+        if event.action.startswith("fn-new:"):
+            self._open_fn(new_name=event.action[len("fn-new:") :])
+            return
         action = actions.get(event.action)
         if action is not None:
             action()
@@ -652,4 +680,4 @@ def main() -> None:
     AnyqlApp().run()
 
 
-__all__ = ["AnyqlApp", "CommandPalette", "EditorPane", "ResultsTable", "main"]
+__all__ = ["AnyqlApp", "main"]

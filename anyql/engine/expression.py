@@ -6,12 +6,16 @@ caller surfaces to the user as-is.
 
 from __future__ import annotations
 
+import functools
+import operator
 import re
 from operator import eq, ge, gt, le, lt, ne
 
 import ibis
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisError
+
+from anyql.query.functions import SCALAR_FUNCTIONS
 
 __all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql"]
 
@@ -22,7 +26,11 @@ class PayloadError(Exception):
 
 AGGREGATE_FNS = frozenset({"sum", "avg", "count", "min", "max"})
 COMPARISONS = {"=": eq, "!=": ne, ">": gt, ">=": ge, "<": lt, "<=": le}
-OPERATORS = frozenset(COMPARISONS) | {"like"}
+# The regex operators: POSIX-style matching (`~`) and its negation (`!~`).
+REGEX_OPS = frozenset({"~", "!~"})
+# The operators whose operand is an inline subquery rather than a literal.
+SUBQUERY_OPS = frozenset({"in", "not in"})
+OPERATORS = frozenset(COMPARISONS) | {"like", *REGEX_OPS, *SUBQUERY_OPS}
 
 # Temporal extraction functions: dtype family -> method on the ibis column.
 # A temporal call is a derived grouping column (`year(timestamp)` ->
@@ -47,13 +55,25 @@ def _dtype_family(dtype) -> str | None:
 
 
 def get_table(
-    con, dataset: object, ctes: dict[str, ir.Table] | None = None
+    con,
+    dataset: object,
+    ctes: dict[str, ir.Table] | None = None,
+    tables: dict[str, ir.Table] | None = None,
 ) -> ir.Table:
-    """Resolve a dataset: a built CTE shadows a registered table of the same name."""
+    """Resolve a dataset: a built CTE shadows a registered table of the same name.
+
+    `tables` are the source's own datasets, already resolved to expressions by
+    whoever owns the registry. They win over asking the connection, which is not
+    only cheaper but *correct* on a backend that introspects when it is asked
+    for a table by name: SQLite's `con.table()` reads the schema inside a
+    transaction of its own, which would commit the session's.
+    """
     if not isinstance(dataset, str) or not dataset:
         raise PayloadError("dataset must be a non-empty string")
     if ctes and dataset in ctes:
         return ctes[dataset]
+    if tables and dataset in tables:
+        return tables[dataset]
     try:
         return con.table(dataset)
     except Exception as exc:  # backend raises IbisError/KeyError for unknown names
@@ -84,12 +104,174 @@ def col(frames: list[tuple[str, ir.Table]], ref: object, what: str = "column") -
     raise PayloadError(f"unknown {what}: {ref!r}")
 
 
+def _build_source(
+    con,
+    dataset: object,
+    body: object,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> ir.Table:
+    """A `\\from`/`\\join`/set-op source: a registered dataset or CTE, or an inline body.
+
+    An inline `( … )` subquery is a query of its own and builds recursively
+    against the same connection, with the same CTEs in scope — the body is a
+    relation, never string SQL.
+    """
+    if body is not None:
+        if not isinstance(body, dict):
+            raise PayloadError("a subquery source must be an object")
+        return build(con, body, ctes, tables)
+    return get_table(con, dataset, ctes, tables)
+
+
+def _outer_ref(ref: object, frames: list[tuple[str, ir.Table]]) -> bool:
+    """True when a `\\where` operand names a column outside the lateral body."""
+    if not isinstance(ref, str) or "." not in ref:
+        return False
+    prefix = ref[: ref.index(".")]
+    return any(prefix == name for name, _ in frames)
+
+
+_LATERAL_ROW = "anyql_lateral_row"
+
+
+def _body_column(right: ir.Table, ref: object, what: str) -> ir.Column:
+    """A column of a lateral body's own output.
+
+    The body is one built relation, so its column resolves by name however it
+    was qualified inside the body (`e.user_id` names the same column as
+    `user_id` here) — the qualifier belongs to the body's own tables, not to the
+    name the join gives that relation.
+    """
+    if not isinstance(ref, str):
+        raise PayloadError(f"unknown {what}: {ref!r}")
+    name = ref.rpartition(".")[2]
+    if name in right.columns:
+        return right[name]
+    raise PayloadError(f"unknown {what}: {ref!r}")
+
+
+def _lateral_parts(
+    con,
+    spec: dict,
+    frames: list[tuple[str, ir.Table]],
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> tuple[ir.Table, object, list[ir.Column], list, int | None]:
+    """A lateral join's right table, join predicate, partition keys and row cap.
+
+    ibis builds no correlated subquery inside a join, so the correlation is
+    *hoisted* instead: the body's `\\where` equality against an outer column
+    leaves the body and becomes an equality in the join's own predicate — the
+    same relation SQL's LATERAL produces when the correlation is an equality.
+    A `\\limit` in the body then has to mean *per left row*, so the engine
+    expresses it the way query planners rewrite it: a `row_number()` over the
+    correlation's partition, filtered, with the helper column dropped again.
+
+    Returns `(right, predicate, partition_keys, order_keys, cap)`.
+    """
+    body = spec.get("body")
+    if not isinstance(body, dict):
+        raise PayloadError("a lateral join needs a `( … )` body")
+    where = body.get("where")
+    left_ref = right_ref = None
+    if isinstance(where, dict) and (
+        _outer_ref(where.get("column"), frames) or _outer_ref(where.get("value"), frames)
+    ):
+        column, value, op = where.get("column"), where.get("value"), where.get("op")
+        if op != "=" or _outer_ref(column, frames) == _outer_ref(value, frames):
+            raise PayloadError(
+                "a lateral body correlates through `= <outer column>` in its \\where: "
+                f"{column} {op} {value}"
+            )
+        left_ref, right_ref = (column, value) if _outer_ref(column, frames) else (value, column)
+    # The correlated equality is not a filter of the body; the join carries it.
+    leaves = {"where"} if left_ref is not None else set()
+    on_left, on_right = spec.get("left"), spec.get("right")
+    keys = [ref for ref in (left_ref, on_left) if isinstance(ref, str) and ref]
+    cap = body.get("limit")
+    order_specs = body.get("orderBy") or []
+    if cap is None or not keys:
+        # An uncorrelated `( … )` body keeps its own global `\limit` and `\order`.
+        right = build(con, {k: v for k, v in body.items() if k not in leaves}, ctes, tables)
+        order_specs, cap = [], None
+    else:
+        # A per-left-row cap: the ordering has to be named to be counted from.
+        if not order_specs:
+            raise PayloadError(
+                "a lateral body that caps rows needs \\order — the cap is per left row"
+            )
+        right = build(
+            con,
+            {k: v for k, v in body.items() if k not in leaves | {"limit", "orderBy"}},
+            ctes,
+            tables,
+        )
+    parts: list[ir.Value] = []
+    if left_ref is not None:
+        parts.append(
+            col(frames, left_ref, "lateral key") == _body_column(right, right_ref, "lateral key")
+        )
+    if on_left:
+        parts.append(
+            col(frames, on_left, "lateral key") == _body_column(right, on_right, "lateral key")
+        )
+    predicate: object = True if not parts else parts[0] if len(parts) == 1 else functools.reduce(
+        operator.and_, parts
+    )
+    orders: list[tuple[ir.Column, str]] = []
+    for item in order_specs:
+        if not isinstance(item, dict):
+            raise PayloadError("lateral order items must be objects")
+        target = item.get("target")
+        if not isinstance(target, str) or target not in right.columns:
+            raise PayloadError(f"unknown order target in the lateral body: {target!r}")
+        orders.append((right[target], str(item.get("direction") or "asc")))
+    # The partition is the left row the correlation matched — its bare column
+    # name, which is the name the joined relation keeps when the two sides share
+    # one (ibis renames the right's copy).
+    keys = [ref.rpartition(".")[2] for ref in keys]
+    return right, predicate, keys, orders, cap
+
+
+def _cap_lateral_rows(
+    expr: ir.Table, keys: list[str], orders: list[tuple[ir.Column, str]], cap: int
+) -> ir.Table:
+    """Keep the first `cap` rows matched for each left row — LATERAL's `\\limit`.
+
+    The rewrite every planner uses: number the joined rows inside the
+    correlation's partition, in the body's own order, keep `row_number() <= cap`,
+    then drop the numbering. The body's ordering columns belong to the right
+    side, so they are re-projected under names of their own first — a window
+    frame may only depend on one relation, and the join may have renamed a right
+    column that shares its name with a left one.
+    """
+    helpers = [f"_anyql_order_{index}" for index in range(len(orders))]
+    clash = next((name for name in (*helpers, _LATERAL_ROW) if name in expr.columns), "")
+    if clash:
+        raise PayloadError(f'column name "{clash}" collides with the lateral row cap')
+    numbered = expr.select(
+        [*[expr[name] for name in expr.columns], *[col.name(helper) for col, helper in zip([c for c, _ in orders], helpers)]]
+    )
+    window = ibis.window(
+        group_by=[numbered[key] for key in keys],
+        order_by=[
+            numbered[helper].desc() if direction == "desc" else numbered[helper].asc()
+            for (_, direction), helper in zip(orders, helpers)
+        ],
+    )
+    numbered = numbered.mutate(**{_LATERAL_ROW: ibis.row_number().over(window) + 1})
+    return numbered.filter(numbered[_LATERAL_ROW] <= cap).drop(*helpers, _LATERAL_ROW)
+
+
 def _join_frames(
     con,
     dataset: object,
     joins: object,
     alias: object = None,
     ctes: dict[str, ir.Table] | None = None,
+    body: object = None,
+    tables: dict[str, ir.Table] | None = None,
 ) -> tuple[list[tuple[str, ir.Table]], ir.Table]:
     """Build the ordered open-table list and the chained inner-join expression.
 
@@ -97,9 +279,10 @@ def _join_frames(
     present, else dataset name); duplicate identifiers are rejected. Join keys
     validate against frames accumulated so far (left) and the right table;
     predicates reference the pre-join parent frames, which ibis still resolves
-    inside the join graph.
+    inside the join graph. A source may be an inline subquery body, and a
+    `lateral` join's body may read the frames to its left (see `_lateral_parts`).
     """
-    source = get_table(con, dataset, ctes)
+    source = _build_source(con, dataset, body, ctes, tables)
     identifier = alias if isinstance(alias, str) and alias else dataset
     frames: list[tuple[str, ir.Table]] = [(identifier, source)]
     expr: ir.Table = source
@@ -112,21 +295,35 @@ def _join_frames(
             raise PayloadError("join specs must be objects")
         right_name = spec.get("dataset")
         right_alias = spec.get("alias")
-        right = get_table(con, right_name, ctes)
         right_ident = right_alias if isinstance(right_alias, str) and right_alias else right_name
+        if not isinstance(right_ident, str) or not right_ident:
+            raise PayloadError("a join source needs an identifier")
         if any(name == right_ident for name, _ in frames):
             raise PayloadError(f'duplicate table identifier "{right_ident}"')
-        left_key = spec.get("left")
-        right_key = spec.get("right")
-        left_table = next(
-            (t for _, t in frames if isinstance(left_key, str) and left_key in t.columns),
-            None,
-        )
-        if left_table is None:
-            raise PayloadError(f"unknown join key: {left_key!r}")
-        if not isinstance(right_key, str) or right_key not in right.columns:
-            raise PayloadError(f"unknown join key: {right_key!r}")
-        expr = expr.join(right, left_table[left_key] == right[right_key])
+        if spec.get("lateral"):
+            right, predicate, keys, orders, cap = _lateral_parts(con, spec, frames, ctes, tables)
+            expr = expr.join(right, predicate)
+            if cap is not None:
+                expr = _cap_lateral_rows(expr, keys, orders, cap)
+            frames.append((right_ident, right))
+            continue
+        right = _build_source(con, right_name, spec.get("body"), ctes, tables)
+        # A *qualified* `on` side may name either relation — `a.k = b.k` and
+        # `b.k = a.k` are the same equality — so it resolves against the
+        # accumulated frames *and* this join's own table (its identifier is fresh,
+        # duplicates refused above, so a qualified name is never ambiguous). A
+        # *bare* name keeps left/right scoping: left resolves to the accumulated
+        # left, right to this table, so `on user_id` is `left.user_id = right.user_id`,
+        # never a self-comparison that would cross the two relations.
+        both = [*frames, (right_ident, right)]
+
+        def key(ref: object, own: list[tuple[str, ir.Table]]) -> ir.Column:
+            scoped = both if isinstance(ref, str) and "." in ref else own
+            return col(scoped, ref, "join key")
+
+        left_column = key(spec.get("left"), frames)
+        right_column = key(spec.get("right"), [(right_ident, right)])
+        expr = expr.join(right, left_column == right_column)
         frames.append((right_ident, right))
     return frames, expr
 
@@ -150,9 +347,18 @@ def _coerce(value: object, dtype) -> object:
     return value if isinstance(value, str) else str(value)
 
 
-def _aggregate(column: ir.Column, fn: str) -> ir.Scalar:
-    """Apply an aggregate method. Resolved by name so a string column can
-    `count` without touching dtype-incompatible methods like `sum`."""
+def _aggregate(
+    expr: ir.Table, frames: list[tuple[str, ir.Table]], fn: object, arg: object
+) -> ir.Scalar:
+    """Count `*` on the current relation; column counts retain NULL semantics."""
+    if fn not in AGGREGATE_FNS:
+        raise PayloadError(f"unknown aggregate: {fn!r}")
+    if arg == "*":
+        if fn != "count":
+            raise PayloadError(f"{fn}(*) is not supported — only count accepts '*'")
+        return expr.count()
+    column = col(frames, arg)
+    # Resolve by name: a string column can count without touching numeric methods.
     method = {
         "sum": "sum",
         "avg": "mean",
@@ -172,16 +378,79 @@ def _predicate(frames: list[tuple[str, ir.Table]], condition: dict) -> ir.Boolea
     if op == "like":
         substring = str(value).strip("%")
         return column.contains(substring)
+    if op in REGEX_OPS:
+        return _regex_match(column, op, value)
     compare = COMPARISONS.get(op)
     if compare is None:
         raise PayloadError(f"unknown operator: {op!r}")
     return compare(column, _coerce(value, column.type()))
 
 
-def _apply_filter(expr: ir.Table, frames: list[tuple[str, ir.Table]], condition: object) -> ir.Table:
+def _regex_match(column: ir.Column, op: str, pattern: object) -> ir.BooleanValue:
+    """`<column> ~ <pattern>` / `!~ <pattern>` — POSIX matching off the dtype.
+
+    Regex is a string operation, so a non-string column is the user's mistake
+    and says so instead of surfacing an ibis attribute error.
+    """
+    if not isinstance(column, ir.StringValue):
+        raise PayloadError(
+            f"`{op}` needs a string column: {column.get_name()!r} is {column.type()}"
+        )
+    text = str(pattern)
+    match = column.re_search(text)
+    return match if op == "~" else ~match
+
+
+def _apply_filter(
+    con,
+    expr: ir.Table,
+    frames: list[tuple[str, ir.Table]],
+    condition: object,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> ir.Table:
+    """A `\\where` clause: a literal predicate, or one over an inline subquery."""
     if not isinstance(condition, dict):
         raise PayloadError("where must be an object")
+    subquery = condition.get("subquery")
+    if subquery is not None:
+        return _apply_subquery_filter(con, expr, frames, condition, subquery, ctes, tables)
     return expr.filter(_predicate(frames, condition))
+
+
+def _apply_subquery_filter(
+    con,
+    expr: ir.Table,
+    frames: list[tuple[str, ir.Table]],
+    condition: dict,
+    subquery: object,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> ir.Table:
+    """A `\\where` over an inline `( … )` subquery.
+
+    `in`/`not in` take the subquery's single column as the set; a comparison
+    takes it as a scalar subquery (`\\where amount > ( … )`), which needs exactly
+    one column too — anything else is the user's mistake, named as such.
+    """
+    if not isinstance(subquery, dict):
+        raise PayloadError("where subquery must be an object")
+    op = condition.get("op")
+    column = col(frames, condition.get("column"))
+    sub = build(con, subquery, ctes, tables)
+    projected = [str(name) for name in sub.columns]
+    if len(projected) != 1:
+        raise PayloadError(
+            f"`{op}` needs a subquery of exactly one column — "
+            f"it projects: {', '.join(projected) or '(nothing)'}"
+        )
+    inner = sub[projected[0]]
+    if op in SUBQUERY_OPS:
+        return expr.filter(column.isin(inner) if op == "in" else column.notin(inner))
+    compare = COMPARISONS.get(op)
+    if compare is None:
+        raise PayloadError(f"unknown operator: {op!r}")
+    return expr.filter(compare(column, inner.as_scalar()))
 
 
 def _literal(value: object) -> ir.Value:
@@ -230,14 +499,34 @@ RANK_FNS = frozenset({"rank", "dense_rank", "row_number"})
 SET_OP_METHODS = {"union": "union", "intersect": "intersect", "except": "difference"}
 
 
-def _window_frame(frames: list[tuple[str, ir.Table]], spec: object):
+def _frame_offset(bound: object, edge: str) -> int | None:
+    """A canonical frame bound as ibis' own offset convention.
+
+    `None` means unbounded on that edge, `0` is the current row, and negative /
+    positive numbers count rows (`rows`) or ordering values (`range`) backwards
+    and forwards — the convention `ibis.window(rows=…, range=…)` reads.
+    """
+    text = str(bound).strip().lower()
+    if text.startswith("unbounded"):
+        return None
+    if text == "current row":
+        return 0
+    number, _, side = text.partition(" ")
+    if not number.isdigit() or side not in ("preceding", "following"):
+        raise PayloadError(f"unknown frame bound: {bound!r} at the {edge} of the frame")
+    return -int(number) if side == "preceding" else int(number)
+
+
+def _window_frame(expr: ir.Table, frames: list[tuple[str, ir.Table]], spec: object):
     """A select item's `window` object -> an ibis window (>= 1 of partition/order)."""
     if not isinstance(spec, dict):
         raise PayloadError("window must be an object")
     partitions = spec.get("partitionBy") or []
     if not isinstance(partitions, list):
         raise PayloadError("window partitionBy must be an array")
-    group_by = [col(frames, name, "partition column") for name in partitions]
+    # Bind the resolved column expressions, not their bare names: a join can
+    # rename duplicate columns, and each window must depend on one relation.
+    group_by = expr.bind([col(frames, name, "partition column") for name in partitions])
     order = spec.get("order")
     order_by = None
     if order is not None:
@@ -246,15 +535,30 @@ def _window_frame(frames: list[tuple[str, ir.Table]], spec: object):
         direction = order.get("direction", "asc")
         if direction not in ("asc", "desc"):
             raise PayloadError(f"unknown sort direction: {direction!r}")
-        key = col(frames, order.get("column"), "order column")
+        (key,) = expr.bind(col(frames, order.get("column"), "order column"))
         order_by = key.desc() if direction == "desc" else key.asc()
     if not group_by and order_by is None:
         raise PayloadError("window needs partitionBy and/or order")
-    return ibis.window(group_by=group_by, order_by=order_by)
+    bounds = spec.get("frame")
+    if bounds is None:
+        return ibis.window(group_by=group_by, order_by=order_by)
+    if not isinstance(bounds, dict):
+        raise PayloadError("window frame must be an object")
+    kind = bounds.get("kind")
+    if kind not in ("rows", "range"):
+        raise PayloadError(f"unknown window frame kind: {kind!r}")
+    span = (_frame_offset(bounds.get("start"), "start"), _frame_offset(bounds.get("end"), "end"))
+    # `rows` counts rows, `range` counts ordering values — ibis spells both with
+    # the same offsets, so the frame's kind is what picks the keyword.
+    return ibis.window(
+        group_by=group_by,
+        order_by=order_by,
+        **({"rows": span} if kind == "rows" else {"range": span}),
+    )
 
 
 def _windowed_column(
-    frames: list[tuple[str, ir.Table]], item: dict, name: str
+    expr: ir.Table, frames: list[tuple[str, ir.Table]], item: dict, name: str
 ) -> ir.Column:
     """A windowed select item -> `<fn> OVER ( … ) AS name`.
 
@@ -262,7 +566,7 @@ def _windowed_column(
     argument), or a capability aggregate over a frame (a partition total).
     Ranks render 1-based: ibis' SQL dialects normalize rank functions to
     0-based, so the compiled expression adds one back."""
-    window = _window_frame(frames, item.get("window"))
+    window = _window_frame(expr, frames, item.get("window"))
     rank = item.get("rank")
     if rank is not None:
         if not isinstance(rank, dict):
@@ -275,14 +579,19 @@ def _windowed_column(
     aggregate = item.get("aggregate")
     if not isinstance(aggregate, dict):
         raise PayloadError("over (...) needs an aggregate or rank function")
-    fn = aggregate.get("fn")
-    if fn not in AGGREGATE_FNS:
-        raise PayloadError(f"unknown aggregate: {fn!r}")
-    column = col(frames, aggregate.get("arg"))
-    return _aggregate(column, fn).over(window).name(name)
+    (aggregate_expr,) = expr.bind(
+        _aggregate(expr, frames, aggregate.get("fn"), aggregate.get("arg"))
+    )
+    return aggregate_expr.over(window).name(name)
 
 
-def _apply_set_ops(con, expr: ir.Table, set_ops: object, ctes: dict[str, ir.Table] | None) -> ir.Table:
+def _apply_set_ops(
+    con,
+    expr: ir.Table,
+    set_ops: object,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> ir.Table:
     """Apply `setOps` left-deep, in document order, onto the built left query.
 
     The accumulated left's output columns define what each operation is over:
@@ -305,16 +614,17 @@ def _apply_set_ops(con, expr: ir.Table, set_ops: object, ctes: dict[str, ir.Tabl
         if method is None:
             raise PayloadError(f"unknown set operation: {op!r}")
         dataset = spec.get("dataset")
+        label = dataset if isinstance(dataset, str) and dataset else "( … )"
         distinct = spec.get("distinct", True)
         if not isinstance(distinct, bool):
             raise PayloadError("setOp distinct must be a boolean")
-        right = get_table(con, dataset, ctes)
+        right = _build_source(con, dataset, spec.get("body"), ctes, tables)
         target = [str(name) for name in expr.columns]
         operand = [str(name) for name in right.columns]
         missing = [name for name in target if name not in operand]
         if missing:
             raise PayloadError(
-                f'\\{op} "{dataset}" is missing {", ".join(missing)} — '
+                f'\\{op} "{label}" is missing {", ".join(missing)} — '
                 f'it projects: {", ".join(operand)}'
             )
         # ibis' set operations align by name and need equal schemas: the operand
@@ -324,8 +634,126 @@ def _apply_set_ops(con, expr: ir.Table, set_ops: object, ctes: dict[str, ir.Tabl
         try:
             expr = getattr(expr, method)(right, distinct=distinct)
         except IbisError as exc:
-            raise PayloadError(f'\\{op} "{dataset}": {" ".join(str(exc).split())}') from exc
+            raise PayloadError(f'\\{op} "{label}": {" ".join(str(exc).split())}') from exc
     return expr
+
+
+def _regex_column(frames: list[tuple[str, ir.Table]], spec: dict, name: str) -> ir.Column:
+    """A regex select item -> `REGEXP_EXTRACT` / `REGEXP_REPLACE` over a string column.
+
+    `regexp_extract` returns the whole match unless a capture group is named;
+    `regexp_replace` substitutes every match. Both are row-wise string
+    operations, so a non-string column is the user's mistake, named as such.
+    """
+    fn = spec.get("fn")
+    pattern = spec.get("pattern")
+    if not isinstance(pattern, str) or not pattern:
+        raise PayloadError(f"{fn} needs a pattern")
+    column = col(frames, spec.get("arg"), "regex argument")
+    if not isinstance(column, ir.StringValue):
+        raise PayloadError(
+            f"{fn} needs a string column: {column.get_name()!r} is {column.type()}"
+        )
+    if fn == "regexp_extract":
+        group = spec.get("group")
+        return column.re_extract(pattern, group if isinstance(group, int) else 0).name(name)
+    if fn == "regexp_replace":
+        replacement = spec.get("replacement")
+        return column.re_replace(pattern, replacement if isinstance(replacement, str) else "").name(name)
+    raise PayloadError(f"unknown regex function: {fn!r}")
+
+
+def _scalar_argument(frames: list[tuple[str, ir.Table]], node: object) -> ir.Value:
+    """Resolve exactly one scalar argument form, without implicit coercion."""
+    if not isinstance(node, dict):
+        raise PayloadError("scalar arguments must be objects")
+    if set(node) == {"column"}:
+        return col(frames, node["column"], "scalar argument")
+    if set(node) == {"literal"}:
+        literal = node["literal"]
+        if not isinstance(literal, dict) or set(literal) != {"value"}:
+            raise PayloadError("scalar literal must be an object with only a value")
+        value = literal["value"]
+        if value is not None and not isinstance(value, (str, int, float, bool)):
+            raise PayloadError("literal value must be a string, number, boolean, or null")
+        try:
+            return ibis.literal(value)
+        except (IbisError, TypeError, ValueError, OverflowError) as exc:
+            raise PayloadError(f"invalid scalar literal: {exc}") from exc
+    if set(node) == {"fn", "args"}:
+        return _scalar_call(frames, node)
+    raise PayloadError("scalar argument must contain only column, literal, or fn and args")
+
+
+def _scalar_call(frames: list[tuple[str, ir.Table]], spec: object) -> ir.Value:
+    """Build a catalog-whitelisted call using Ibis' own string semantics."""
+    if not isinstance(spec, dict) or set(spec) != {"fn", "args"}:
+        raise PayloadError("scalar must be an object with only fn and args")
+    fn = spec["fn"]
+    if not isinstance(fn, str) or fn not in SCALAR_FUNCTIONS:
+        raise PayloadError(f"unknown scalar function: {fn!r}")
+    signature = SCALAR_FUNCTIONS[fn]
+    nodes = spec["args"]
+    if not isinstance(nodes, list):
+        raise PayloadError(f"{fn} args must be an array")
+    if not signature.accepts(len(nodes)):
+        maximum = len(signature.parameters)
+        expected = (
+            f"at least {signature.minimum}"
+            if signature.variadic
+            else str(maximum) if signature.minimum == maximum
+            else f"{signature.minimum} to {maximum}"
+        )
+        raise PayloadError(f"{fn} expects {expected} arguments, got {len(nodes)}")
+    args = []
+    for index, node in enumerate(nodes):
+        value = _scalar_argument(frames, node)
+        kind = signature.argument_kind(index)
+        dtype = value.type()
+        if kind != "any":
+            if dtype.is_null():
+                value = value.cast("int64" if kind == "integer" else "string")
+            elif not (dtype.is_string() if kind == "string" else dtype.is_integer()):
+                raise PayloadError(f"{fn} argument {index + 1} needs {kind}, got {dtype}")
+        args.append(value)
+    first, *rest = args
+    try:
+        if fn == "string":
+            return first.cast("string")
+        if fn == "concat":
+            return first.concat(*rest)
+        if fn == "concat_ws":
+            return first.join(rest)
+        return getattr(first, fn)(*rest)
+    except (IbisError, TypeError, ValueError, OverflowError) as exc:
+        raise PayloadError(f"invalid {fn} arguments: {exc}") from exc
+
+
+def _scalar_subquery_column(
+    con,
+    subquery: object,
+    name: str | None,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> ir.Column:
+    """A `\\select ( … ) as <alias>` scalar subquery, projected as one column.
+
+    It projects exactly one column (the same rule SQL has) and needs an alias —
+    there is nothing to derive a name from. It is a computed column like a case
+    or window column, so the caller keeps it out of any grouped projection.
+    """
+    if not name:
+        raise PayloadError("a scalar subquery needs an alias — write ( … ) as <name>")
+    if not isinstance(subquery, dict):
+        raise PayloadError("a scalar subquery must be an object")
+    sub = build(con, subquery, ctes, tables)
+    projected = [str(column) for column in sub.columns]
+    if len(projected) != 1:
+        raise PayloadError(
+            "a scalar subquery must project exactly one column — "
+            f"it projects: {', '.join(projected) or '(nothing)'}"
+        )
+    return sub[projected[0]].as_scalar().name(name)
 
 
 def _star_columns(frames: list[tuple[str, ir.Table]]) -> list[ir.Column]:
@@ -340,7 +768,12 @@ def _star_columns(frames: list[tuple[str, ir.Table]]) -> list[ir.Column]:
     return columns
 
 
-def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Table:
+def build(
+    con,
+    payload: dict,
+    ctes: dict[str, ir.Table] | None = None,
+    tables: dict[str, ir.Table] | None = None,
+) -> ir.Table:
     """Compile an ExecutePayload dict into an Ibis table expression.
 
     Empty `select` means all columns (with joins: left table first, each joined
@@ -356,12 +789,21 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
     datasets."""
     if not isinstance(payload, dict):
         raise PayloadError("payload must be an object")
+    distinct = payload.get("distinct", False)
+    if not isinstance(distinct, bool):
+        raise PayloadError("distinct must be a boolean")
 
     cte_tables: dict[str, ir.Table] = dict(ctes) if ctes else {}
-    _build_ctes(con, payload.get("ctes"), cte_tables)
+    _build_ctes(con, payload.get("ctes"), cte_tables, tables)
 
     frames, expr = _join_frames(
-        con, payload.get("dataset"), payload.get("joins"), payload.get("alias"), cte_tables
+        con,
+        payload.get("dataset"),
+        payload.get("joins"),
+        payload.get("alias"),
+        cte_tables,
+        payload.get("body"),
+        tables,
     )
 
     select = payload.get("select") or []
@@ -378,11 +820,13 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
         raise PayloadError("orderBy must be an array")
 
     if where is not None:
-        expr = _apply_filter(expr, frames, where)
+        expr = _apply_filter(con, expr, frames, where, cte_tables, tables)
 
-    plain: list[ir.Column] = []
+    plain: list[ir.Value] = []
+    constants: list[ir.Scalar] = []
     aggregates: list[ir.Column] = []
     windowed: list[ir.Column] = []
+    scalar_subqueries: list[ir.Column] = []
     # Output names already projected as plain columns; a star expansion skips
     # these so `\select user_id, *` never duplicates `user_id`.
     projected: set[str] = set()
@@ -391,12 +835,21 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
         if not isinstance(item, dict):
             raise PayloadError("select items must be objects")
         column_name = item.get("column")
+        literal = item.get("literal")
+        scalar = item.get("scalar")
         aggregate = item.get("aggregate")
         temporal = item.get("temporal")
         rank = item.get("rank")
+        regex = item.get("regex")
+        subquery = item.get("subquery")
         alias = item.get("alias")
         named = alias if isinstance(alias, str) and alias else None
         star = bool(item.get("star"))
+        if scalar is not None and any(
+            value is not None
+            for value in (column_name, literal, aggregate, temporal, rank, regex, subquery)
+        ):
+            raise PayloadError("a scalar select item carries only one expression")
         if star:
             if item.get("window") is not None:
                 raise PayloadError("a star select cannot carry over (...)")
@@ -407,6 +860,10 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
                 or aggregate is not None
                 or temporal is not None
                 or rank is not None
+                or regex is not None
+                or subquery is not None
+                or literal is not None
+                or scalar is not None
             ):
                 raise PayloadError("a star select item carries no expression")
             star_seen = True
@@ -415,16 +872,45 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
                     projected.add(column.get_name())
                     plain.append(column)
         elif item.get("window") is not None:
+            if scalar is not None:
+                raise PayloadError("a scalar call cannot carry over (...)")
             if rank is not None:
                 fn = rank.get("fn") if isinstance(rank, dict) else None
-                windowed.append(_windowed_column(frames, item, named or str(fn)))
+                windowed.append(_windowed_column(expr, frames, item, named or str(fn)))
             elif isinstance(aggregate, dict):
                 fn = aggregate.get("fn")
                 windowed.append(
-                    _windowed_column(frames, item, named or _derived_alias(fn, aggregate.get("arg")))
+                    _windowed_column(expr, frames, item, named or _derived_alias(fn, aggregate.get("arg")))
                 )
             else:
                 raise PayloadError("over (...) needs an aggregate or rank function")
+        elif scalar is not None:
+            out = _scalar_call(frames, scalar)
+            out = out.name(named or scalar["fn"])
+            plain.append(out)
+            projected.add(out.get_name())
+            if isinstance(out, ir.Scalar):
+                constants.append(out)
+        elif literal is not None:
+            if not isinstance(literal, dict) or "value" not in literal:
+                raise PayloadError("literal must be an object with a value")
+            value = literal["value"]
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise PayloadError("literal value must be a string, number, boolean, or null")
+            out = ibis.literal(value)
+            if named:
+                out = out.name(named)
+            constants.append(out)
+            plain.append(out)
+            projected.add(out.get_name())
+        elif subquery is not None:
+            scalar_subqueries.append(_scalar_subquery_column(con, subquery, named, cte_tables, tables))
+        elif regex is not None:
+            if not isinstance(regex, dict):
+                raise PayloadError("regex must be an object")
+            name = named or _derived_alias(regex.get("fn"), regex.get("arg"))
+            plain.append(_regex_column(frames, regex, name))
+            projected.add(name)
         elif rank is not None:
             fn = rank.get("fn") if isinstance(rank, dict) else None
             raise PayloadError(f"{fn}() requires over (...)")
@@ -432,10 +918,7 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
             if not isinstance(aggregate, dict):
                 raise PayloadError("aggregate must be an object")
             fn = aggregate.get("fn")
-            if fn not in AGGREGATE_FNS:
-                raise PayloadError(f"unknown aggregate: {fn!r}")
-            column = col(frames, aggregate.get("arg"))
-            out = _aggregate(column, fn)
+            out = _aggregate(expr, frames, fn, aggregate.get("arg"))
             name = named or _derived_alias(fn, aggregate.get("arg"))
             aggregates.append(out.name(name))
         elif temporal is not None:
@@ -462,7 +945,9 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
             plain.append(column)
             projected.add(named or column.get_name())
         else:
-            raise PayloadError("select item must have column, aggregate, temporal, rank, or *")
+            raise PayloadError(
+                "select item must have column, literal, scalar, aggregate, temporal, rank, regex, subquery, or *"
+            )
 
     keys = []
     seen: set[str] = set()
@@ -480,16 +965,22 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
         raise PayloadError("windowed select items cannot mix with aggregates or group by")
     if star_seen and (aggregates or group_by):
         raise PayloadError("star select cannot mix with aggregates or group by")
-    computed += windowed
+    if scalar_subqueries and (aggregates or group_by):
+        raise PayloadError("a scalar subquery cannot mix with aggregates or group by")
+    computed += windowed + scalar_subqueries
     joined = len(frames) > 1
     if aggregates:
         if computed:
             raise PayloadError("case/window columns cannot mix with aggregates")
         for column in plain:
+            if isinstance(column, ir.Scalar):
+                continue  # Constants never introduce grouping, even on an empty input.
             if column.get_name() not in seen:
                 keys.append(column)
                 seen.add(column.get_name())
         expr = expr.group_by(keys).aggregate(aggregates) if keys else expr.aggregate(aggregates)
+        if constants:
+            expr = expr.mutate(constants)
     elif plain:
         expr = expr.select([*plain, *computed])
     elif joined:
@@ -500,7 +991,9 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
 
     # Set operations run over the projection above, so a trailing `\order` and
     # `\limit` apply to the merged result (SQL's own reading of the document).
-    expr = _apply_set_ops(con, expr, payload.get("setOps"), cte_tables)
+    expr = _apply_set_ops(con, expr, payload.get("setOps"), cte_tables, tables)
+    if distinct:
+        expr = expr.distinct()
 
     if order_by:
         sorts = []
@@ -527,7 +1020,9 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
     return expr
 
 
-def _build_ctes(con, ctes: object, tables: dict[str, ir.Table]) -> None:
+def _build_ctes(
+    con, ctes: object, resolved: dict[str, ir.Table], tables: dict[str, ir.Table] | None
+) -> None:
     """Build each `ctes` entry in order into `tables`, so a later body can name
     an earlier CTE. Bodies build against the same connection through `build`;
     the map is threaded into table resolution (no `con` state mutation)."""
@@ -541,14 +1036,14 @@ def _build_ctes(con, ctes: object, tables: dict[str, ir.Table]) -> None:
         name = spec.get("name")
         if not isinstance(name, str) or not name:
             raise PayloadError("cte must have a non-empty name")
-        if name in tables:
+        if name in resolved:
             raise PayloadError(f'duplicate cte name "{name}"')
         body = spec.get("body")
         if not isinstance(body, dict):
             raise PayloadError(f"cte {name!r} must have a body object")
         if body.get("ctes"):
             raise PayloadError("nested CTEs are not supported")
-        tables[name] = build(con, body, tables)
+        resolved[name] = build(con, body, resolved, tables)
 
 
 def _derived_alias(fn: object, arg: object) -> str:

@@ -56,14 +56,6 @@ TABLES = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def _empty_registry():
-    """Every test starts (and ends) with the schema registry empty."""
-    set_schema_state([])
-    yield
-    set_schema_state([])
-
-
 @pytest.fixture
 def loaded():
     set_schema_state(TABLES)
@@ -475,6 +467,21 @@ def test_over_is_case_insensitive_and_tolerates_spacing():
     assert ast.select[0].window.order.direction == "desc"
 
 
+def test_literal_expressions_preserve_types_and_resolve_aliases():
+    ast = parse_query("\\from events\n\\select '1' as text_one, 1 as number_one, null as missing\n\\order text_one\n\\limit 2")
+    assert ast.errors == []
+    assert [item.literal.to_json() for item in ast.select] == [
+        {"value": "1"}, {"value": 1}, {"value": None},
+    ]
+    assert ast.order_by[0].resolves_to == 1
+
+
+@pytest.mark.parametrize("expression", ["'unclosed", "'a' 'b'", "'x' over (order by user_id)"])
+def test_invalid_literal_expressions_are_rejected_on_settled_lines(expression):
+    ast = parse_query(f"\\from events\n\\select {expression}\n\\limit 1")
+    assert [error.line for error in ast.errors] == [2]
+
+
 # --- star select -------------------------------------------------------------
 
 
@@ -487,11 +494,15 @@ def test_star_parses_to_a_star_item_and_the_payload_carries_star():
     payload = payload_from_ast(ast)
     assert payload["select"][0] == {
         "column": None,
+        "literal": None,
+        "scalar": None,
         "star": True,
         "aggregate": None,
         "temporal": None,
         "rank": None,
         "window": None,
+        "regex": None,
+        "subquery": None,
         "alias": None,
     }
 
@@ -755,20 +766,25 @@ def test_join_rejects_a_malformed_clause():
     assert messages(ast) == ["\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"]
     assert ast.joins == []
 
-    # The right-hand side is a bare column by grammar — only the left may be
-    # identifier-qualified, so a qualified right side is a malformed clause.
-    ast = parse_query("\\from events\n\\join users u on user_id = u.id\n\\limit 2")
+    ast = parse_query("\\from events\n\\join users u on user_id =\n\\limit 2")
     assert messages(ast) == ["\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"]
     assert ast.joins == []
 
+    # Either side of `on` may be identifier-qualified: the right side names the
+    # joined source, which a derived table's column needs.
+    ast = parse_query("\\from events\n\\join users u on user_id = u.id\n\\limit 2")
+    assert ast.errors == []
+    assert ast.joins[0].right == "u.id"
 
-def test_join_qualified_left_only_sees_identifiers_established_before_it(loaded):
+
+def test_join_qualified_on_names_any_open_table_at_its_clause(loaded):
     ast = parse_query("\\from events as e\n\\join users as u on e.user_id = id\n\\limit 2")
     assert ast.errors == []
 
-    # The clause's own alias is not part of the accumulated left yet.
-    ast = parse_query("\\from events as e\n\\join users as u on u.user_id = id\n\\limit 2")
-    assert messages(ast) == ['unknown column "u.user_id" — "u" is not an open table: e']
+    # Either side may name this clause's own table: `a.k = b.k` and `b.k = a.k`
+    # are the same equality, so the own alias resolves wherever it is written.
+    ast = parse_query("\\from events as e\n\\join users as u on u.user_id = e.user_id\n\\limit 2")
+    assert ast.errors == []
 
     # A third clause sees both earlier identifiers.
     ast = parse_query(
@@ -779,13 +795,15 @@ def test_join_qualified_left_only_sees_identifiers_established_before_it(loaded)
     )
     assert ast.errors == []
 
+    # A prefix naming nothing open at that clause is still refused, now listing
+    # every identifier the clause can see (including its own alias).
     ast = parse_query(
         "\\from events as e\n"
         "\\join users as u on user_id = id\n"
         "\\join users as r on z.user_id = id\n"
         "\\limit 2"
     )
-    assert messages(ast) == ['unknown column "z.user_id" — "z" is not an open table: e, u']
+    assert messages(ast) == ['unknown column "z.user_id" — "z" is not an open table: e, u, r']
 
 
 # --- `\union` / `\intersect` / `\except` -------------------------------------
@@ -808,10 +826,10 @@ def test_set_op_parses_with_sql_defaults_and_modifiers():
         (5, "except", "staging", True),
     ]
     assert payload_from_ast(ast)["setOps"] == [
-        {"op": "union", "dataset": "archived", "distinct": True},
-        {"op": "union", "dataset": "events", "distinct": False},
-        {"op": "intersect", "dataset": "users", "distinct": True},
-        {"op": "except", "dataset": "staging", "distinct": True},
+        {"op": "union", "dataset": "archived", "distinct": True, "body": None},
+        {"op": "union", "dataset": "events", "distinct": False, "body": None},
+        {"op": "intersect", "dataset": "users", "distinct": True, "body": None},
+        {"op": "except", "dataset": "staging", "distinct": True, "body": None},
     ]
 
 
@@ -828,11 +846,11 @@ def test_set_op_commands_are_case_insensitive_and_keep_document_order():
 def test_set_op_rejects_a_bare_modifier_and_a_malformed_argument():
     # `\union all` names nothing: the modifier is not the table.
     ast = parse_query("\\from events\n\\union all\n\\select user_id")
-    assert messages(ast) == ["\\union expects `[all|distinct] <dataset>`"]
+    assert messages(ast) == ["\\union expects `[all|distinct] <dataset>` or `( … )`"]
     assert ast.set_ops == []
 
     ast = parse_query("\\from events\n\\intersect all 3x\n\\select user_id")
-    assert messages(ast) == ["\\intersect expects `[all|distinct] <dataset>`"]
+    assert messages(ast) == ["\\intersect expects `[all|distinct] <dataset>` or `( … )`"]
 
     ast = parse_query("\\from events\n\\except\n\\select user_id")
     assert messages(ast) == ["\\except expects arguments"]
@@ -907,15 +925,23 @@ def test_payload_maps_the_canonical_document():
     ast = parse_query(CANONICAL_DOC)
     payload = payload_from_ast(ast)
     assert payload["dataset"] == "recent"
+    assert payload["distinct"] is True
     assert payload["alias"] is None
-    assert payload["joins"] == []
-    assert payload["setOps"] == [
-        {"op": "union", "dataset": "archived", "distinct": True},
-        {"op": "union", "dataset": "events", "distinct": False},
-        {"op": "intersect", "dataset": "other", "distinct": True},
-        {"op": "except", "dataset": "staging", "distinct": True},
+    assert payload["body"] is None
+    assert [
+        (op["op"], op["dataset"], op["distinct"], op["body"] is not None)
+        for op in payload["setOps"]
+    ] == [
+        ("union", "archived", True, False),
+        ("union", "", False, True),
+        ("intersect", "other", True, False),
+        ("except", "", True, True),
     ]
-    assert payload["where"] is None
+    # Two set-op operands are inline subqueries: a payload of their own.
+    assert payload["setOps"][1]["body"]["dataset"] == "events"
+    assert payload["setOps"][3]["body"]["dataset"] == "staging"
+    assert payload["where"]["op"] == "in"
+    assert payload["where"]["subquery"]["dataset"] == "customers"
     assert payload["groupBy"] == []
     assert payload["limit"] == 5
     assert payload["orderBy"] == [{"target": "customer_total", "direction": "desc"}]
@@ -926,30 +952,74 @@ def test_payload_maps_the_canonical_document():
             "else": "low",
         }
     ]
+    assert payload["temp"] == "snapshot"
+    assert payload["drop"] == "previous"
+    assert payload["tx"] == [{"kind": "begin", "name": None}, {"kind": "commit", "name": None}]
 
-    customer, month_col, total, rank_col = payload["select"]
+    customer, month_col, total, running, rank_col, extracted, peak, *constants, _scalar = payload["select"]
+    assert [item["literal"] for item in constants] == [
+        {"value": "1"}, {"value": 1}, {"value": "x"}, {"value": None},
+    ]
     assert customer["column"] == "customer_id"
     assert customer["alias"] is None
     assert month_col["temporal"] == {"fn": "month", "arg": "placed_at"}
     assert month_col["alias"] == "placed_at_month"
     assert total == {
         "column": None,
+        "literal": None,
+        "scalar": None,
         "star": False,
         "aggregate": {"fn": "sum", "arg": "amount"},
         "temporal": None,
         "rank": None,
-        "window": {"partitionBy": ["customer_id"], "order": None},
+        "window": {"partitionBy": ["customer_id"], "order": None, "frame": None},
+        "regex": None,
+        "subquery": None,
         "alias": "customer_total",
+    }
+    # The frame rides in the window, bounds and all (`range` here).
+    assert running["window"] == {
+        "partitionBy": [],
+        "order": {"column": "placed_at", "direction": "asc"},
+        "frame": {"kind": "range", "start": "unbounded preceding", "end": "current row"},
     }
     assert rank_col == {
         "column": None,
+        "literal": None,
+        "scalar": None,
         "star": False,
         "aggregate": None,
         "temporal": None,
         "rank": {"fn": "rank"},
-        "window": {"partitionBy": [], "order": {"column": "placed_at", "direction": "desc"}},
+        "window": {
+            "partitionBy": [],
+            "order": {"column": "placed_at", "direction": "desc"},
+            "frame": None,
+        },
+        "regex": None,
+        "subquery": None,
         "alias": "recency_rank",
     }
+    assert extracted["regex"] == {
+        "fn": "regexp_extract",
+        "arg": "sku",
+        "pattern": "SKU-([0-9]+)",
+        "group": 1,
+        "replacement": None,
+    }
+    assert extracted["alias"] == "sku_number"
+    # An inline subquery travels as a payload of its own, alias included.
+    assert peak["subquery"]["dataset"] == "staging"
+    assert peak["subquery"]["select"][0]["aggregate"] == {"fn": "max", "arg": "amount"}
+    assert peak["alias"] == "peak_amount"
+
+    # The lateral join carries its body and its correlation, left as written.
+    lateral = payload["joins"][0]
+    assert lateral["lateral"] is True
+    assert lateral["alias"] == "last_two"
+    assert lateral["left"] == "recent.campaign_id"
+    assert (lateral["body"]["dataset"], lateral["body"]["limit"]) == ("spend_log", 2)
+    assert lateral["body"]["where"]["value"] == "recent.campaign_id"
 
     # A CTE body is a full payload whose own ctes list is empty (by grammar).
     assert payload["ctes"] == [
@@ -958,12 +1028,17 @@ def test_payload_maps_the_canonical_document():
             "body": {
                 "dataset": "orders",
                 "alias": None,
+                "body": None,
                 "joins": [],
                 "setOps": [],
                 "select": [],
-                "where": {"column": "status", "op": "=", "value": "paid"},
+                "distinct": False,
+                "where": {"column": "status", "op": "=", "value": "paid", "subquery": None},
                 "groupBy": [],
                 "orderBy": [],
+                "temp": None,
+                "drop": None,
+                "tx": [],
                 "limit": None,
                 "cases": [],
                 "ctes": [],
@@ -997,11 +1072,22 @@ def test_payload_maps_from_joins_where_group_order_and_limit():
     payload = payload_from_ast(ast)
     assert payload["dataset"] == "events"
     assert payload["alias"] == "e"
-    assert payload["joins"] == [{"dataset": "users", "alias": "u", "left": "user_id", "right": "id"}]
-    assert payload["where"] == {"column": "amount", "op": ">", "value": "10"}
+    assert payload["body"] is None
+    assert payload["joins"] == [
+        {
+            "dataset": "users",
+            "alias": "u",
+            "left": "user_id",
+            "right": "id",
+            "lateral": False,
+            "body": None,
+        }
+    ]
+    assert payload["where"] == {"column": "amount", "op": ">", "value": "10", "subquery": None}
     assert payload["groupBy"] == ["user_id", "region"]
     assert payload["orderBy"] == [{"target": "user_id", "direction": "desc"}]
     assert payload["limit"] == 7
+    assert payload["temp"] is None and payload["drop"] is None and payload["tx"] == []
 
 
 def test_payload_without_from_is_empty_dataset():

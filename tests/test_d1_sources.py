@@ -271,3 +271,156 @@ def test_live_join_and_aggregate_build_on_unbound_schema():
     joined = [s for s in sent if "JOIN" in s.upper()]
     assert joined, "the compiled SQLite SQL must carry the join"
     assert all('"customers"' in s and '"orders"' in s for s in joined)
+
+
+@pytest.fixture()
+def sqlite_cloudflare():
+    """Execute the API's discovery SQL, rather than answering a substring match."""
+    database = sqlite3.connect(":memory:")
+    database.row_factory = sqlite3.Row
+    database.setlimit(sqlite3.SQLITE_LIMIT_COMPOUND_SELECT, 5)
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sql = json.loads(request.content)["sql"]
+        sent.append(sql)
+        rows = [dict(row) for row in database.execute(sql).fetchall()]
+        return httpx.Response(200, json=_envelope([{"success": True, "results": rows}]))
+
+    client = CloudflareD1(
+        account_id=LIVE_ARGS["account_id"], api_token=SECRET,
+        database="11111111-2222-3333-4444-555555555555",
+        _client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        yield database, client, sent
+    finally:
+        client.close()
+        database.close()
+
+
+def test_live_discovery_executes_valid_sqlite_sql(sqlite_cloudflare):
+    database, client, _ = sqlite_cloudflare
+    database.executescript('''
+        create table "order details" ("notnull" integer not null, "quoted""name" text);
+        insert into "order details" values (1, 'first'), (2, null);
+        create table _cf_meta (internal text);
+        create view "public view" as select * from "order details";
+    ''')
+    source = add_d1_live_source("live", client=client, **LIVE_ARGS)
+    assert set(source.datasets) == {"order details", "public view"}
+    schema = source.con.table("order details").schema()
+    assert schema.names == ("notnull", 'quoted"name')
+    assert not schema["notnull"].nullable
+    assert schema['quoted"name'].nullable
+    assert {name: table["rows"] for name, table in source.datasets.items()} == {
+        "order details": 2, "public view": 2,
+    }
+
+
+def test_live_discovery_counts_all_tables_across_compound_limit(sqlite_cloudflare):
+    database, client, _ = sqlite_cloudflare
+    expected = {}
+    for index in range(12):
+        name = f'''table {index:02d} ' "'''
+        quoted = '"' + name.replace('"', '""') + '"'
+        database.execute(f"create table {quoted} (id integer)")
+        database.executemany(f"insert into {quoted} values (?)", [(n,) for n in range(index)])
+        expected[name] = index
+    database.execute('create view "last view" as select 1 as id')
+    expected["last view"] = 1
+
+    source = add_d1_live_source("many-tables", client=client, **LIVE_ARGS)
+
+    assert {name: entry["rows"] for name, entry in source.datasets.items()} == expected
+    assert set(source.con.list_tables()) == set(expected)
+
+
+def test_empty_live_database_connects_without_count_queries(sqlite_cloudflare):
+    database, client, sent = sqlite_cloudflare
+    database.execute("create table _cf_meta (internal text)")
+    source = add_d1_live_source("empty", client=client, **LIVE_ARGS)
+    assert source.kind == "d1-live"
+    assert source.datasets == {}
+    assert source.con.list_tables() == []
+    assert not any("count(*)" in sql for sql in sent)
+    assert not client._client.is_closed
+
+
+def test_database_name_is_encoded_and_unknown_names_never_execute_sql():
+    name = "production & region=other/#?"
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.url.params["name"] == name
+        assert "region" not in request.url.params
+        assert not request.url.fragment
+        return httpx.Response(200, json=_envelope([]))
+
+    client = CloudflareD1(
+        account_id="acct-1", database=name, api_token=SECRET,
+        _client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(D1Error, match="No D1 database matched"):
+        add_d1_live_source("missing", "acct-1", SECRET, name, client=client)
+    assert len(requests) == 1
+    assert not client.database_uuid
+    assert client._client.is_closed
+
+
+def test_name_resolution_searches_later_pages():
+    uuid = "11111111-2222-3333-4444-555555555555"
+    pages = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        rows = ([{"name": f"orders-db-{n}", "uuid": uuid} for n in range(1000)]
+                if page == 1 else [{"name": "orders-db", "uuid": uuid}])
+        return httpx.Response(200, json=_envelope(rows))
+
+    client = CloudflareD1(**LIVE_ARGS, _client=httpx.Client(transport=httpx.MockTransport(handler)))
+    try:
+        assert client.resolve() == uuid
+        assert pages == [1, 2]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("failure", ["api", "query", "transport"])
+def test_token_is_redacted_from_client_repr_and_failures(failure):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "transport":
+            raise httpx.ConnectError(f"unexpected credential {SECRET}", request=request)
+        error = {"success": False, "errors": [{"message": f"Invalid API Token: {SECRET}"}]}
+        if failure == "query":
+            return httpx.Response(200, json=_envelope([error]))
+        return httpx.Response(401, json=error)
+
+    client = CloudflareD1(
+        account_id="acct-1", database="11111111-2222-3333-4444-555555555555", api_token=SECRET,
+        _client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert SECRET not in repr(client)
+    try:
+        with pytest.raises(D1Error) as error:
+            client.schemas()
+        assert SECRET not in str(error.value)
+        assert SECRET not in repr(error.value)
+    finally:
+        client.close()
+
+
+def test_failed_discovery_releases_client_even_for_non_d1_errors():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("transport failed before responding")
+
+    client = CloudflareD1(
+        account_id="acct-1", database="11111111-2222-3333-4444-555555555555", api_token=SECRET,
+        _client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(RuntimeError, match="transport failed"):
+        add_d1_live_source("failed", client=client, **LIVE_ARGS)
+    assert client._client.is_closed

@@ -83,7 +83,9 @@ def test_the_document_path_builds_the_same_result(con):
     ast = parse_query(SETOP_DOC)
     assert ast.errors == []
     payload = payload_from_ast(ast)
-    assert payload["setOps"] == [{"op": "union", "dataset": "purchases", "distinct": False}]
+    assert payload["setOps"] == [
+        {"op": "union", "dataset": "purchases", "distinct": False, "body": None}
+    ]
     assert execute(con, payload)["rows"] == load("expected_setop_rows.json")["rows"]
 
 

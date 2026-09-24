@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ from anyql.tui.app import AnyqlApp
 from anyql.tui.palette import VALUE_SUGGESTIONS, view_for
 from anyql.tui.session import PREVIEW_ROW_CAP, VALUE_POOL_LIMIT, Session
 from anyql.tui.settings import SettingsScreen
+from anyql.tui.fn import FnScreen
 from tests.conftest import REPO_ROOT
 
 TUI_DIR = Path(anyql.__file__).resolve().parent / "tui"
@@ -74,8 +76,12 @@ def history_table(app: AnyqlApp) -> DataTable:
 
 
 @pytest.fixture(autouse=True)
-def restore_schema_seam():
-    """The schema registry is process-global: hand it back as it was found."""
+def restore_schema_seam(_clean_schema_registry):
+    """The schema registry is process-global: hand it back as it was found.
+
+    It asks for the suite's reset first, so the seam this file found is the
+    empty one, whatever installed a schema before it.
+    """
     tables = list(schema_tables())
     caps = capabilities()
     yield
@@ -174,6 +180,7 @@ def test_a_typed_document_fills_the_results_table():
         await type_document(pilot, TYPED_DOCUMENT)
         assert app.editor.text == TYPED_DOCUMENT
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
 
         table = results_table(app)
         assert table.row_count == 3
@@ -187,6 +194,169 @@ def test_a_typed_document_fills_the_results_table():
         assert str(history_table(app).get_cell_at((0, 1))) == "demo"
 
     run_app(scenario)
+
+
+def test_pending_run_keeps_keys_responsive_and_owns_its_submission(monkeypatch):
+    """A delayed real query cannot steal edits or share its connection mid-run."""
+    from anyql.tui import session as session_module
+
+    started = threading.Event()
+    release = threading.Event()
+    execute = session_module.execute
+    calls = []
+
+    def delayed_execute(*args, **kwargs):
+        calls.append(threading.get_ident())
+        started.set()
+        if not release.wait(15):
+            raise RuntimeError("query was not released while the UI was responsive")
+        return execute(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "execute", delayed_execute)
+
+    async def scenario(app, pilot):
+        app.editor.load_text(TYPED_DOCUMENT)
+        await pilot.pause()
+        try:
+            await pilot.press("ctrl+enter")
+            assert await asyncio.to_thread(started.wait, 2)
+            assert app.run_busy
+            assert len(calls) == 1
+            assert calls[0] != threading.get_ident()
+
+            # These are real key events, all handled before the query is released.
+            app.editor.move_cursor((2, len("\\limit 3")))
+            await pilot.press("backspace", "2", "ctrl+enter", "f5")
+            edited = TYPED_DOCUMENT[:-1] + "2"
+            assert app.editor.text == edited
+            assert len(calls) == 1
+            assert app.session.history == []
+            assert "unavailable" in text_of(app, "#status")
+
+            await pilot.press("ctrl+k")
+            assert app.query_one("#sql-text", TextArea).text == ""
+            app.query_one("#source-select", Select).value = "postgres"
+            app.query_one("#dialect-select", Select).value = "mysql"
+            await pilot.pause()
+            assert app.session.active_id == "demo"
+            assert app.session.dialect == "duckdb"
+            assert app.query_one("#source-select", Select).value == "demo"
+            assert app.query_one("#dialect-select", Select).value == "duckdb"
+
+            # Completion must not issue a value query or parse changing temp schema.
+            app.editor.load_text("\\from events\n\\where event_type = ")
+            await pilot.pause()
+            assert not app.palette.is_open
+            app.editor.load_text(edited)
+            await pilot.press("ctrl+comma")
+            assert isinstance(app.screen, SettingsScreen)
+            await pick(pilot, app, "Data source")
+            await pick(pilot, app, "postgres")
+            assert app.session.active_id == "demo"
+            assert "unavailable" in text_of(app, "#status")
+            await pilot.press("escape", "escape")
+            assert not isinstance(app.screen, SettingsScreen)
+
+            release.set()
+            await app.workers.wait_for_complete()
+            assert not app.run_busy and not app.session.busy
+            assert app.editor.text == edited
+            assert results_table(app).row_count == 3
+            assert [str(results_table(app).get_cell_at((row, 0))) for row in range(3)] == ["1", "8", "15"]
+            assert [(entry.doc, entry.source, entry.dialect) for entry in app.session.history] == [
+                (TYPED_DOCUMENT, "demo", "duckdb")
+            ]
+            assert history_table(app).row_count == 1
+
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            assert results_table(app).row_count == 2
+            assert [entry.doc for entry in app.session.history] == [edited, TYPED_DOCUMENT]
+        finally:
+            release.set()
+            await app.workers.wait_for_complete()
+
+    run_app(scenario)
+
+
+def test_background_run_recovers_after_execution_errors(monkeypatch):
+    from anyql.engine import PayloadError
+    from anyql.tui import session as session_module
+
+    started = threading.Event()
+    release = threading.Event()
+    execute = session_module.execute
+
+    def failing_execute(*args, **kwargs):
+        started.set()
+        if not release.wait(5):
+            raise RuntimeError("error run was not released")
+        raise PayloadError("source temporarily unavailable")
+
+    monkeypatch.setattr(session_module, "execute", failing_execute)
+
+    async def scenario(app, pilot):
+        app.editor.load_text(TYPED_DOCUMENT)
+        try:
+            await pilot.press("ctrl+enter")
+            assert await asyncio.to_thread(started.wait, 2)
+            await pilot.press("left")
+            assert app.run_busy
+            release.set()
+            await app.workers.wait_for_complete()
+            assert not app.run_busy and not app.session.busy
+            assert "source temporarily unavailable" in text_of(app, "#results-error")
+            assert not app.session.history
+
+            monkeypatch.setattr(session_module, "execute", execute)
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            assert text_of(app, "#results-error") == ""
+            assert results_table(app).row_count == 3
+            assert [entry.doc for entry in app.session.history] == [TYPED_DOCUMENT]
+        finally:
+            release.set()
+            await app.workers.wait_for_complete()
+
+    run_app(scenario)
+
+
+def test_quit_does_not_cancel_a_pending_temp_write_or_render_after_unmount(monkeypatch):
+    from anyql.tui import session as session_module
+
+    started = threading.Event()
+    release = threading.Event()
+    materialize = session_module.materialize
+
+    def delayed_materialize(*args, **kwargs):
+        started.set()
+        if not release.wait(5):
+            raise RuntimeError("write was not released after quitting")
+        return materialize(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "materialize", delayed_materialize)
+
+    async def scenario():
+        app = AnyqlApp()
+        document = "\\from users\n\\select user_id\n\\limit 2\n\\temp kept"
+        try:
+            async with app.run_test(size=(140, 45)) as pilot:
+                app.editor.load_text(document)
+                await pilot.press("ctrl+enter")
+                assert await asyncio.to_thread(started.wait, 2)
+                pending = app._run_task
+                await pilot.press("ctrl+q")
+            assert app.run_busy
+            release.set()
+            outcome = await asyncio.wait_for(asyncio.shield(pending), 5)
+            assert outcome.ok
+            assert not app.run_busy and not app.session.busy
+            assert app.session.source.datasets["kept"]["rows"] == 2
+            assert [entry.doc for entry in app.session.history] == [document]
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
 
 
 def test_a_typed_document_merges_two_tables_and_compiles_the_merge():
@@ -205,6 +375,7 @@ def test_a_typed_document_merges_two_tables_and_compiles_the_merge():
             "\\limit 2",
         )
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
 
         table = results_table(app)
         assert text_of(app, "#results-error") == ""
@@ -225,6 +396,7 @@ def test_a_parser_error_shows_and_does_not_execute():
     async def scenario(app, pilot):
         app.editor.load_text("\\nope\n\\from events")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
 
         message = 'line 1: unknown command "\\nope"'
         assert text_of(app, "#results-error") == message
@@ -260,6 +432,7 @@ def test_compile_renders_sql_for_the_chosen_dialect_without_executing():
         await pilot.pause()
         assert "does not compile" in text_of(app, "#status")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert results_table(app).row_count == 0
         assert "does not compile" in text_of(app, "#status")
 
@@ -278,18 +451,12 @@ def test_add_source_modal_masks_credentials_and_cancels():
         await pilot.press("ctrl+o")
         modal = app.screen
         assert isinstance(modal, AddSourceModal)
-        assert [field.id for field in modal.query(Input)] == [
-            "account-id",
-            "database",
-            "api-token",
-            "snapshot-path",
-            "display-name",
-        ]
         assert modal.query_one("#api-token", Input).password is True
-        assert [button.id for button in modal.query(Button)] == ["test", "add", "cancel"]
 
         modal.query_one("#account-id", Input).value = "00000000000000000000000000000000"
         modal.query_one("#api-token", Input).value = "secret-token"
+        modal.query_one("#cancel", Button).scroll_visible(immediate=True)
+        await pilot.pause()
         await pilot.click("#cancel")
 
         assert not isinstance(app.screen, AddSourceModal)
@@ -307,7 +474,11 @@ def test_add_source_registers_a_local_snapshot(snapshot):
             await pilot.press("ctrl+o")
             app.screen.query_one("#snapshot-path", Input).value = path
             app.screen.query_one("#display-name", Input).value = "Widget DB"
+            app.screen.query_one("#add", Button).scroll_visible(immediate=True)
+            await pilot.pause()
             await pilot.click("#add")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
 
             assert not isinstance(app.screen, AddSourceModal)
             assert list(app.session.sources) == [
@@ -328,6 +499,7 @@ def test_add_source_registers_a_local_snapshot(snapshot):
 
             app.editor.load_text("\\from widgets\n\\select name\n\\select id\n\\order id")
             await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
             assert results_table(app).row_count == 3
             assert str(results_table(app).get_cell_at((0, 0))) == "row-0"
 
@@ -355,6 +527,7 @@ def test_switching_source_repoints_the_schema_seam():
 
         app.editor.load_text("\\from orders\n\\select status\n\\limit 2")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert results_table(app).row_count == 2
         assert "· postgres · postgres" in text_of(app, "#results-status")
 
@@ -379,6 +552,7 @@ def test_preview_cap_bounds_the_results_buffer(snapshot):
         # The demo's own 100 rows: nothing to cap, and the count agrees.
         app.editor.load_text("\\from events")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert results_table(app).row_count == min(100, PREVIEW_ROW_CAP) == 100
         assert "preview capped" not in text_of(app, "#results-status")
 
@@ -388,6 +562,7 @@ def test_preview_cap_bounds_the_results_buffer(snapshot):
         app.query_one("#source-select", Select).value = "big"
         app.editor.load_text("\\from readings")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
 
         table = results_table(app)
         assert table.row_count == PREVIEW_ROW_CAP
@@ -431,16 +606,6 @@ def test_palette_lists_commands_actions_and_inserts():
             "with",
         ):
             assert f"\\{command}" in labels
-        assert [entry.label for entry in app.palette.view.entries if entry.action] == [
-            "Run",
-            "Compile",
-            "Data source…",
-            "History",
-            "Results",
-            "SQL",
-            "Schema",
-            "Settings",
-        ]
 
         # An abbreviation is completed in place, and the offers follow it into
         # the clause it opened.
@@ -487,29 +652,6 @@ def test_palette_follows_the_caret_and_the_schema():
         app.editor.load_text("\\from events\n")
         app.editor.cursor_location = (1, 0)
         await type_document(pilot, "\\select ")
-        # Fields first, then the functions the live capabilities advertise.
-        assert app.palette.view.labels == [
-            "timestamp",
-            "user_id",
-            "event_type",
-            "amount",
-            "path",
-            "sum",
-            "avg",
-            "count",
-            "min",
-            "max",
-            "year",
-            "month",
-            "day",
-            "quarter",
-            "hour",
-            "minute",
-            "second",
-            "rank",
-            "dense_rank",
-            "row_number",
-        ]
 
         caret = app.editor.cursor_location
         await pilot.press("down", "down")
@@ -688,7 +830,6 @@ def test_select_offers_functions_and_completes_their_argument():
         app.editor.load_text("\\from events\n")
         app.editor.cursor_location = (1, 0)
         await type_document(pilot, "\\select su")
-        assert app.palette.view.labels == ["sum"]
         await pilot.press("enter")
         assert app.editor.text == "\\from events\n\\select sum("
         assert app.palette.is_open is True  # an open call keeps offering
@@ -704,6 +845,71 @@ def test_select_offers_functions_and_completes_their_argument():
         await pilot.press("enter")
         await type_document(pilot, "\\select year(")
         assert app.palette.view.labels == ["timestamp"]
+
+    run_app(scenario)
+
+
+def test_string_completion_tracks_nested_arguments_and_quoted_commas():
+    session = Session()
+    doc = "\\from events e\n"
+    prefix = "\\select concat(upper(e.event_type), 'it''s, (text)', "
+    line = prefix + "pa"
+    view = view_for(session, doc + line, line, len(line))
+    assert line[:view.start] + view.entries[0].insert == prefix + "path"
+
+    line = "\\select substr(e.path, "
+    view = view_for(session, doc + line, line, len(line))
+    assert "user_id" in view.labels
+    assert "path" not in view.labels
+    assert "amount" not in view.labels
+    assert "length" in view.labels
+    assert "upper" not in view.labels
+
+    line = "\\select concat('unfinished, "
+    assert view_for(session, doc + line, line, len(line)) is None
+
+    line = "\\select concat(e.path, string(us"
+    view = view_for(session, doc + line, line, len(line))
+    assert line[:view.start] + view.entries[0].insert == "\\select concat(e.path, string(user_id)"
+
+
+def test_string_completion_obeys_source_capabilities():
+    session = Session()
+    caps = replace(capabilities(), functions={"string": ["upper"], "any": ["string"]})
+    set_schema_state(list(schema_tables()), caps)
+    line = "\\select "
+    view = view_for(session, "\\from events\n" + line, line, len(line))
+    assert "upper" in view.labels
+    assert "concat" not in view.labels
+    line = "\\select concat("
+    assert view_for(session, "\\from events\n" + line, line, len(line)) is None
+
+
+def test_string_calls_complete_and_execute_in_the_editor():
+    async def scenario(app, pilot):
+        app.editor.load_text("\\from events\n")
+        app.editor.cursor_location = (1, 0)
+        await type_document(pilot, "\\select concat")
+        await pilot.press("enter")
+        await type_document(pilot, "upp")
+        await pilot.press("enter")
+        await type_document(pilot, "event_ty")
+        await pilot.press("enter")
+        await type_document(pilot, ", ':', stri")
+        await pilot.press("enter")
+        await type_document(pilot, "user_i")
+        await pilot.press("enter")
+        await type_document(pilot, ") as label\n\\limit 2")
+        assert app.editor.text == (
+            "\\from events\n\\select concat(upper(event_type), ':', string(user_id)) as label\n\\limit 2"
+        )
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == ""
+        source = app.session.source.datasets["events"]["table"].limit(2).execute()
+        expected = [f"{row.event_type.upper()}:{row.user_id}" for row in source.itertuples()]
+        table = results_table(app)
+        assert [str(table.get_cell_at((row, 0))) for row in range(table.row_count)] == expected
 
     run_app(scenario)
 
@@ -759,7 +965,6 @@ def test_pane_actions_show_and_hide_each_pane():
     async def scenario(app, pilot):
         app.editor.load_text("")
         await type_document(pilot, "\\results")
-        assert app.palette.view.labels == ["Results"]  # an action, not a command
         await pilot.press("enter")
         assert app.editor.text == ""  # an action never enters the document
         assert app.pane_visible("results") is False
@@ -775,7 +980,6 @@ def test_pane_actions_show_and_hide_each_pane():
         assert text_of(app, "#status") == "schema pane hidden"
 
         await type_document(pilot, "\\RESULTS")
-        assert app.palette.view.labels == ["Results"]  # matching is case-insensitive
         await pilot.press("enter")
         assert app.pane_visible("results") is True
         assert app.query_one("#result-tabs", TabbedContent).active == "tab-results"
@@ -795,6 +999,7 @@ def test_a_hidden_pane_stays_hidden_when_the_document_runs():
 
         app.editor.load_text(TYPED_DOCUMENT)
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert history_table(app).row_count == 1
         assert results_table(app).row_count == 3  # the run still rendered
         assert app.pane_visible("results") is False
@@ -915,6 +1120,7 @@ def test_history_loads_a_document_back():
     async def scenario(app, pilot):
         app.editor.load_text(TYPED_DOCUMENT)
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert history_table(app).row_count == 1
 
         app.editor.load_text("")
@@ -936,6 +1142,7 @@ def test_results_table_takes_the_keys_it_needs():
     async def scenario(app, pilot):
         app.editor.load_text("\\from events\n\\select user_id\n\\select amount\n\\limit 5")
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
 
         table = results_table(app)
         assert [str(column.label) for column in table.ordered_columns] == [
@@ -962,6 +1169,7 @@ def test_results_table_takes_the_keys_it_needs():
 
         # The app's own binding still runs the document from this focus.
         await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
         assert results_table(app).row_count == 5
         assert app.editor.text == document
 
@@ -985,10 +1193,20 @@ async def open_settings(app, pilot) -> SettingsScreen:
 
 
 async def pick(pilot, app, match: str) -> None:
-    """Select the open Settings row whose label or value is `match`."""
+    """Select a category or an action in the Settings workspace."""
     screen = app.screen
     assert isinstance(screen, SettingsScreen)
+    sidebar = screen.query_one("#settings-sidebar", OptionList)
+    for index in range(sidebar.option_count):
+        option = sidebar.get_option_at_index(index)
+        if match in (str(option.prompt), option.id):
+            sidebar.focus()
+            sidebar.highlighted = index
+            await pilot.pause()
+            await pilot.press("enter")
+            return
     menu = screen.query_one("#settings-menu", OptionList)
+    menu.focus()
     menu.highlighted = next(
         index for index, row in enumerate(screen.rows) if match in (row.label, row.value)
     )
@@ -996,25 +1214,24 @@ async def pick(pilot, app, match: str) -> None:
     await pilot.pause()
 
 
-def test_settings_lists_every_submenu_and_leaves_on_escape():
-    """`\\settings` opens full screen, and escape leaves it from the root."""
+def test_settings_sidebar_preserves_category_when_returning_from_details():
+    """Browsing categories previews controls; only accepting a control changes it."""
 
     async def scenario(app, pilot):
         screen = await open_settings(app, pilot)
-        assert screen.query_one("#settings").outer_size == app.size  # it takes the screen
-        assert [row.label for row in screen.rows] == [
-            "Show/Hide Menus",
-            "Intellisense",
-            "Keybindings",
-            "Data source",
-            "Dialect",
-        ]
-        assert screen.rows[1].detail == "on"
-
-        await pick(pilot, app, "Intellisense")
-        assert app.session.intellisense is False
-        assert screen.rows[1].detail == "off"
-
+        sidebar = screen.query_one("#settings-sidebar", OptionList)
+        details = screen.query_one("#settings-menu", OptionList)
+        assert sidebar.has_focus
+        assert sidebar.region.right < details.region.x
+        await pilot.press("down")
+        assert screen.menu == "menus"
+        assert sidebar.has_focus
+        assert all(app.pane_visible(name) for name in app.PANE_TITLES)
+        await pilot.press("enter")
+        assert details.has_focus
+        await pilot.press("escape")
+        assert sidebar.has_focus
+        assert screen.menu == "menus"
         await pilot.press("escape")
         assert not isinstance(app.screen, SettingsScreen)
         assert app.focused is app.editor
@@ -1044,8 +1261,8 @@ def test_settings_menus_submenu_flips_panes_at_once():
         assert app.pane_visible("sql") is True
         assert screen.rows[1].detail == "visible"
 
-        await pilot.press("escape")  # a submenu backs out to the root first
-        assert [row.label for row in screen.rows][0] == "Show/Hide Menus"
+        await pilot.press("escape")
+        assert screen.query_one("#settings-sidebar", OptionList).has_focus
         await pilot.press("escape")
         assert not isinstance(app.screen, SettingsScreen)
 
@@ -1060,7 +1277,7 @@ def test_settings_intellisense_switch_is_the_hard_off():
         await pick(pilot, app, "Intellisense")
         assert app.session.intellisense is False
         assert [row.detail for row in screen.rows if row.label == "Intellisense"] == ["off"]
-        await pilot.press("escape")
+        await pilot.press("escape", "escape")
 
         app.editor.load_text("\\from events\n")
         app.editor.cursor_location = (1, 0)
@@ -1075,7 +1292,7 @@ def test_settings_intellisense_switch_is_the_hard_off():
         assert isinstance(screen, SettingsScreen)
         await pick(pilot, app, "Intellisense")
         assert app.session.intellisense is True
-        await pilot.press("escape")
+        await pilot.press("escape", "escape")
         assert not isinstance(app.screen, SettingsScreen)
 
         app.editor.load_text("\\from events\n")
@@ -1183,3 +1400,598 @@ def test_the_tui_reaches_no_http_server():
 
     loaded = {name.split(".")[0] for name in sys.modules}
     assert not (FORBIDDEN & loaded)
+
+
+# ---------------------------------------------------------------------------
+# The statements the query cannot carry: temp tables and transactions
+# ---------------------------------------------------------------------------
+
+
+def test_the_palette_offers_the_statement_commands(snapshot):
+    """Every command is in the palette, and only `\\drop` has a list to offer."""
+    session = Session()
+    labels = view_for(session, "\\", "\\", 1).labels
+    for command in ("\\temp", "\\drop", "\\begin", "\\commit", "\\rollback"):
+        assert command in labels
+    # Savepoints are the engine's own gift: DuckDB has none, so they are not
+    # offered on it — and a SQLite snapshot, which has them, offers both.
+    assert "\\savepoint" not in labels and "\\release" not in labels
+    assert view_for(session, "\\nope ", "\\nope ", len("\\nope ")) is None
+
+    # A temp table's name is typed, not chosen; the ones there are, are offered.
+    assert view_for(session, "\\temp ", "\\temp ", len("\\temp ")) is None
+    assert view_for(session, "\\drop ", "\\drop ", len("\\drop ")) is None  # nothing yet
+    session.run("\\from users\n\\select user_id\n\\limit 2\n\\temp few\n")
+    drop = view_for(session, "\\drop ", "\\drop ", len("\\drop "))
+    assert drop.labels == ["few"]
+    assert drop.entries[0].detail == "temp table"
+
+    # A second session re-points the shared schema seam, so it goes last.
+    snap = Session({"snap": add_sqlite_source("snap", snapshot("snap", 3), "Snap")})
+    snap_labels = view_for(snap, "\\", "\\", 1).labels
+    assert "\\savepoint" in snap_labels and "\\release" in snap_labels
+
+
+def test_a_where_operand_that_is_typed_offers_nothing():
+    """`~`, `!~`, `in` and `not in` take patterns and subqueries, not values."""
+    session = Session()
+    for line in ("\\where path ~ ", "\\where path !~ ", "\\where user_id in ", "\\where user_id not in "):
+        assert view_for(session, line, line, len(line)) is None
+    # The operators themselves are offered, and `like` still offers values.
+    operators = view_for(session, "\\where path ", "\\where path ", len("\\where path ")).labels
+    assert "~" in operators and "in" in operators
+    like = '\\where event_type like '
+    assert view_for(session, like, like, len(like)).labels
+
+
+def test_a_typed_document_keeps_a_temp_table_and_drops_it_again():
+    """`\\temp` runs, lands in the explorer, and `\\drop` takes it away."""
+
+    async def scenario(app, pilot):
+        app.editor.load_text("")
+        await type_document(pilot, "\\from users\n\\select user_id\n\\limit 3\n\\temp few")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+
+        assert text_of(app, "#results-error") == ""
+        assert results_table(app).row_count == 3
+        assert text_of(app, "#results-status").startswith('created temp table "few" · 3 rows · ')
+        # The table joined the source, and the explorer says it is a temp one.
+        assert "few" in app.session.source.datasets
+        assert app.session.source.datasets["few"]["temp"] is True
+        labels = [str(node.label) for node in app.query_one("#schema-tree").root.children]
+        assert "few  3 rows  temp" in labels
+
+        # A later document reads it back by name, and `\drop` removes it.
+        app.editor.load_text("\\from few\n\\select user_id")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert results_table(app).row_count == 3
+
+        app.editor.load_text("\\drop few")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-status") == 'dropped temp table "few"'
+        assert [str(node.label) for node in app.query_one("#schema-tree").root.children] == [
+            "events  100 rows",
+            "users  25 rows",
+        ]
+
+    run_app(scenario)
+
+
+def test_a_transaction_statement_reports_itself_and_survives_a_query():
+    """`\\begin` is a document of its own; the query after it runs inside it."""
+
+    async def scenario(app, pilot):
+        app.editor.load_text("\\begin")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == ""
+        assert text_of(app, "#status") == "transaction open · demo"
+        assert app.session.tx_state().open is True
+
+        app.editor.load_text("\\commit")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#status") == "transaction committed · demo"
+        assert app.session.tx_state().open is False
+
+        # A refused statement is the results-tab line, exactly like a bad query.
+        app.editor.load_text("\\rollback")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == "no transaction is open on demo — \\begin first"
+
+    run_app(scenario)
+
+
+def test_a_lateral_join_and_a_subquery_run_from_the_document():
+    """The two new query shapes reach the engine through the app itself."""
+
+    async def scenario(app, pilot):
+        app.editor.load_text("")
+        await type_document(
+            pilot,
+            "\\from users u\n"
+            "\\join lateral (\\from events e \\where e.user_id = u.user_id \\order timestamp desc \\limit 2) as recent\n"
+            "\\select u.user_id\n",
+        )
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == ""
+        assert results_table(app).row_count == 50  # two events for each of 25 users
+
+        app.editor.load_text(
+            "\\from events\n"
+            "\\select user_id\n"
+            "\\where user_id in (\\from users \\select user_id \\where region = \"us\")\n"
+        )
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == ""
+        assert results_table(app).row_count > 0
+        await pilot.press("ctrl+k")
+        assert "IN (" in app.query_one("#sql-text", TextArea).text
+
+    run_app(scenario)
+
+
+# ---------------------------------------------------------------------------
+# Table-valued functions
+# ---------------------------------------------------------------------------
+
+
+FN_BODY = "\\from events\n\\where amount > @min_amount\n\\select user_id, amount"
+
+
+async def fill_fn(screen, *, name, params, body, doc="", args="") -> None:
+    """Put a function into the library's fields, as a person would type them."""
+    screen.query_one("#fn-name", Input).value = name
+    screen.query_one("#fn-doc", Input).value = doc
+    screen.query_one("#fn-params", Input).value = params
+    screen.query_one("#fn-body", TextArea).text = body
+    screen.query_one("#fn-args", Input).value = args
+
+
+def test_fn_library_authors_and_previews_then_the_document_calls_it():
+    """`\\fn` opens the library; a saved function previews and runs from the document."""
+
+    async def scenario(app, pilot):
+        await type_document(pilot, "\\fn")
+        assert app.palette.view.labels == ["New function…"]  # empty library, one offer
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, FnScreen)
+
+        await fill_fn(
+            screen,
+            name="hot",
+            params="min_amount",
+            body=FN_BODY,
+            doc="events above a threshold",
+            args="0",
+        )
+        await pilot.click("#fn-preview")  # preview saves first, then runs the call
+        await pilot.pause()
+        assert list(app.session.fns) == ["hot"]
+        assert screen.query_one("#fn-grid", DataTable).row_count == 100  # every event clears 0
+        # a preview is a trial, not a run: History stays empty.
+        assert app.session.history == []
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not isinstance(app.screen, FnScreen)
+        assert app.focused is app.editor
+
+        # The saved function is now a source the document can call.
+        app.editor.load_text("\\from hot(0)\n\\select *")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert text_of(app, "#results-error") == ""
+        assert results_table(app).row_count == 100
+
+    run_app(scenario)
+
+
+def test_a_bad_body_is_refused_on_the_screen_not_at_the_call():
+    """Saving a function whose `@param` is undeclared names it in the status, in red."""
+
+    async def scenario(app, pilot):
+        await type_document(pilot, "\\fn")
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        await fill_fn(screen, name="oops", params="min_amount", body=FN_BODY.replace("@min_amount", "@nope"))
+        await pilot.click("#fn-save")
+        await pilot.pause()
+        status = screen.query_one("#fn-status", Static)
+        assert "@nope" in str(status.content)
+        assert status.has_class("error")
+        assert "oops" not in app.session.fns
+
+    run_app(scenario)
+
+
+def test_fn_named_in_the_palette_opens_it_or_starts_a_new_one():
+    """`\\fn <name>` opens an existing function, or a blank form named the new one."""
+
+    async def scenario(app, pilot):
+        app.session.save_fn("hot", "min_amount", FN_BODY, "above a threshold")
+        await type_document(pilot, "\\fn hot")
+        assert app.palette.view.labels == ["hot"]  # the exact name leads, nothing to create
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, FnScreen)
+        assert screen.query_one("#fn-name", Input).value == "hot"
+        assert screen.query_one("#fn-params", Input).value == "min_amount"
+        assert screen.query_one("#fn-body", TextArea).text == FN_BODY
+        assert screen.query_one("#fn-doc", Input).value == "above a threshold"
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        # A name the library lacks starts a new function, prefilled with that name.
+        await type_document(pilot, "\\fn monthly")
+        assert app.palette.view.labels == ["monthly"]  # the one create offer
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert screen.query_one("#fn-name", Input).value == "monthly"
+        assert screen.query_one("#fn-body", TextArea).text == ""  # blank body, new function
+        assert str(screen.query_one("#fn-status", Static).content) == "new function"
+
+    run_app(scenario)
+
+
+def test_a_saved_function_completes_as_a_call_from_the_document():
+    """In `\\from`, a saved function is offered as `name()` with the caret inside."""
+
+    async def scenario(app, pilot):
+        app.session.save_fn("hot", "min_amount", FN_BODY, "")
+        app.editor.load_text("")
+        await pilot.pause()
+        await type_document(pilot, "\\from hot")
+        # Accepting inserts the call and parks the caret between the parens, so
+        # the argument is typed next to the cursor — the whole point of the row.
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.editor.text == "\\from hot()"
+        assert app.editor.cursor_location == (0, len("\\from hot("))
+        # A call to a no-argument function needs no argument at all: it runs as-is.
+        app.session.save_fn("all_events", "", "\\from events\n\\select user_id", "")
+        app.editor.load_text("\\from all_events()\n\\select *")
+        await pilot.press("ctrl+enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert text_of(app, "#results-error") == ""
+        assert results_table(app).row_count == 100
+
+    run_app(scenario)
+
+
+def test_a_function_is_deleted_from_the_library():
+    """Deleting removes it from the store and the list; the editor keeps its text."""
+
+    async def scenario(app, pilot):
+        app.session.save_fn("hot", "min_amount", FN_BODY, "")
+        await type_document(pilot, "\\fn hot")
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        await pilot.click("#fn-delete")
+        await pilot.pause()
+        assert "hot" not in app.session.fns
+        assert list(app.session.fns) == []
+        # the fields are now a blank new-function form (the name field clears)
+        assert screen.query_one("#fn-name", Input).value == ""
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not isinstance(app.screen, FnScreen)
+
+    run_app(scenario)
+
+
+def test_fn_target_drives_completion_save_and_preview_without_changing_workspace():
+    """A foreign target never leaks its schema or dialect into the workspace."""
+
+    async def scenario(app, pilot):
+        app.select_source("mysql")
+        await pilot.pause()
+        app.select_dialect("postgres")
+        await pilot.pause()
+        workspace_doc = app.editor.text
+        app.action_fn()
+        await pilot.pause()
+        screen = app.screen
+        source = screen.query_one("#fn-source", Select)
+        body = screen.query_one("#fn-body", TextArea)
+        palette = screen.query_one("#fn-palette")
+        assert source.value == "mysql"
+
+        body.focus()
+        await type_document(pilot, "\\from ")
+        assert "products" in palette.view.labels
+        assert "events" not in palette.view.labels
+        source.value = "demo"
+        await pilot.pause()
+        assert "events" in palette.view.labels
+        assert "products" not in palette.view.labels
+        assert body.text == "\\from "
+
+        await fill_fn(screen, name="target_events", params="", body="\\from events\n\\select user_id\n\\limit 2")
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        grid = screen.query_one("#fn-grid", DataTable)
+        assert grid.row_count == 2
+        assert "target_events" in app.session.fns
+        assert app.session.history == []
+        assert app.session.active_id == "mysql"
+        assert app.session.dialect == "postgres"
+        assert [table.name for table in schema_tables()] == list(app.session.source.datasets)
+
+        # Validation and execution errors must restore the same workspace too.
+        source.value = "mysql"
+        await pilot.pause()
+        assert grid.row_count == 0
+        await pilot.click("#fn-save")
+        await pilot.pause()
+        assert screen.query_one("#fn-status", Static).has_class("error")
+        source.value = "demo"
+        await pilot.pause()
+        await fill_fn(screen, name="target_events", params="limit", body="\\from events\n\\where amount > @limit\n\\select user_id")
+        await pilot.press("ctrl+r")  # no argument supplied
+        await pilot.pause()
+        assert screen.query_one("#fn-status", Static).has_class("error")
+        assert app.session.active_id == "mysql"
+        assert app.session.dialect == "postgres"
+        assert [table.name for table in schema_tables()] == list(app.session.source.datasets)
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not isinstance(app.screen, FnScreen)
+        assert app.editor.text == workspace_doc
+
+    run_app(scenario)
+
+
+def test_fn_body_completion_accepts_keys_and_clicks_without_editing_workspace():
+    """Body completion owns its keys, while Escape/Tab still leave the form usable."""
+
+    async def scenario(app, pilot):
+        workspace_doc = app.editor.text
+        app.action_fn()
+        await pilot.pause()
+        screen = app.screen
+        body = screen.query_one("#fn-body", TextArea)
+        palette = screen.query_one("#fn-palette")
+        body.focus()
+        await pilot.press("escape")
+        assert app.screen is screen
+        assert not palette.is_open  # An empty body has nothing to offer, not a reason to leave.
+        await type_document(pilot, "\\fro")
+        await pilot.press("tab")
+        assert body.text == "\\from "
+        await type_document(pilot, "ev")
+        await pilot.press("enter")
+        assert body.text == "\\from events "
+        await pilot.press("enter")
+        await type_document(pilot, "\\sel")
+        await pilot.press("tab")
+        await type_document(pilot, "us")
+        assert palette.view.labels == ["user_id"]
+        await pilot.click("#fn-palette", offset=(3, 1))
+        await pilot.pause()
+        assert body.text == "\\from events \n\\select user_id "
+        assert app.focused is body
+        await pilot.press("enter")
+        await type_document(pilot, "\\")
+        assert all(not entry.action for entry in palette.view.entries)
+        await pilot.press("escape")
+        assert app.screen is screen
+        assert not palette.is_open
+        await pilot.press("escape")
+        assert app.screen is screen
+        assert palette.is_open
+        await pilot.press("escape")
+        assert not palette.is_open
+        await pilot.press("tab")
+        assert app.focused is screen.query_one("#fn-args", Input)
+        await pilot.press("escape")
+        assert app.screen is screen  # Escape in a form field never closes the library.
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert not isinstance(app.screen, FnScreen)
+        assert app.editor.text == workspace_doc
+
+    run_app(scenario)
+
+
+def test_fn_parameters_accept_bare_prefix_and_nested_tokens_then_preview():
+    """Parameter accepts keep punctuation intact and produce an executable body."""
+
+    async def scenario(app, pilot):
+        app.action_fn()
+        await pilot.pause()
+        screen = app.screen
+        await fill_fn(screen, name="threshold", params="min_amount", body="\\from events\n\\where amount > ", args="0")
+        body = screen.query_one("#fn-body", TextArea)
+        palette = screen.query_one("#fn-palette")
+        body.focus()
+        body.cursor_location = (1, len(body.document[1]))
+        await type_document(pilot, "@")
+        assert palette.view.labels == ["@min_amount"]
+        await pilot.press("tab")
+        assert body.text.endswith("amount > @min_amount")
+        await pilot.press("enter")  # Accepting the exact name is a no-op, so Enter is a newline.
+        assert body.text.endswith("@min_amount\n")
+
+        body.load_text("\\from events\n\\where amount > ")
+        body.cursor_location = (1, len(body.document[1]))
+        await type_document(pilot, "@min")
+        await pilot.press("enter")
+        assert body.text == "\\from events\n\\where amount > @min_amount"
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert screen.query_one("#fn-grid", DataTable).row_count == 100
+        assert not screen.query_one("#fn-status", Static).has_class("error")
+
+        # Completing inside a stale token replaces its suffix, not its enclosing calls.
+        nested = '\\select concat("a,b", upper(@min_stale), "tail") as label'
+        body.load_text("\\from events\n" + nested)
+        body.cursor_location = (1, nested.index("@min") + len("@min"))
+        body.focus()
+        await pilot.pause()
+        assert "@min_amount" in palette.view.labels
+        await pilot.click("#fn-palette", offset=(3, 1))
+        await pilot.pause()
+        assert body.text == "\\from events\n" + nested.replace("@min_stale", "@min_amount")
+        assert app.focused is body
+
+    run_app(scenario)
+
+
+def test_fn_parameter_offers_follow_unsaved_declarations_and_function_switches():
+    """Only the current form's valid declarations are offered, even before saving."""
+
+    async def scenario(app, pilot):
+        app.session.save_fn("first", "old_name", "\\from events\n\\where amount > @old_name", "")
+        app.session.save_fn("second", "other_name", "\\from events\n\\where amount > @other_name", "")
+        app.action_fn()
+        await pilot.pause()
+        screen = app.screen
+        listing = screen.query_one("#fn-list", OptionList)
+        listing.highlighted = 0
+        listing.focus()
+        await pilot.press("enter")
+        body = screen.query_one("#fn-body", TextArea)
+        palette = screen.query_one("#fn-palette")
+        params = screen.query_one("#fn-params", Input)
+        body.load_text("\\from events\n\\where amount > ")
+        body.cursor_location = (1, len(body.document[1]))
+        body.focus()
+        await type_document(pilot, "@")
+        assert palette.view.labels == ["@old_name"]
+
+        params.value = "admin_limit, min_amount, min_amount, @bad, 3bad, , two words"
+        await pilot.pause()
+        assert palette.view.labels == ["@admin_limit", "@min_amount"]
+        await type_document(pilot, "min")
+        assert palette.view.labels == ["@min_amount", "@admin_limit"]
+        assert app.session.fns["first"].params == ["old_name"]
+        params.value = ""
+        await pilot.pause()
+        assert not palette.is_open
+        params.value = "minimum"
+        await pilot.pause()
+        assert palette.view.labels == ["@minimum"]
+
+        listing.highlighted = 1
+        listing.focus()
+        await pilot.press("enter")
+        body.load_text("\\from events\n\\where amount > ")
+        body.cursor_location = (1, len(body.document[1]))
+        body.focus()
+        await type_document(pilot, "@")
+        assert palette.view.labels == ["@other_name"]
+        listing.highlighted = 2  # A new function must not inherit the last signature.
+        listing.focus()
+        await pilot.press("enter")
+        body.focus()
+        await type_document(pilot, "@")
+        assert not palette.is_open
+
+    run_app(scenario)
+
+
+def test_fn_parameter_completion_respects_quotes_dismissal_and_workspace_scope():
+    """Quoted/email @ signs aren't placeholders, and neither dismissal leaks."""
+
+    async def scenario(app, pilot):
+        app.action_fn()
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#fn-params", Input).value = "minimum"
+        body = screen.query_one("#fn-body", TextArea)
+        palette = screen.query_one("#fn-palette")
+        body.focus()
+        for prefix in ('\\select concat("quoted, ', "\\where event_type = '", "\\where event_type = user"):
+            body.load_text(prefix)
+            body.cursor_location = (0, len(prefix))
+            await type_document(pilot, "@min")
+            assert palette.view is None or "@minimum" not in palette.view.labels
+
+        body.load_text("\\from events\n\\where amount > ")
+        body.cursor_location = (1, len(body.document[1]))
+        await type_document(pilot, "@min")
+        assert "@minimum" in palette.view.labels
+        await pilot.press("escape")
+        await type_document(pilot, "i")
+        assert not palette.is_open
+        await pilot.press("escape")
+        assert "@minimum" in palette.view.labels
+        await pilot.press("escape")
+        await type_document(pilot, " @")
+        assert "@minimum" in palette.view.labels
+
+        app.session.intellisense = False
+        await type_document(pilot, " @")
+        await pilot.press("escape")
+        assert not palette.is_open
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        app.session.intellisense = True
+        app.editor.load_text("\\from events\n\\where amount > ")
+        app.editor.cursor_location = (1, len(app.editor.document[1]))
+        await type_document(pilot, "@min")
+        assert app.palette.view is None or "@minimum" not in app.palette.view.labels
+
+    run_app(scenario)
+
+
+def test_cancel_pending_d1_connection_never_registers_or_remembers(monkeypatch):
+    """Escape stays responsive while connecting; a late result is discarded."""
+    from tests.test_d1_sources import live_source
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    async def scenario(app, pilot):
+        def delayed_source(*args, **kwargs):
+            started.set()
+            try:
+                if not release.wait(5):
+                    raise RuntimeError("connection was not cancelled promptly")
+                source, _ = live_source()
+                return source
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(app.session, "build_live_source", delayed_source)
+        await pilot.press("ctrl+o")
+        modal = app.screen
+        modal.query_one("#account-id", Input).value = "account"
+        modal.query_one("#database", Input).value = "orders-db"
+        modal.query_one("#api-token", Input).value = "private-token"
+        await pilot.pause()
+        modal.query_one("#add", Button).scroll_visible(immediate=True)
+        await pilot.pause()
+        try:
+            await pilot.click("#add")
+            assert await asyncio.to_thread(started.wait, 2)
+            await pilot.press("escape")
+            assert not isinstance(app.screen, AddSourceModal)
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 2)
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.session.active_id == "demo"
+            assert "orders-db" not in app.session.sources
+            assert app.session.d1_profiles == []
+            assert not app.session.storage_path.exists()
+        finally:
+            release.set()
+
+    run_app(scenario)

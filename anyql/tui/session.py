@@ -2,16 +2,20 @@
 
 Everything the widgets need to know is computed here in plain Python, so the
 Textual layer stays a thin shell and the tests can drive a `Session` without a
-terminal attached. Nothing here opens a server or a socket: the only network
-edge is the engine's own live-D1 path, reached exactly as the engine exposes it.
+terminal attached. Provider configuration is in memory; AI transport lives in
+`anyql.ai`, while database networking stays in the engine's live-D1 path.
 """
 
 from __future__ import annotations
 
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from anyql.ai.client import AIConfig
 
 from anyql.engine import (
     D1Error,
@@ -20,29 +24,44 @@ from anyql.engine import (
     PayloadError,
     add_d1_live_source,
     add_sqlite_source,
+    begin,
     build,
+    commit,
     capabilities_for,
     column_values,
     compile_sql,
     dialect_for,
+    drop_temp,
     execute,
     execute_remote,
     load,
+    materialize,
+    release,
+    rollback,
+    rollback_to,
+    savepoint,
+    temp_handle,
     type_name,
 )
 from anyql.query import (
     Capabilities,
     ColumnDef,
+    QueryAST,
     TableDef,
+    FnDef,
     column_by_name,
     column_pool,
+    is_identifier,
     open_tables_of,
+    parse_body,
     parse_query,
     payload_from_ast,
     resolve_column,
     set_schema_state,
+    set_fns,
     table_by_name,
 )
+from anyql.storage import MemoryStore
 
 PREVIEW_ROW_CAP = 10000
 """Rows the results DataTable buffers; the rest of the result is left unread.
@@ -107,12 +126,34 @@ def _source_id(hint: str, taken) -> str:
 
 
 def looks_numeric(value: str) -> bool:
-    """True for a value `\\where` can carry bare; text gets quoted instead."""
+    r"""True for a value `\where` can carry bare; text gets quoted instead."""
     try:
         float(value)
     except ValueError:
         return False
     return True
+
+
+def has_query(ast: QueryAST) -> bool:
+    r"""True when the document carries a query, not only its statements.
+    `\begin`/`\commit`/`\rollback`/`\savepoint`/`\release` and `\drop` are
+    statements: a document of theirs alone runs them and answers with their
+    status. Everything else — `\with` bodies included — makes a query that the
+    statements wrap around.
+    """
+    return bool(
+        ast.with_
+        or ast.from_
+        or ast.joins
+        or ast.set_ops
+        or ast.select
+        or ast.distinct
+        or ast.where
+        or ast.group_by
+        or ast.order_by
+        or ast.cases
+        or ast.limit is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +187,9 @@ class RunOutcome:
 
     `error` is the Results-tab line (empty when the run succeeded); `status` is
     always what the footer shows. `rows` is already capped at `PREVIEW_ROW_CAP`
-    while `total` is what the document asked for.
+    while `total` is what the document asked for. `schema_changed` says the run
+    added or removed a table — a `\\temp`/`\\drop` — so the explorer and the
+    parser's schema seam need re-reading.
     """
 
     status: str = ""
@@ -160,11 +203,25 @@ class RunOutcome:
     total: int = 0
     ms: float = 0.0
     sql: str = ""
+    schema_changed: bool = False
 
     @property
     def capped(self) -> bool:
         """True when the preview buffer, not the document, decided the row count."""
         return self.total > len(self.rows)
+
+
+@dataclass
+class TxState:
+    """One source's transaction: whether it is open, and the savepoints in it.
+
+    The transaction itself lives on the connection; this is what the session
+    needs to answer with (which savepoints exist, whether `\\begin` is legal
+    yet) and it dies with the process; it is never part of saved local memory.
+    """
+
+    open: bool = False
+    savepoints: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -180,16 +237,68 @@ class Session:
     parse a document against real columns — no separate "load" step.
     """
 
-    def __init__(self, sources: dict[str, DataSource] | None = None) -> None:
+    def __init__(
+        self, sources: dict[str, DataSource] | None = None, *, data_dir: Path | None = None,
+    ) -> None:
         self.sources: dict[str, DataSource] = load() if sources is None else dict(sources)
         self.active_id: str = next(iter(self.sources))
         self.dialect: str = default_dialect(self.source)
-        # The palette's master switch, owned by the Settings menu. In memory
-        # like everything else here — it dies with the process.
+        # The palette's master switch is session-only, owned by Settings.
         self.intellisense: bool = True
+        # UI-owned reservation: a background run/context lookup owns the shared
+        # connection and schema seam until its real work finishes. Headless
+        # callers keep the synchronous run API and need no reservation.
+        self.busy: str = ""
+        self.ai_config = AIConfig()
         self.history: list[HistoryEntry] = []
+        # One transaction per source: what `\begin` opened lives on that
+        # source's connection, so it is tracked per source and never leaks
+        # into another one.
+        self.tx: dict[str, TxState] = {}
+        # Temp tables a `\drop` removed, per source: a rollback undoes the
+        # drop on the engine, and this is what puts the registry back in step.
+        self._dropped: dict[str, dict[str, dict]] = {}
         self._values: dict[tuple[str, str, str], list[str]] = {}
+        # Definitions load without schema-dependent validation: a D1 function
+        # remains available even while the bundled demo is the active source.
+        self._memory = MemoryStore(data_dir)
+        self.fns: dict[str, FnDef] = {
+            item["name"]: FnDef(
+                name=item["name"], params=item["params"], body=item["body"], doc=item["description"],
+            )
+            for item in self._memory.document["functions"]
+        }
+        self.d1_profiles: list[dict[str, str]] = self._memory.document["d1_profiles"]
         self.refresh_schema()
+
+    @property
+    def storage_path(self) -> Path:
+        """The local JSON file containing functions and token-free D1 profiles."""
+        return self._memory.path
+
+    @property
+    def memory_error(self) -> str:
+        """An actionable startup read error, or an empty string."""
+        return self._memory.error
+
+    def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]]) -> None:
+        self._memory.save([
+            {"name": fn.name, "params": fn.params, "body": fn.body, "description": fn.doc}
+            for fn in fns.values()
+        ], profiles)
+
+    def remember_d1(self, account_id: str, database: str, display: str) -> None:
+        """Persist only connection identifiers, never a token or live source."""
+        profile = {"account_id": account_id, "database": database, "display": display}
+        profiles = list(self.d1_profiles)
+        for index, saved in enumerate(profiles):
+            if saved["account_id"] == account_id and saved["database"] == database:
+                profiles[index] = profile
+                break
+        else:
+            profiles.append(profile)
+        self._save_memory(self.fns, profiles)
+        self.d1_profiles = profiles
 
     # -- the active source --------------------------------------------------
 
@@ -206,6 +315,23 @@ class Session:
         self.dialect = default_dialect(self.source)
         self.refresh_schema()
 
+    @contextmanager
+    def target_source(self, source_id: str | None = None) -> Iterator[None]:
+        """Use a source for synchronous editor work, then restore the workspace.
+
+        Never hold this scope across an await: the language registry is shared.
+        """
+        if source_id is None or source_id == self.active_id:
+            yield
+            return
+        active_id, dialect = self.active_id, self.dialect
+        try:
+            self.set_active(source_id)
+            yield
+        finally:
+            self.active_id, self.dialect = active_id, dialect
+            self.refresh_schema()
+
     def register(self, source: DataSource, activate: bool = True) -> None:
         """Add a source built by `add_sqlite_source`/`add_d1_live_source`."""
         self.sources[source.id] = source
@@ -217,8 +343,11 @@ class Session:
 
         This is the seam the parser's strict regime and the palette both read;
         it is refreshed on every source change, never cached across sources.
+        The saved functions ride along — the parser reads them from the same
+        module-level seam, so a call resolves against the live schema.
         """
         set_schema_state(tables_of(self.source), capabilities_object(self.source))
+        set_fns(list(self.fns.values()))
 
     # -- palette data -------------------------------------------------------
 
@@ -257,13 +386,95 @@ class Session:
         The document's own `\\with` names lead: a CTE is addressable by name
         from a later `\\from`/`\\open`/`\\join`/`\\union` — and it is the table
         the user just wrote — so it belongs in the offers. Then the active
-        source's datasets, in registry order.
+        source's datasets, in registry order; a temp table this session created
+        says so instead of showing a row count that is only as fresh as the run.
         """
         ctes = [(cte.name, "cte") for cte in parse_query(doc).with_]
         return [
             *ctes,
-            *((name, f"{entry['rows']} rows") for name, entry in self.source.datasets.items()),
+            *(
+                (name, "temp table" if entry.get("temp") else f"{entry['rows']} rows")
+                for name, entry in self.source.datasets.items()
+            ),
         ]
+
+
+    # -- saved table-valued functions --------------------------------------
+
+    def save_fn(self, name: str, params_text: str, body: str, doc: str) -> FnDef:
+        """Create or replace a saved function; `ValueError` names what is wrong.
+
+        The name is an identifier; `params_text` is the comma-separated
+        positional signature; the body is validated against the live schema
+        exactly as a call would expand it (`parse_body`), so a function that
+        could only fail at its call site is refused here. Saving persists first,
+        then re-seams the registry so the parser resolves a call immediately.
+        """
+        fn = self.validate_fn(name, params_text, body, doc)
+        functions = dict(self.fns)
+        functions[fn.name] = fn
+        self._save_memory(functions, self.d1_profiles)
+        self.fns[fn.name] = fn  # replacing keeps definition order; a new name appends
+        self.refresh_schema()
+        return fn
+
+    @staticmethod
+    def validate_fn(name: str, params_text: str, body: str, doc: str) -> FnDef:
+        """Build a validated definition without saving or changing the registry."""
+        name = name.strip()
+        if not is_identifier(name):
+            raise ValueError("the function name must be a bare identifier (letters, digits, _)")
+        params = [part.strip() for part in params_text.split(",") if part.strip()]
+        if len(set(params)) != len(params):
+            raise ValueError("duplicate parameter name in the signature")
+        for param in params:
+            if not is_identifier(param):
+                raise ValueError(f'parameter "{param}" is not a bare identifier')
+        messages = parse_body(body, params)
+        if messages:
+            raise ValueError(messages[0])
+        return FnDef(name=name, params=params, body=body, doc=doc.strip())
+
+    def delete_fn(self, name: str) -> None:
+        """Persist deletion before removing the function from the live registry."""
+        if name not in self.fns:
+            return
+        functions = dict(self.fns)
+        del functions[name]
+        self._save_memory(functions, self.d1_profiles)
+        del self.fns[name]
+        self.refresh_schema()
+
+    def fn_call_rows(self) -> list[tuple[str, str]]:
+        """(call, detail) rows for the dataset-taking palette clauses.
+
+        `name()` is what a row inserts — the caret lands between the parens —
+        and the detail is the signature the library shows.
+        """
+        return [
+            (
+                f"{fn.name}()",
+                "function · "
+                + (
+                    ", ".join(fn.params)
+                    if fn.params
+                    else "no arguments"
+                )
+                + (f" · {fn.doc}" if fn.doc else ""),
+            )
+            for fn in self.fns.values()
+        ]
+
+    def fn_preview(self, name: str, args_text: str = "") -> RunOutcome:
+        """Run a call to a saved function and show its rows, without history.
+
+        The preview is a real document (`\\from name(args)`) run through `run`,
+        so it exercises the exact call-site path the editor's own queries take —
+        same expansion, same engine, same errors — with `record=False` so trying
+        a function out never lands in the History pane.
+        """
+        doc = f"\\from {name}({args_text.strip()})\n\\select *"
+        return self.run(doc, record=False)
 
     def values_for(self, doc: str, column: str) -> list[str]:
         """A column's distinct values, for the `\\where` value search.
@@ -324,23 +535,218 @@ class Session:
             display=display or None,
         )
 
+    # -- statements the query cannot carry ----------------------------------
+
+    def _supports(self, name: str) -> bool:
+        """Whether the active source advertises that capability."""
+        return bool(capabilities_for(self.source).get("supports", {}).get(name, False))
+
+    def tx_state(self) -> TxState:
+        """The active source's transaction state, created on first use."""
+        return self.tx.setdefault(self.active_id, TxState())
+
+    def temp_tables(self) -> list[str]:
+        """The temp tables the active source holds — what `\\drop` can drop."""
+        return [name for name, entry in self.source.datasets.items() if entry.get("temp")]
+
+    def apply_tx(self, kind: str, name: str | None) -> str:
+        """Run one transaction command and report it, or raise for a user mistake.
+
+        The transaction lives on the connection (so a later run stays inside
+        it); this keeps the session's own view of it — open or not, and which
+        savepoints exist — in step, including SQL's rule that `ROLLBACK TO`
+        keeps its savepoint while `RELEASE` (and everything after it) is gone.
+        """
+        if not self._supports("transactions"):
+            raise PayloadError(
+                "a live D1 source has no transactions — it is reached over HTTP, "
+                "so every query stands alone"
+            )
+        state = self.tx_state()
+        con = self.source.con
+        if kind == "begin":
+            if state.open:
+                raise PayloadError(
+                    f"a transaction is already open on {self.active_id} — \\commit or \\rollback first"
+                )
+            begin(con)
+            state.open = True
+            return f"transaction open · {self.active_id}"
+        if kind in ("commit", "rollback"):
+            if not state.open:
+                raise PayloadError(f"no transaction is open on {self.active_id} — \\begin first")
+            if kind == "commit":
+                commit(con)
+                message = f"transaction committed · {self.active_id}"
+            else:
+                rollback(con)
+                message = f"transaction rolled back · {self.active_id}"
+            state.open = False
+            state.savepoints.clear()
+            if kind == "rollback":
+                self._prune_temp()
+            return message
+        if not state.open:
+            raise PayloadError(f"no transaction is open on {self.active_id} — \\begin first")
+        if kind == "savepoint":
+            if name in state.savepoints:
+                raise PayloadError(f'savepoint "{name}" already exists')
+            savepoint(con, name or "")
+            state.savepoints.append(name or "")
+            return f'savepoint "{name}" set'
+        if name not in state.savepoints:
+            listed = ", ".join(state.savepoints) or "(none)"
+            raise PayloadError(f'unknown savepoint "{name}" — open: {listed}')
+        kept = state.savepoints[: state.savepoints.index(name)]
+        if kind == "release":
+            release(con, name or "")
+            state.savepoints = kept
+            return f'savepoint "{name}" released'
+        rollback_to(con, name or "")
+        state.savepoints = [*kept, name]
+        self._prune_temp()
+        return f'rolled back to savepoint "{name}"'
+
+    def _prune_temp(self) -> None:
+        """Re-derive the temp tables the engine still holds after a rollback.
+
+        Temp-table DDL is transactional on both engines, so a rollback takes a
+        `\\temp` created inside the transaction (or after the savepoint) with it
+        — and puts back a `\\drop` that undid one. The registry follows both
+        ways, or the explorer would keep offering a table that is gone and hide
+        one that is there.
+        """
+        dropped = self._dropped.get(self.active_id, {})
+        if not any(entry.get("temp") for entry in self.source.datasets.values()) and not dropped:
+            return
+        try:
+            live = set(self.source.con.list_tables())
+        except Exception:  # a source that cannot list locally keeps what it has
+            return
+        changed = False
+        for name in [
+            name
+            for name, entry in self.source.datasets.items()
+            if entry.get("temp") and name not in live
+        ]:
+            del self.source.datasets[name]
+            changed = True
+        for name, entry in [
+            (name, entry)
+            for name, entry in dropped.items()
+            if name in live and name not in self.source.datasets
+        ]:
+            self.source.datasets[name] = entry
+            del dropped[name]
+            changed = True
+        for name in [name for name in dropped if name not in live]:
+            del dropped[name]
+        if changed:
+            self.refresh_schema()
+
+    def tables(self) -> dict:
+        """The active source's datasets as resolved expressions.
+
+        Handing them to the engine keeps it from asking the connection for a
+        table by name: SQLite reads a table's schema inside a transaction of its
+        own, which would commit the session's open one.
+        """
+        return {name: entry["table"] for name, entry in self.source.datasets.items()}
+
+    def materialize_temp(
+        self,
+        name: str,
+        payload: dict,
+        dialect: str,
+        schema,
+        tables: dict | None = None,
+    ) -> dict:
+        """Run the payload and keep its rows as a temp table on the active source.
+
+        Only a name that is not already the session's — a dataset, or this
+        document's own CTE — is refused; re-running a `\temp` replaces the table
+        it made last time, which is what an IDE's run key should do.
+        """
+        if not self._supports("temp"):
+            raise PayloadError(
+                "a live D1 source cannot hold a temp table — it is reached over HTTP"
+            )
+        entry = self.source.datasets.get(name)
+        if entry is not None and not entry.get("temp"):
+            raise PayloadError(f'"{name}" is already a dataset — pick another temp name')
+        if name in {cte["name"] for cte in payload.get("ctes") or []}:
+            raise PayloadError(f'"{name}" is a CTE in this document — pick another temp name')
+        result = materialize(self.source.con, payload, name, dialect, tables=tables)
+        self.source.datasets[name] = {
+            "table": temp_handle(self.source.con, name, schema),
+            "doc": "temp table · created this session",
+            "rows": len(result["rows"]),
+            "temp": True,
+        }
+        # A fresh table means fresh values: nothing cached for this source still holds.
+        self._values = {key: value for key, value in self._values.items() if key[0] != self.active_id}
+        self.refresh_schema()
+        return result
+
+    def drop_temp_table(self, name: str) -> None:
+        """Drop a temp table this session created — `\\drop` is not general DDL."""
+        entry = self.source.datasets.get(name)
+        if entry is None or not entry.get("temp"):
+            raise PayloadError(f'"{name}" is not a temp table')
+        drop_temp(self.source.con, name)
+        del self.source.datasets[name]
+        # A drop inside a transaction can be rolled back, which puts the table
+        # back on the engine: what it was — its handle, its row count — is kept
+        # so the registry can follow.
+        self._dropped.setdefault(self.active_id, {})[name] = entry
+        self._values = {key: value for key, value in self._values.items() if key[0] != self.active_id}
+        self.refresh_schema()
+
     # -- running ------------------------------------------------------------
 
-    def run(self, doc: str) -> RunOutcome:
-        """Parse, execute, and cap the result; never raises for a user mistake."""
+    def run(self, doc: str, record: bool = True) -> RunOutcome:
+        """Parse, run the document's statements, then its query; never raises.
+
+        A document is a statement: its transaction commands run first, in the
+        order they were written, then `\\drop`, and then the query — which is
+        the one thing `\\temp` wraps (`CREATE TEMP TABLE … AS`). A document of
+        statements alone runs them and answers with their status; the rows a
+        query produced are the rows it asked for, capped for the pane.
+        """
         ast = parse_query(doc)
         if ast.errors:
             first = ast.errors[0]
             message = f"line {first.line}: {first.message}"
             return RunOutcome(status=f"not executed · {message}", error=message)
         payload = payload_from_ast(ast)
+        queried = has_query(ast)
+        steps: list[str] = []
         try:
             dialect = dialect_for(self.source, self.dialect)
-            expr = build(self.source.con, payload)
-            if self.source.d1 is not None:
-                result = execute_remote(self.source.d1, self.source.con, payload, dialect)
+            for step in ast.tx:
+                steps.append(self.apply_tx(step.kind, step.name))
+            if ast.drop:
+                self.drop_temp_table(ast.drop.name)
+                steps.append(f'dropped temp table "{ast.drop.name}"')
+            if not queried:
+                if ast.temp:
+                    raise PayloadError(
+                        "\\temp needs a query to keep — this document has no \\from"
+                    )
+                return self._statement_outcome(steps, dialect, doc, dropped=bool(ast.drop))
+            tables = self.tables()
+            expr = build(self.source.con, payload, tables=tables)
+            if ast.temp:
+                result = self.materialize_temp(
+                    ast.temp.name, payload, dialect, expr.schema(), tables
+                )
+                steps.append(f'created temp table "{ast.temp.name}"')
+            elif self.source.d1 is not None:
+                result = execute_remote(
+                    self.source.d1, self.source.con, payload, dialect, tables=tables
+                )
             else:
-                result = execute(self.source.con, payload, dialect)
+                result = execute(self.source.con, payload, dialect, tables=tables)
         except (PayloadError, D1Error) as exc:
             return RunOutcome(status=str(exc), error=str(exc))
         except Exception as exc:  # last-resort guard: a UI may not crash or exit
@@ -366,16 +772,43 @@ class Session:
             total=total,
             ms=result["ms"],
             sql=result["sql"],
+            schema_changed=bool(ast.temp or ast.drop),
         )
-        outcome.status = self._status_for(outcome)
+        outcome.status = " · ".join([*steps, self._status_for(outcome)])
+        if record:
+            # A library preview is not a run the user made; it stays out of history.
+            self.history.insert(
+                0,
+                HistoryEntry(
+                    at=time.strftime("%H:%M:%S"),
+                    source=self.active_id,
+                    dialect=dialect,
+                    rows=total,
+                    ms=result["ms"],
+                    doc=doc,
+                ),
+            )
+        return outcome
+
+    def _statement_outcome(
+        self, steps: list[str], dialect: str, doc: str, dropped: bool = False
+    ) -> RunOutcome:
+        """A run that carried statements and no query: their status, no rows."""
+        outcome = RunOutcome(
+            ok=True,
+            source=self.active_id,
+            dialect=dialect,
+            status=" · ".join(steps) or "nothing to run",
+            schema_changed=dropped,
+        )
         self.history.insert(
             0,
             HistoryEntry(
                 at=time.strftime("%H:%M:%S"),
                 source=self.active_id,
                 dialect=dialect,
-                rows=total,
-                ms=result["ms"],
+                rows=0,
+                ms=0.0,
                 doc=doc,
             ),
         )
@@ -385,21 +818,26 @@ class Session:
         """(sql, message): the document rendered for the active dialect.
 
         Compiling never executes; `sql` is None when the document or the dialect
-        is refused, and `message` is then the user-facing reason.
+        is refused, and `message` is then the user-facing reason. The statements
+        a document may carry — transactions, `\\temp`, `\\drop` — are not SQL to
+        render, so they are named in the message instead.
         """
         ast = parse_query(doc)
         if ast.errors:
             first = ast.errors[0]
             return None, f"line {first.line}: {first.message}"
         payload = payload_from_ast(ast)
+        if not has_query(ast):
+            return None, "nothing to compile — this document carries statements only"
         try:
             dialect = dialect_for(self.source, self.dialect)
-            sql = compile_sql(build(self.source.con, payload), dialect)
+            sql = compile_sql(build(self.source.con, payload, tables=self.tables()), dialect)
         except (PayloadError, D1Error) as exc:
             return None, str(exc)
         except Exception as exc:  # last-resort guard: a UI may not crash or exit
             return None, f"{type(exc).__name__}: {exc}"
-        return sql, f"compiled for {dialect} · {len(sql.splitlines())} lines"
+        note = " · \\temp materializes on run" if ast.temp else ""
+        return sql, f"compiled for {dialect} · {len(sql.splitlines())} lines{note}"
 
     def count_rows(self, expr) -> int | None:
         """The document's full row count, for the preview-cap note.

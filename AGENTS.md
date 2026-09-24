@@ -12,7 +12,8 @@ The **document** — a short `\command` language — is the source of truth.
 Everything derives from it: the AST is always recomputed from the text (nothing
 caches it across edits), the AST becomes a payload, the payload builds a real
 ibis expression, and the widgets render whatever comes back. Nothing writes
-back into the document except the user and the palette's own inserts.
+back into the document except user edits, palette inserts, and an AI proposal
+the user explicitly accepts with Apply.
 
 Three layers, one direction:
 
@@ -32,21 +33,21 @@ Three layers, one direction:
 | Real database connections | DuckDB in-process over the Parquet under `anyql/engine/data/` |
 | An HTTP server or a browser UI | **The TUI is the app.** `uv run anyql`; nothing listens on a port |
 | Authentication | No login, no users, no session identity |
-| Credentials handling | Nothing to authenticate against; never introduce secrets beyond the D1 token below |
-| Persistence | State lives in memory (active source, dialect, history, added sources); it dies with the process |
+| Credentials handling | Only the user-authorized D1 and AI-provider keys below; never persist, log, or echo them |
+| Persistence | Only custom functions and token-free D1 profiles persist under the user-authorized exception below; other state stays in memory |
 | Hand-written SQL generation | Compose ibis expressions; render with `ibis.to_sql(expr, dialect=…)` |
 
 If a task seems to require one of these, it is out of scope. Build the *UI
 affordance* for it, not the feature.
 
-**One user-authorized exception — Cloudflare D1.** Pointing anyQL at a real D1
+**User-authorized exception — Cloudflare D1.** Pointing anyQL at a real D1
 database was an explicit, deliberate override of the rows above, so it is scoped
 exactly as narrowly as it is implemented today and nothing else may lean on it:
 `kind="d1-live"` reaches Cloudflare's official D1 REST API
 (`anyql/engine/d1api.py`) using credentials the *user* pastes into the
 add-source modal, and `kind="d1"` opens a local `.sqlite` snapshot of a D1
 database through ibis's SQLite backend, entirely in-process. There is still no
-login/user/session concept, no persisted secret, and no other remote service.
+login/user/session concept or persisted secret.
 The live path keeps the architecture intact: payloads build against *unbound*
 ibis tables carrying the D1 database's real schemas and compile to SQLite SQL
 exactly like every other source; only the execution seam differs — the compiled
@@ -55,6 +56,34 @@ connection (`execute_remote` in `anyql/engine/execute.py`). **The token is
 request-scoped: it lives only in the in-memory source, is used per query, and is
 never persisted, logged, or echoed back into the UI** (the modal's API-token
 input is `password=True` and the built source never renders it).
+
+**User-authorized exception — local memory.** `anyql/storage.py` stores custom
+functions (name, ordered parameters, body, description) and token-free D1
+profiles (account ID, resolved database UUID, display label) in user-local
+`memory.json`. `Session` loads it at startup without network or schema-dependent
+body validation. Function Save/Run preview and Delete persist immediately;
+AI Apply and ordinary draft edits never auto-save. D1 Add remembers identifiers;
+Test and Cancel do not. A saved connection always requires a fresh token.
+The default directory is `%LOCALAPPDATA%/anyql` on Windows, Application Support
+on macOS, or XDG data home on Linux; `ANYQL_DATA_DIR` overrides it. Atomic
+replacement and stale-session detection protect saved work. Invalid/unreadable
+memory is preserved, surfaced to the UI, and blocks saves until recovery and
+restart. Tests isolate this directory per test. No credentials, AI settings,
+chat, query history, active-source choice, documents, or temp tables persist.
+
+**User-authorized exception — AI inference.** `anyql/ai/client.py` calls a
+user-configured OpenAI-compatible Chat Completions provider using the existing
+`httpx` dependency. Settings owns URL/model/masked key configuration in memory;
+the optional yolo import reads the environment or `~/.omp/agent/.env` without
+modifying it. No OMP dependency, HTTP server, or persisted chat/credentials.
+`anyql/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
+history, function definitions, and parser validation; it grants no shell/file or
+arbitrary query-execution tool. `\AI` opens an in-layout chat; the function form's
+Make with AI uses the same panel. Streaming is cancellable, retries and tool
+rounds are bounded, and incomplete replies never become applicable proposals.
+Only explicit Apply changes the document/body, after parser validation and a
+stale-target check; Apply never executes a query or saves a function. Schema,
+sample rows, history, and submitted drafts may be sent to the configured provider.
 
 ## Architecture rules
 
@@ -67,8 +96,8 @@ input is `password=True` and the built source never renders it).
   never written back into the document.
 - **No network in the UI.** No TUI module imports a server framework, and
   importing the app loads none — `tests/test_tui.py::test_the_tui_reaches_no_http_server`
-  enforces exactly that, structurally and at import time. The single network
-  edge in the whole repo is the live-D1 client inside the engine.
+  enforces exactly that, structurally and at import time. Network edges are the
+  live-D1 client inside the engine and the AI-provider client in `anyql/ai/`.
 - **Schema state lives at one seam.** `anyql/query/schema.py` is the registry
   the parser's validation and the palette both read; `Session.refresh_schema()`
   installs the active source's tables + capabilities through
@@ -95,7 +124,7 @@ input is `password=True` and the built source never renders it).
   deterministic data* and executes on the same in-process DuckDB as the demo;
   nothing more. `capabilities_for` labels each one honestly
   (`"<dialect> (mock)"`).
-- **Cloudflare D1 sources, added at runtime** (never persisted, never bundled):
+- **Cloudflare D1 sources, added at runtime** (connections never persisted or bundled; token-free profiles remembered):
   `add_sqlite_source` (`kind="d1"`, a local `.sqlite` snapshot, opened
   in-process; `sqlite_*`/`_cf_*` objects are skipped, the same filter D1's own
   console applies) and `add_d1_live_source` (`kind="d1-live"`, real schemas
@@ -120,16 +149,19 @@ anyql/
                   (derived output names), schema.py (the registry seam)
   engine/         datasources.py (registry, dialects, capabilities, D1 sources),
                   expression.py (payload → ibis), execute.py (compile + execute,
-                  execute_remote for live D1), d1api.py (Cloudflare REST client),
+                  execute_remote for live D1, materialize for `\temp`),
+                  tx.py (transactions, savepoints, temp tables),
+                  d1api.py (Cloudflare REST client),
                   make_data.py (deterministic Parquet + fixtures),
                   data/ (demo Parquet + per-mock mirrors), d1/ (the shipped
                   D1 snapshot)
   tui/            app.py (widgets + bindings, pane visibility), session.py
                   (headless core, run, compile, history, PREVIEW_ROW_CAP,
                   VALUE_POOL_LIMIT), palette.py (`\` rules, matching, offers),
-                  settings.py (the `\settings` menu), add_source.py (the
+                  settings.py (the `\settings` menu), fn.py (the `\fn` function
+                  library + editor), add_source.py (the
                   `ctrl+o` modal), app.tcss
-tests/            pytest suite (203: 170 query/engine + 33 TUI) + fixtures/
+tests/            pytest suite (298: 255 query/engine + 43 TUI) + fixtures/
 spec/             canonical-query.anyql ↔ canonical-query.ast.json (the contract)
 docs/AST.md       language contract — read before touching anyql/query/
 verify/           check_canonical.py — the language gate
@@ -149,8 +181,7 @@ command runs in the project's `.venv`.
 ```bash
 uv sync                                      # create/refresh the project environment (.venv)
 uv run anyql                                 # launch the IDE in this terminal
-uv run python -m anyql                       # the same entry point, module form
-uv run pytest -q                             # the whole suite (203 tests)
+uv run pytest -q                             # the whole suite (298 tests)
 uv run python verify/check_canonical.py      # language contract gate → prints MATCH
 uv run python -m anyql.engine.make_data      # regenerate demo Parquet + fixtures
 ```
@@ -161,10 +192,10 @@ group) and locked in `uv.lock` with `uv lock`. A new dependency means editing
 only dependency records, and there is no second requirements file.
 
 ## Verification bar
-
-- `uv run pytest -q` must pass — 203 tests: the query/engine contract
+- `uv run pytest -q` must pass — 298 tests: the query/engine contract
   (parser regimes, payload mapping, datasources, D1 sources, set operations,
-  execute vs fixtures) plus the TUI end to end.
+  subqueries, lateral joins, window frames, regex, table-valued functions, temp
+  tables and transactions, execute vs fixtures) plus the TUI end to end.
 - `uv run python verify/check_canonical.py` must print `MATCH` — deep equality of
   `parse_query(canonical)` against `spec/canonical-query.ast.json`.
 - **UI changes are verified headlessly with Textual's pilot**
@@ -228,16 +259,21 @@ Results explorer, `anyql/tui/app.py:158-160`:
 
 Add-source modal, `anyql/tui/add_source.py:27`: `escape` cancels (registers
 nothing). Settings menu, `anyql/tui/settings.py:90`: `escape` backs out one
-level, and leaves Settings from the root. Clicking a palette row accepts it,
+level, and leaves Settings from the root. Function library (`\fn`),
+`anyql/tui/fn.py`: `ctrl+r` previews the selected function (its grid shows the
+call's rows, and a preview never lands in History), `ctrl+d` deletes it, `escape`
+back out. Clicking a palette row accepts it,
 like Enter on the highlight (`app.py` `_palette_clicked`).
-
 Beyond the keys, the `\` palette carries the workspace actions: `\results`,
 `\sql`, `\history` and `\schema` show/hide their pane — accepting the row, so
-nothing is ever written into the document — and `\settings` opens the
-full-screen menu, the one place every setting lives: Show/Hide Menus (all four
-panes), Intellisense, Keybindings (read live off the widget classes), Data
-source, and Dialect. Accepting one of the thirteen clause commands instead takes
-its own line, or the line that clause already has in the block being edited.
+nothing is ever written into the document — `\settings` opens the full-screen
+menu, the one place every setting lives (Show/Hide Menus for all four panes,
+Intellisense, Keybindings read live off the widget classes, Data source, Dialect),
+and `\fn` opens the function library (see fn.py). Accepting a clause command instead takes
+its own line, or the line that clause already has in the block being edited:
+`\from`, `\open`, `\join`, `\union`, `\intersect`, `\except`, `\select`,
+`\distinct`/`\unique`, `\where`, `\group`, `\order`, `\case`, `\limit`, `\with`, `\temp`, `\drop`,
+`\begin`, `\savepoint`, `\release`, `\rollback`, `\commit`.
 
 Provided by Textual, not by this app: `ctrl+q` quits (`textual/app.py`,
 `App.BINDINGS`), and the results/history tables use `DataTable`'s own keys
@@ -295,14 +331,78 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
 - **`ctrl+a` selects the whole document.** `TextArea` binds `home,ctrl+a` to
   line start, so `EditorPane` claims the key for the same reason.
 - **A clause command takes its own line — or the line its clause has.**
-  Accepting `\where` (any of the thirteen) asks `clause_line`
+  Accepting `\where` (or any clause command) asks `clause_line`
   (`anyql/query/parser.py:286`) for that clause in the block the caret is
   editing: found, the caret goes there and the document is untouched; not found,
-  the command breaks the line first. `\open` is `\from`; a repeated clause
-  answers with its last line; a `\with` body is a block of its own.
+  the command breaks the line first. `\open` is `\from`, and `\unique` is
+  `\distinct`; a repeated clause answers with its last line; a `\with` body
+  is a block of its own.
+- **Distinct compares output rows.** `\distinct` / `\unique` take no arguments,
+  use Ibis `distinct()` after projection and set operations, and precede ordering
+  and limits. Each CTE, inline subquery, and function body owns its own flag.
+- **Function parameters complete from the draft.** In the `\fn` body editor,
+  `@` offers the current form's declared names, including unsaved edits. These
+  offers respect parameter quote/boundary rules and never leak to the workspace.
 - **A screen must not define `_render`.** `Widget._render` is Textual's own hook
   returning the visual a widget paints; naming the settings menu's redraw
   `_render` shadowed it and killed rendering for the whole screen (`AttributeError:
   'NoneType' object has no attribute 'render_strips'`). That method is `_draw`.
 - Timestamps leave the engine as ISO strings; NaN/None become `None` (rendered
   as `NULL` in the table).
+- **A document is one statement.** Transaction commands run in document order
+  *before* the query, then `\drop`, then the query — with `\temp` materializing
+  what that query produced — so `\begin` + `\temp t` in one run is "open a
+  transaction, then keep this"; a document of statements alone runs them and
+  answers with their status, rows-free. Transaction state is per source, lives
+  in `Session.tx`, and the transaction itself lives on the connection.
+- **Inline subqueries are the same grammar on one line.** `( \from … \select … )`
+  is parsed by `parse_subquery` into a full `QueryAST` whose every node reports
+  the *clause's* line (`ParseOpts.fixed_line`) because that is the only line it
+  has; errors bubble to the document and the nested `errors` list is cleared,
+  exactly like a `\with` body. A parenthesized `\where` operand is a subquery
+  only when it contains a `\`, so `\where amount = (3)` still compares to `(3)`.
+- **LATERAL is correlation hoisting.** ibis has no correlated subquery inside a
+  join, so `\join lateral` lifts the body's `\where` equality against an outer
+  column into the join predicate, and a body `\limit` becomes the top-N rewrite
+  (`row_number()` over the correlation's partition, filtered, helper column
+  dropped). Anything that is not an equality correlation is refused by name —
+  never approximated — and a body table may not reuse a name from the left, or
+  every reference to it would be ambiguous (`duplicate table identifier`). The
+  body's ordering columns are re-projected under `_anyql_order_N` names first:
+  a window frame may only depend on one relation.
+- **`\temp` is `CREATE TEMPORARY TABLE … AS`** around ibis' own rendering of the
+  query, and the rows the pane shows are read back *from the table*. It is the
+  one write in the app, so it is what a transaction has to show for itself:
+  temp-table DDL is transactional on DuckDB and SQLite alike, so `\begin` in one
+  run, `\temp t` in the next, then `\rollback` leaves no `t`. `Session._prune_temp`
+  re-derives *which* temp tables there are from the connection after every
+  rollback — removing what the transaction took and putting back what its DDL
+  undid (a `\drop` is stashed in `Session._dropped` for exactly that). A
+  restored table's handle is name-based (`tx.temp_handle`), so it reads the
+  table the name resolves to now, never a snapshot of a dropped one. (All of a document's
+  directives run before its query, so a `\begin` and a `\rollback` in the *same*
+  document cannot wrap the table it keeps.)
+- **ibis' `create_table`/`drop_table` are unusable in this build.** With the
+  locked sqlglot (30.19), `sge.Drop(...).sql("duckdb")` renders `DROP TABLE IF
+  EXISTS` with **no name**, so `drop_table` (and every `overwrite=True` path)
+  raises a parser error; SQLite's `create_table` additionally wraps itself in
+  `self.begin()`, which would commit the session's own transaction. Hence
+  `anyql/engine/tx.py` issues `DROP`/`CREATE TEMPORARY TABLE … AS` through the
+  backend's own handle.
+- **`con.table(name)` commits an open SQLite transaction.** ibis' SQLite
+  `get_schema` runs inside its own transaction, so introspection ends the
+  session's; that is why `Session.tables()` hands the registry's already-resolved
+  handles to `build`/`execute`/`materialize` (the `tables` parameter) and why a
+  temp table's handle is built from its schema (`tx.temp_handle`) instead of
+  being looked up. DuckDB is unaffected, but the handles save its introspection
+  too.
+- **A frame needs the ordering it counts from.** `rows|range between …` inside
+  `over ( … )` without `order by` is refused with its own message (a frame is
+  counted from the ordering); bounds are canonical text in the AST whatever case
+  and spacing they were typed with.
+- **`~`/`!~` are predicates, not filters on strings only.** A non-string column
+  is named as the mistake (`needs a string column`), and the palette stops
+  offering values after `~`, `!~`, `in` and `not in` — their operand is typed.
+  It also reads the capability flags: `\savepoint`/`\release` are offered only
+  where `supports.savepoints` says the engine has them (SQLite does, DuckDB does
+  not), exactly as the operator list comes from the backend.

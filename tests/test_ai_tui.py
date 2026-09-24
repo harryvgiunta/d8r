@@ -1,0 +1,371 @@
+"""AI acceptance: real Textual widgets and engine, deterministic provider wire."""
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+
+import httpx
+from textual.widgets import Button, Input, OptionList, Static, TextArea
+
+from anyql.ai import client
+from anyql.ai.client import AIConfig
+from anyql.ai.context import AIContext
+from anyql.tui.ai import AIPanel
+from anyql.tui.app import AnyqlApp
+from anyql.tui.fn import FnScreen
+from anyql.tui.session import Session
+from anyql.tui.settings import AIProviderScreen, SettingsScreen
+
+PROPOSAL = "\\from events\n\\select event_type\n\\limit 2"
+ANSWER = "Here is the replacement.\n```anyql\n" + PROPOSAL + "\n```"
+
+
+def frame(delta: dict, finish=None) -> bytes:
+    return ("data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
+
+
+def completion(text=ANSWER) -> bytes:
+    return frame({"content": text}) + frame({}, "stop") + b"data: [DONE]\n\n"
+
+
+def install_provider(monkeypatch, handler):
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(client, "create_client", lambda config: httpx.AsyncClient(transport=transport))
+
+
+async def finished(panel):
+    async def wait():
+        while panel.busy:
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(wait(), 8)
+
+
+async def click(pilot, widget):
+    widget.scroll_visible(animate=False)
+    await pilot.pause()
+    await pilot.click(widget)
+
+
+def configured():
+    session = Session()
+    session.ai_config = AIConfig(base_url="https://provider.invalid/v1", model="test", api_key="test-secret")
+    return session
+
+
+def test_settings_save_cancel_and_masked_key():
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(150, 58)) as pilot:
+            await pilot.press("ctrl+comma")
+            screen = app.screen
+            assert isinstance(screen, SettingsScreen)
+            sidebar = screen.query_one("#settings-sidebar", OptionList)
+            sidebar.highlighted = sidebar.get_option_index("ai")
+            await pilot.pause()
+            await pilot.press("enter", "enter")
+            assert isinstance(app.screen, AIProviderScreen)
+            form = app.screen
+            form.query_one("#ai-base-url", Input).value = "https://provider.invalid/v1"
+            form.query_one("#ai-model", Input).value = "test"
+            form.query_one("#ai-api-key", Input).value = "private-value"
+            assert form.query_one("#ai-api-key", Input).password
+            await click(pilot, form.query_one("#ai-settings-save", Button))
+            assert app.session.ai_config.model == "test"
+            assert app.session.ai_config.api_key == "private-value"
+            assert "private-value" not in repr(app.session.ai_config)
+            await pilot.press("enter")
+            form = app.screen
+            assert isinstance(form, AIProviderScreen)
+            form.query_one("#ai-model", Input).value = "cancelled-change"
+            await pilot.press("escape")
+            assert app.session.ai_config.model == "test"
+            assert Session().ai_config.api_key == ""
+    asyncio.run(scenario())
+
+
+def test_inline_stream_tools_and_apply_only(monkeypatch):
+    async def scenario():
+        release = asyncio.Event()
+        streamed = asyncio.Event()
+        requests = []
+
+        class ResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield frame({"content": ANSWER})
+                streamed.set()
+                await release.wait()
+                yield frame({}, "stop") + b"data: [DONE]\n\n"
+
+        def provider(request):
+            body = json.loads(request.content)
+            requests.append(body)
+            tool_results = [m for m in body["messages"] if m["role"] == "tool"]
+            if len(requests) == 1:
+                return httpx.Response(429, headers={"Retry-After": "0"})
+            if not tool_results:
+                calls = [{"index": i, "id": f"call-{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+                         for i, (name, args) in enumerate((("schema", {"table": "events"}), ("sample_rows", {"table": "events", "limit": 2}), ("query_history", {})))]
+                return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=frame({"tool_calls": calls}) + frame({}, "tool_calls") + b"data: [DONE]\n\n")
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=ResponseStream())
+
+        install_provider(monkeypatch, provider)
+        session = configured()
+        session.run("\\from events\n\\select user_id\n\\limit 1")
+        app = AnyqlApp(session)
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.editor.load_text("")
+            app.editor.focus()
+            await pilot.press("\\", "A", "I", "enter")
+            panel = app.query_one("#workspace-ai", AIPanel)
+            assert panel.display
+            original = app.editor.text
+            assert "\\AI" not in original
+            composer = panel.query_one("#ai-input", TextArea)
+            composer.load_text("Use schema, sample rows and history.")
+            composer.move_cursor((0, len(composer.text)))
+            composer.focus()
+            await pilot.press("enter", *"Propose a query.")
+            assert composer.text == "Use schema, sample rows and history.\nPropose a query."
+            assert not requests  # Enter edits the message; only Ctrl+Enter sends.
+            await pilot.press("ctrl+enter")
+            await asyncio.wait_for(streamed.wait(), 8)
+            await pilot.pause()
+            assert "replacement" in str(panel.query_one("#ai-transcript", Static).content)
+            assert panel.query_one("#ai-apply", Button).disabled
+            assert app.editor.text == original
+            assert len(session.history) == 1  # ctrl+enter sent chat, not a query
+            assert len(requests) == 3  # rate limit, successful tools, final stream
+            sent = next(message for message in requests[0]["messages"] if message["role"] == "user")
+            assert sent["content"] == "Use schema, sample rows and history.\nPropose a query."
+            assert composer.text == ""
+            results = [json.loads(m["content"]) for m in requests[-1]["messages"] if m["role"] == "tool"]
+            assert results[0]["tables"][0]["name"] == "events"
+            assert len(results[1]["rows"]) == 2
+            assert results[2]["history"][0]["document"].startswith("\\from events")
+            release.set()
+            await finished(panel)
+            assert not panel.query_one("#ai-apply", Button).disabled
+            assert app.editor.text == original
+            await click(pilot, panel.query_one("#ai-apply", Button))
+            assert app.editor.text == PROPOSAL
+            assert len(session.history) == 1
+            panel.query_one("#ai-input", TextArea).focus()
+            await pilot.press("tab")
+            assert app.focused is panel.query_one("#ai-send", Button)
+    asyncio.run(scenario())
+
+
+def test_cancellation_stale_edits_and_source_isolation(monkeypatch):
+    async def scenario():
+        partial = asyncio.Event()
+        close_seen = asyncio.Event()
+        requests = []
+
+        class Pending(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield frame({"content": ANSWER})
+                partial.set()
+                await asyncio.Event().wait()
+            async def aclose(self):
+                close_seen.set()
+
+        def provider(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=Pending()) if len(requests) == 1 else httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion())
+
+        install_provider(monkeypatch, provider)
+        app = AnyqlApp(configured())
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.action_ai()
+            panel = app.query_one("#workspace-ai", AIPanel)
+            original = app.editor.text
+            panel.query_one("#ai-input", TextArea).load_text("first")
+            await click(pilot, panel.query_one("#ai-send", Button))
+            await asyncio.wait_for(partial.wait(), 5)
+            await click(pilot, panel.query_one("#ai-cancel", Button))
+            await asyncio.wait_for(close_seen.wait(), 5)
+            assert app.editor.text == original
+            assert panel.query_one("#ai-apply", Button).disabled
+            assert not panel.messages
+            panel.query_one("#ai-input", TextArea).load_text("second")
+            await click(pilot, panel.query_one("#ai-send", Button))
+            await finished(panel)
+            assert not panel.query_one("#ai-apply", Button).disabled
+            app.editor.load_text("\\from users\n\\limit 1")
+            await pilot.pause()
+            panel.action_apply()
+            assert app.editor.text == "\\from users\n\\limit 1"
+            assert panel.query_one("#ai-apply", Button).disabled
+            app.select_source("mysql")
+            await pilot.pause()
+            assert not panel.messages
+            assert not panel.query_one("#ai-transcript", Static).content
+    asyncio.run(scenario())
+
+
+def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(monkeypatch):
+    from anyql.ai import context as context_module
+
+    started = threading.Event()
+    release = threading.Event()
+    execute = context_module.execute
+
+    def delayed_execute(*args, **kwargs):
+        started.set()
+        if not release.wait(10):
+            raise RuntimeError("sample was not released after chat cancellation")
+        return execute(*args, **kwargs)
+
+    def provider(request):
+        call = {"index": 0, "id": "sample", "type": "function", "function": {
+            "name": "sample_rows", "arguments": json.dumps({"table": "events", "limit": 2}),
+        }}
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                             content=frame({"tool_calls": [call]}) + frame({}, "tool_calls") + b"data: [DONE]\n\n")
+
+    monkeypatch.setattr(context_module, "execute", delayed_execute)
+    install_provider(monkeypatch, provider)
+
+    async def scenario():
+        app = AnyqlApp(configured())
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.editor.load_text(PROPOSAL)
+            app.action_ai()
+            panel = app.ai_panel
+            panel.query_one("#ai-input", TextArea).load_text("Read a sample.")
+            try:
+                await click(pilot, panel.query_one("#ai-send", Button))
+                assert await asyncio.to_thread(started.wait, 2)
+                await click(pilot, panel.query_one("#ai-cancel", Button))
+                await click(pilot, panel.query_one("#ai-close", Button))
+                await pilot.press("ctrl+enter")
+                assert not app.run_busy
+                assert "unavailable" in str(app.query_one("#status", Static).content)
+                assert not app.session.history
+
+                release.set()
+                async def idle():
+                    while app.session.busy:
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(idle(), 5)
+                await pilot.press("ctrl+enter")
+                await app.workers.wait_for_complete()
+                assert [entry.doc for entry in app.session.history] == [PROPOSAL]
+                assert app.session.history[0].rows == 2
+                assert not panel.messages
+            finally:
+                release.set()
+                await asyncio.gather(*panel._context_tasks)
+
+    asyncio.run(scenario())
+
+
+def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
+    requests = []
+    body = "\\from products\n\\where category = @category\n\\select category\n\\limit 2"
+    metadata = {"name": "categories", "description": "Return two product categories",
+                "parameters": ["category"], "arguments": '"electronics"'}
+
+    def provider(request):
+        requests.append(json.loads(request.content))
+        answer = "```json\n" + json.dumps(metadata) + "\n```\n```anyql\n" + body + "\n```"
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion(answer))
+
+    install_provider(monkeypatch, provider)
+
+    async def scenario():
+        from textual.widgets import Select
+        app = AnyqlApp(configured())
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.action_fn()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, FnScreen)
+            await click(pilot, screen.query_one("#fn-ai", Button))
+            panel = screen.ai_panel
+            assert not requests  # Opening the helper must not send anything.
+            assert app.focused is panel.query_one("#ai-input", TextArea)
+            screen.query_one("#fn-source", Select).value = "mysql"
+            await pilot.pause()
+            panel.query_one("#ai-input", TextArea).load_text("Give me two products in a category I choose")
+            panel.query_one("#ai-input", TextArea).focus()
+            await pilot.press("ctrl+enter")
+            await finished(panel)
+            assert screen.query_one("#fn-name", Input).value == ""
+            assert screen.query_one("#fn-body", TextArea).text == ""
+            assert not app.session.fns
+            assert '"source": "mysql"' in requests[0]["messages"][0]["content"]
+            assert not panel.query_one("#ai-apply", Button).disabled
+            assert "categories(category)" in str(panel.query_one("#ai-function-details", Static).content)
+            # Even example-argument edits make an outstanding replacement stale.
+            screen.query_one("#fn-args", Input).value = '"books"'
+            await pilot.pause()
+            panel.action_apply()
+            assert screen.query_one("#fn-body", TextArea).text == ""
+            assert panel.query_one("#ai-apply", Button).disabled
+            panel.query_one("#ai-input", TextArea).load_text("Use electronics as the example instead")
+            panel.query_one("#ai-input", TextArea).focus()
+            await pilot.press("ctrl+enter")
+            await finished(panel)
+            assert len(requests) == 2
+            assert not panel.query_one("#ai-apply", Button).disabled
+            await click(pilot, panel.query_one("#ai-apply", Button))
+            assert not panel.display
+            assert screen.query_one("#fn-name", Input).value == "categories"
+            assert screen.query_one("#fn-params", Input).value == "category"
+            assert screen.query_one("#fn-args", Input).value == '"electronics"'
+            assert screen.query_one("#fn-body", TextArea).text == body
+            assert not app.session.fns
+            assert not app.session.history
+            assert not app.session.storage_path.exists()
+            await click(pilot, screen.query_one("#fn-save", Button))
+            assert app.session.fns["categories"].body == body
+            assert app.session.active_id == "demo"
+    asyncio.run(scenario())
+
+
+def test_context_pins_source_bounds_samples_and_never_runs_suggested_text():
+    async def scenario():
+        session = Session()
+        session.run("\\from events\n\\limit 1")
+        context = AIContext(session, "demo", "")
+        session.set_active("mysql")
+        session.run("\\from products\n\\limit 1")
+        history = json.loads(await context.call_tool("query_history", {}))
+        assert [h["document"] for h in history["history"]] == ["\\from events\n\\limit 1"]
+        sampled = json.loads(await context.call_tool("sample_rows", {"table": "events", "limit": 5}))
+        assert len(sampled["rows"]) == 5
+        assert "event_type" in sampled["columns"]
+        assert "error" in json.loads(await context.call_tool("sample_rows", {"table": "products"}))
+        assert "error" in json.loads(await context.call_tool("sample_rows", {"table": "events", "limit": 10000}))
+        assert "error" in json.loads(await context.call_tool("execute", {"text": "\\drop events"}))
+        assert context.validate_proposal(PROPOSAL) is None
+        assert context.validate_proposal("\\from events\n\\bogus") is not None
+        fn_context = AIContext(session, "demo", "", parameters=("kind",))
+        assert fn_context.validate_proposal("\\from events\n\\where event_type = @kind") is None
+        assert fn_context.validate_proposal("\\from events\n\\where event_type = @missing") is not None
+        assert fn_context.validate_proposal("\\from events\n\\temp kept") is not None
+        assert session.active_id == "mysql"
+        assert len(session.history) == 2
+        assert "events" in session.sources["demo"].datasets
+    asyncio.run(scenario())
+
+
+def test_complete_function_proposals_reject_invalid_or_conflicting_definitions():
+    session = Session()
+    session.save_fn("existing", "", PROPOSAL, "Saved work")
+    context = AIContext(session, "demo", "", parameters=())
+
+    def proposal(name="generated", parameters=None, body=PROPOSAL):
+        metadata = {"name": name, "description": "Example", "parameters": parameters or [], "arguments": ""}
+        return context.read_proposal("```json\n" + json.dumps(metadata) + "\n```\n```anyql\n" + body + "\n```")
+
+    assert context.validate_replacement(proposal()) is None
+    assert context.validate_replacement(proposal(name="existing")) is not None
+    assert context.validate_replacement(proposal(parameters=["a", "a"])) is not None
+    assert context.validate_replacement(proposal(parameters=["a,b"])) is not None
+    assert context.validate_replacement(proposal(body="\\from events\n\\where amount > @missing")) is not None
+    assert context.validate_replacement(proposal(body="\\from events\n\\temp kept")) is not None
+    assert list(session.fns) == ["existing"]
+    assert not session.history

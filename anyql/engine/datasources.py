@@ -1,11 +1,9 @@
 """Datasource registry for anyQL's Python engine.
 
 A datasource is a named connection carrying its own dataset schemas. `demo`
-is the bundled Parquet directory executed on a real in-process DuckDB; every
-other entry is a **mock connection**: a vendor-shaped schema plus
-deterministic mock data checked into `anyql/engine/data/<id>/` and mirrored
-into an in-process DuckDB for execution only. anyQL never opens a real
-database connection (AGENTS.md hard boundaries).
+is the bundled Parquet directory executed on a real in-process DuckDB; other
+bundled entries are vendor-shaped mock schemas mirrored into DuckDB. Explicitly
+added D1 sources either use a local SQLite snapshot or Cloudflare's live API.
 
 Every bundled path resolves from this module's own file, never the process
 working directory, so the engine behaves the same however it is launched.
@@ -30,7 +28,9 @@ import ibis
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .d1api import CloudflareD1, D1Error, schema_connection
+from anyql.query.functions import SCALAR_FUNCTIONS
+
+from .d1api import CloudflareD1, schema_connection
 from .expression import PayloadError, compile_sql
 
 ENGINE_DIR = Path(__file__).resolve().parent
@@ -59,18 +59,32 @@ CAPABILITIES: dict = {
         "timestamp": ["year", "month", "day", "quarter", "hour", "minute", "second"],
         "date": ["year", "month", "day", "quarter"],
         "time": ["hour", "minute", "second"],
+        "string": [fn for fn in SCALAR_FUNCTIONS if fn != "string"],
+        "any": ["string"],
     },
-    "operators": ["=", "!=", ">", ">=", "<", "<=", "like"],
+    "operators": ["=", "!=", ">", ">=", "<", "<=", "like", "~", "!~", "in", "not in"],
     # Rank-style window functions usable as `<fn>() over ( … )` in a select.
     "windowFunctions": ["rank", "dense_rank", "row_number"],
     "supports": {
         "groupBy": True,
         "orderBy": True,
         "limit": True,
+        "distinct": True,
         "like": True,
         "case": True,
         "window": True,
         "cte": True,
+        # The clauses the six SQL features above ibis landed as: inline
+        # subqueries, lateral joins, frame bounds, regex, and — the two writes
+        # — temp tables and transactions. Savepoints are the engine's own gift:
+        # SQLite has them, DuckDB keeps whole transactions only.
+        "subquery": True,
+        "lateral": True,
+        "frame": True,
+        "regex": True,
+        "temp": True,
+        "transactions": True,
+        "savepoints": False,
     },
 }
 
@@ -80,15 +94,38 @@ def capabilities_for(source: "DataSource") -> dict:
 
     Mock connections advertise the same ibis-translatable surface; only the
     `backend` label differs so the UI states honestly what it is talking to.
-    A D1 source is a real SQLite engine, not a mock, and says which flavor:
-    a local snapshot, or a live Cloudflare D1 reached over its API.
+    A D1 source is a real SQLite engine, not a mock, and says which flavor: a
+    local snapshot, or a live Cloudflare D1 reached over its API. A live D1 is
+    reached over stateless HTTP, so it can neither keep a transaction nor hold a
+    temp table; a snapshot runs in-process and can do both, savepoints included.
     """
     if source.kind == "demo":
         return CAPABILITIES
     if source.kind == "d1":
-        return {**CAPABILITIES, "backend": "sqlite (D1 snapshot)"}
+        return {
+            **CAPABILITIES,
+            "backend": "sqlite (D1 snapshot)",
+            "supports": {**CAPABILITIES["supports"], "savepoints": True},
+        }
     if source.kind == "d1-live":
-        return {**CAPABILITIES, "backend": "sqlite (Cloudflare D1)"}
+        return {
+            **CAPABILITIES,
+            "backend": "sqlite (Cloudflare D1)",
+            # These SQLite translations call Python UDFs registered only by
+            # the local Ibis backend; Cloudflare D1 has no such functions.
+            "functions": {
+                **CAPABILITIES["functions"],
+                "string": [
+                    fn for fn in CAPABILITIES["functions"]["string"]
+                    if fn not in {"capitalize", "reverse", "repeat", "lpad", "rpad"}
+                ],
+            },
+            "supports": {
+                **CAPABILITIES["supports"],
+                "temp": False,
+                "transactions": False,
+            },
+        }
     return {**CAPABILITIES, "backend": f"{source.dialect} (mock)"}
 
 
@@ -458,7 +495,7 @@ def load(
 
 
 # ---------------------------------------------------------------------------
-# Cloudflare D1 sources — added at runtime, never persisted.
+# Cloudflare D1 sources — connected at runtime; credentials never persisted.
 #
 # A D1 database *is* SQLite: Cloudflare runs a real SQLite engine and its own
 # D1 console introspects it through `sqlite_schema` / `pragma_*`. Two shapes:
@@ -489,23 +526,31 @@ def _ingest_sqlite(source: DataSource) -> DataSource:
     # A query may run on any thread. DuckDB tolerates a connection crossing
     # threads; stdlib sqlite3 refuses by default, so the handle is opened with
     # the thread check off — the same single shared, in-process connection the
-    # demo source already relies on. The snapshot is opened read-only from the
-    # user's point of view (queries never write).
+    # demo source already relies on. `isolation_level=None` is autocommit: the
+    # driver stops wrapping statements in transactions of its own, which leaves
+    # `\begin`/`\savepoint`/`\commit` (anyql.engine.tx) as the only transaction
+    # control on the connection. The snapshot is opened read-only from the
+    # user's point of view (queries never write; a temp table lives in SQLite's
+    # temp schema, not in the database file).
     import sqlite3
 
-    raw = sqlite3.connect(str(source.dir), check_same_thread=False)
-    source.con = ibis.sqlite.from_connection(raw)
-    for name in source.con.list_tables():
-        if name.startswith("sqlite_") or name.startswith("_cf_"):
-            continue
-        table = source.con.table(name)
-        source.datasets[name] = {
-            "table": table,
-            "doc": f"{name} · {source.dir.name}",
-            "rows": int(table.count().execute()),
-        }
-    if not source.datasets:
-        raise RuntimeError(f"database {source.dir} has no user tables")
+    raw = sqlite3.connect(str(source.dir), check_same_thread=False, isolation_level=None)
+    try:
+        source.con = ibis.sqlite.from_connection(raw)
+        for name in source.con.list_tables():
+            if name.startswith("sqlite_") or name.startswith("_cf_"):
+                continue
+            table = source.con.table(name)
+            source.datasets[name] = {
+                "table": table,
+                "doc": f"{name} · {source.dir.name}",
+                "rows": int(table.count().execute()),
+            }
+        if not source.datasets:
+            raise RuntimeError(f"database {source.dir} has no user tables")
+    except Exception:
+        raw.close()
+        raise
     return source
 
 
@@ -551,28 +596,25 @@ def add_d1_live_source(
         d1.resolve()
         schemas = d1.schemas()
         counts = d1.row_counts(list(schemas))
-    except D1Error:
+        label = (display or "").strip() or f"D1 · {database}"
+        con = schema_connection(schemas)
+        source = DataSource(
+            id=source_id,
+            display=label,
+            doc=f"Cloudflare D1 · {d1.database_uuid}",
+            kind="d1-live",
+            dialect="sqlite",
+            dir=Path(database),
+            con=con,
+            d1=d1,
+        )
+        for name in schemas:
+            source.datasets[name] = {
+                "table": con.table(name),
+                "doc": f"{name} · {database}",
+                "rows": counts.get(name, 0),
+            }
+        return source
+    except Exception:
         d1.close()
         raise
-    if not schemas:
-        d1.close()
-        raise RuntimeError(f"D1 database {database!r} has no user tables")
-    label = (display or "").strip() or f"D1 · {database}"
-    con = schema_connection(schemas)
-    source = DataSource(
-        id=source_id,
-        display=label,
-        doc=f"Cloudflare D1 · {d1.database_uuid or database}",
-        kind="d1-live",
-        dialect="sqlite",
-        dir=Path(database),
-        con=con,
-        d1=d1,
-    )
-    for name, schema in schemas.items():
-        source.datasets[name] = {
-            "table": con.table(name),
-            "doc": f"{name} · {database}",
-            "rows": counts.get(name, 0),
-        }
-    return source

@@ -24,16 +24,30 @@ ones is still found by typing part of it.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
+from textual import on
+from textual.binding import Binding
+from textual.containers import Vertical
 from textual.content import Content
 from textual.message import Message
-from textual.widgets import OptionList
+from textual.widgets import OptionList, TextArea
 from textual.widgets.option_list import Option
 
-from anyql.query import AGGREGATES, TEMPORAL, capabilities, clause_line, dtype_family
+from anyql.query import (
+    AGGREGATES,
+    REGEX_OPS,
+    SUBQUERY_OPS,
+    TEMPORAL,
+    capabilities,
+    clause_line,
+    dtype_family,
+    is_identifier,
+    param_spans,
+)
+from anyql.query.functions import SCALAR_FUNCTIONS, ArgumentKind
 
 from .session import Session, looks_numeric
 
@@ -46,12 +60,21 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("intersect", "keep only rows both sides have"),
     ("except", "subtract the other table's rows"),
     ("select", "append a projection"),
+    ("distinct", "remove duplicate output rows"),
+    ("unique", "same as \\distinct — remove duplicate output rows"),
     ("where", "set the row filter"),
     ("group", "append a grouping key"),
     ("order", "append an ordering"),
     ("case", "add a computed column"),
     ("limit", "cap the rows"),
     ("with", "start a CTE block"),
+    ("temp", "keep this query as a temp table"),
+    ("drop", "drop a temp table"),
+    ("begin", "open a transaction"),
+    ("savepoint", "mark a savepoint"),
+    ("release", "release a savepoint"),
+    ("rollback", "roll back the transaction"),
+    ("commit", "commit the transaction"),
 )
 
 # Palette actions: label, detail, and the action name the app carries out.
@@ -60,6 +83,10 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Run", "ctrl+enter · execute the document", "run"),
     ("Compile", "ctrl+k · render SQL without running", "compile"),
     ("Data source…", "ctrl+o · add a D1 database", "add-source"),
+    ("Functions…", "\\fn · open or create a table-valued function", "fn"),
+    ("Query to function", "create a function draft from this document", "query-to-fn"),
+    ("Export results", "save selected or buffered rows as CSV", "export-results"),
+    ("AI", "chat and review an AI-proposed replacement", "ai"),
     ("History", "show/hide the history pane", "history"),
     ("Results", "show/hide the results pane", "toggle-results"),
     ("SQL", "show/hide the SQL pane", "toggle-sql"),
@@ -80,9 +107,18 @@ SET_OP_MODIFIERS: tuple[tuple[str, str], ...] = (
 )
 SET_OP_MODIFIER_WORDS = frozenset(name for name, _ in SET_OP_MODIFIERS)
 
+# The commands only a savepoint-capable engine can run: the palette offers them
+# where the active source advertises `supports.savepoints` (SQLite has them;
+# DuckDB keeps whole transactions only).
+SAVEPOINT_COMMANDS = frozenset({"savepoint", "release"})
+
 # The clause commands: accepting one takes its own line, or the line the
 # current block already gives that clause.
 CLAUSE_NAMES = frozenset(name for name, _ in COMMANDS)
+
+# The function-library summon. Like the pane toggles it is an action, not a
+# clause: `\fn` never becomes document text.
+FN_COMMAND = "fn"
 
 # Fallback comparison operators; the live capability set is preferred.
 DEFAULT_OPERATORS: tuple[str, ...] = ("=", "!=", ">", ">=", "<", "<=", "like")
@@ -90,8 +126,7 @@ DEFAULT_OPERATORS: tuple[str, ...] = ("=", "!=", ">", ">=", "<", "<=", "like")
 # How many value rows the popup shows; the search still reads the whole pool.
 VALUE_SUGGESTIONS = 50
 
-# `sum(amount` — a call whose argument is still being typed (no `)` yet).
-_CALL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(([^()]*)$")
+_CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 
 def operators() -> tuple[str, ...]:
@@ -108,6 +143,8 @@ class Entry:
     insert: str = ""
     detail: str = ""
     action: str = ""
+    # Characters an accept leaves behind the caret — a call completes to `fn(|)`.
+    cursor_back: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,6 +157,8 @@ class View:
     # "command": the word right after the `\\`. "argument": everything a command
     # takes. Escape's dismissal silences both; a fresh `\\` is what lifts it.
     phase: Literal["command", "argument"] = "command"
+    # Parameter completion replaces the full token even when the caret is inside it.
+    end: int | None = None
 
     @property
     def labels(self) -> list[str]:
@@ -188,10 +227,19 @@ def _split(text: str) -> tuple[str, str, str]:
 
 
 def _command_entries(token: str) -> list[Entry]:
-    """The language and the app's actions matching the word after the `\\`."""
+    """The language and the app's actions matching the word after the `\\`.
+
+    What the backend advertises decides what is offered: `\\savepoint` and
+    `\\release` need an engine with savepoints, so they are not offered on one
+    without (DuckDB keeps whole transactions only). Typing them anyway is still
+    the user's to do — the run refuses them by name.
+    """
+    supports = capabilities().supports
     commands = [
         (match_rank(name, token), index, Entry(label=f"\\{name}", insert=f"\\{name} ", detail=detail))
         for index, (name, detail) in enumerate(COMMANDS)
+        if (name not in SAVEPOINT_COMMANDS or supports.get("savepoints"))
+        and (name not in {"distinct", "unique"} or supports.get("distinct"))
     ]
     actions = [
         (match_rank(label, token), len(COMMANDS) + index, Entry(label=label, detail=detail, action=action))
@@ -207,6 +255,41 @@ def _segment(rest: str) -> tuple[str, int]:
     offset = rest.rfind(",") + 1
     raw = rest[offset:]
     return raw.lstrip(), offset + (len(raw) - len(raw.lstrip()))
+
+
+def _expression_position(text: str) -> tuple[int, str | None, int] | None:
+    """Locate the current select expression or innermost call argument.
+
+    Commas in strings and completed nested calls never restart completion.
+    Inside a quoted literal there is nothing for the palette to insert.
+    """
+    offset = 0
+    stack: list[tuple[str, int, int]] = []
+    quote: str | None = None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            match = _CALL_NAME_RE.search(text[:index])
+            stack.append((match.group(1).lower() if match else "", 0, index + 1))
+        elif char == ")":
+            if stack:
+                stack.pop()
+        elif char == ",":
+            if stack:
+                fn, argument, _ = stack[-1]
+                stack[-1] = (fn, argument + 1, index + 1)
+            else:
+                offset = index + 1
+    if quote:
+        return None
+    fn, argument, offset = stack[-1] if stack else (None, 0, offset)
+    while offset < len(text) and text[offset].isspace():
+        offset += 1
+    return offset, fn, argument
 
 
 def _word(rest: str) -> tuple[str, int]:
@@ -249,6 +332,28 @@ def _temporal_fns(columns: list[tuple[str, str, str]]) -> list[str]:
     ]
 
 
+def _scalar_fns() -> list[str]:
+    """Known scalar calls the source advertises, including literal-only calls."""
+    advertised = {fn for functions in capabilities().functions.values() for fn in functions}
+    return [fn for fn in SCALAR_FUNCTIONS if fn in advertised]
+
+
+def _scalar_detail(fn: str) -> str:
+    spec = SCALAR_FUNCTIONS[fn]
+    args = [kind if index < spec.minimum else f"[{kind}]" for index, kind in enumerate(spec.parameters)]
+    if spec.variadic:
+        args.append("…")
+    return f"{fn}({', '.join(args)}) → {spec.result}"
+
+
+def _accepts_type(kind: ArgumentKind, type_: str) -> bool:
+    if kind == "any":
+        return True
+    if kind == "integer":
+        return type_.startswith(("int", "uint"))
+    return type_ == kind
+
+
 def _select_entries(session: Session, doc: str, token: str) -> list[Entry]:
     """`\\select` offers fields first, then the functions that apply to them.
 
@@ -260,12 +365,37 @@ def _select_entries(session: Session, doc: str, token: str) -> list[Entry]:
     rows += [(1, fn, "aggregate", f"{fn}(") for fn in _aggregate_fns()]
     rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns)]
     rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns()]
+    rows += [(4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns()]
     return _offers(rows, token)
 
 
-def _call_argument_entries(session: Session, doc: str, fn: str, partial: str) -> list[Entry]:
-    """The argument of an open `fn(` — only the columns that function takes."""
+def _call_argument_entries(
+    session: Session, doc: str, fn: str, partial: str, argument: int = 0,
+) -> list[Entry]:
+    """Complete the current argument without replacing its enclosing call."""
     columns = session.column_entries(doc)
+    if fn in SCALAR_FUNCTIONS:
+        if fn not in _scalar_fns():
+            return []
+        spec = SCALAR_FUNCTIONS[fn]
+        kind = spec.argument_kind(argument)
+        if kind is None:
+            return []
+        # Multi-argument calls stay open: the user chooses additional optional
+        # or variadic arguments. Unary calls complete like existing date parts.
+        suffix = ")" if len(spec.parameters) == 1 else ", " if argument + 1 < spec.minimum else ""
+        rows = [
+            (0, name, detail, f"{name}{suffix}")
+            for name, type_, detail in columns if _accepts_type(kind, type_)
+        ]
+        rows += [
+            (1, nested, _scalar_detail(nested), f"{nested}(")
+            for nested in _scalar_fns()
+            if kind == "any" or SCALAR_FUNCTIONS[nested].result == kind
+        ]
+        return _offers(rows, partial)
+    if argument:
+        return []
     if fn in _aggregate_fns():
         rows = [(0, name, detail, f"{name})") for name, _, detail in columns]
         if fn == "count":
@@ -296,31 +426,115 @@ def _value_entries(session: Session, doc: str, column: str, token: str) -> list[
     return _offers(rows, token.strip('"'))[:VALUE_SUGGESTIONS]
 
 
-def view_for(session: Session, doc: str, line: str, column: int) -> View | None:
+def _fn_call_entries(session: Session, token: str) -> list[Entry]:
+    """Saved functions as call rows for a dataset-taking clause.
+
+    Each inserts `name()` with the caret between the parens, so accepting
+    `\from mont…` lands at `\from monthly(|)` ready for the argument.
+    """
+    kept = [
+        (rank, index, call, detail)
+        for index, (call, detail) in enumerate(session.fn_call_rows())
+        if (rank := match_rank(call, token)) >= 0
+    ]
+    kept.sort(key=lambda row: row[0])
+    return [Entry(label=call, insert=call, detail=detail, cursor_back=1) for _, _, call, detail in kept]
+
+
+def _fn_view(session: Session, token: str, slash: int) -> View | None:
+    """The `\fn` library view: open an existing function, or create one.
+
+    Bare `\fn` offers the library (and a new function). `\fn <name>` filters
+    it to what matches and always offers to create the typed name — entering a
+    new name is how a new function begins, and entering an existing one opens
+    it. These are actions: accepting erases the whole span, so `\fn` never
+    stays in the document.
+    """
+    entries: list[Entry] = []
+    for fn in session.fns.values():
+        rank = match_rank(fn.name, token)
+        if rank < 0:
+            continue
+        detail = f"{', '.join(fn.params)}" if fn.params else "no arguments"
+        if fn.doc:
+            detail = f"{detail} · {fn.doc}"
+        entries.append(Entry(label=fn.name, detail=detail, action=f"fn-open:{fn.name}"))
+    if not token or is_identifier(token):
+        exact = any(entry.label.lower() == token.lower() for entry in entries)
+        if not exact:
+            label = token if token else "New function…"
+            detail = f"create \\fn {token}" if token else "define a new table-valued function"
+            entries.insert(0, Entry(label=label, detail=detail, action=f"fn-new:{token}"))
+    return View(start=slash, token=token, entries=entries) if entries else None
+
+
+def _parameter_token(before: str) -> tuple[int, str] | None:
+    """Find a parameter ending at the caret, including an unfinished bare `@`."""
+    # The parser requires a name; a temporary identifier lets its quote and
+    # word-boundary rules also decide whether a bare `@` starts a parameter.
+    probe = before + "_" if before.endswith("@") else before
+    spans = param_spans(probe)
+    if spans and spans[-1][1] == len(probe):
+        start = spans[-1][0]
+        return start, before[start:]
+    return None
+
+
+def view_for(
+    session: Session, doc: str, line: str, column: int, *, parameters: Iterable[str] = (),
+) -> View | None:
     """The palette view for the line text left of the caret, or `None`.
 
     `None` means "no palette": no `\\` before the caret, a command the palette
     has nothing to say about, or nothing left to suggest for what is typed.
     """
     before = line[:column]
+    parameter = _parameter_token(before) if parameters else None
+    if parameter is not None:
+        start, token = parameter
+        rows = ((0, name, "parameter", f"@{name}") for name in parameters)
+        entries = [
+            Entry(label=entry.insert, insert=entry.insert, detail=entry.detail)
+            for entry in _offers(rows, token[1:])
+        ]
+        end = next((end for begin, end, _ in param_spans(line) if begin == start), column)
+        return View(start, line[start:end], entries, phase="argument", end=end) if entries else None
     slash = before.rfind("\\")
     if slash < 0:
         return None
     word, gap, rest = _split(before[slash + 1 :])
+    if word.lower() == FN_COMMAND:
+        # `\fn` is a summon, not a clause: it never lands in the document. Bare
+        # it opens the library; `\fn <name>` opens (or offers to create) that
+        # one function. Accepting erases the whole `\ … ` span and fires the
+        # app's action, exactly like `Run`/`Compile`.
+        return _fn_view(session, rest.strip(), slash)
     if not gap:
         entries = _command_entries(word)
         return View(start=slash, token=word, entries=entries) if entries else None
 
     command = word.lower()
-    arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where"}
+    arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where", "drop"}
     if command in arguments:
         token, offset = _word(rest)
+    elif command == "select":
+        position = _expression_position(rest)
+        if position is None:
+            return None
+        offset, fn, argument = position
+        token = rest[offset:].strip()
     else:
         segment, offset = _segment(rest)
         token = segment.strip()
     start = slash + 1 + len(word) + len(gap) + offset
 
-    if command in DATASET_COMMANDS or command in SET_OP_COMMANDS:
+    if command == "temp":
+        # A temp table's name is new text, not a choice — nothing to offer.
+        return None
+    if command == "drop":
+        rows = [(0, name, "temp table", f"{name} ") for name in session.temp_tables()]
+        entries = _offers(rows, token)
+    elif command in DATASET_COMMANDS or command in SET_OP_COMMANDS:
         head = rest[:offset].split()
         # `\union all |` still takes a name: the modifier is not a table.
         modifier = head[0].lower() if head and head[0].lower() in SET_OP_MODIFIER_WORDS else ""
@@ -334,15 +548,12 @@ def view_for(session: Session, doc: str, line: str, column: int) -> View | None:
         if command in SET_OP_COMMANDS and not modifier:
             # The modifier leads the argument, and only once.
             rows += [(1, name, detail, f"{name} ") for name, detail in SET_OP_MODIFIERS]
-        entries = _offers(rows, token)
+        # Saved functions complete here too — accepted as a `name()` call with
+        # the caret inside the parens — after the datasets, in match order.
+        entries = _offers(rows, token) + _fn_call_entries(session, token)
     elif command == "select":
-        call = _CALL_RE.match(token)
-        if call is not None:
-            # An open call completes its own argument: the typed span starts
-            # after `fn(`, so accepting leaves the call in place.
-            entries = _call_argument_entries(session, doc, call.group(1).lower(), call.group(2))
-            start += len(call.group(1)) + 1
-            token = call.group(2)
+        if fn is not None:
+            entries = _call_argument_entries(session, doc, fn, token, argument)
         else:
             entries = _select_entries(session, doc, token)
     elif command in COLUMN_COMMANDS:
@@ -355,8 +566,14 @@ def view_for(session: Session, doc: str, line: str, column: int) -> View | None:
 
 
 def _where_entries(session: Session, doc: str, head: list[str], token: str) -> list[Entry]:
-    """`\\where` offers a column, then an operator, then that column's values."""
+    """`\\where` offers a column, then an operator, then that column's values.
+
+    Operators whose operand is not one of the column's values — a regex pattern,
+    a subquery — offer nothing after them: the pattern and the `( … )` are typed.
+    """
     if len(head) >= 2 and head[1].lower() in operators():
+        if head[1].lower() in REGEX_OPS | SUBQUERY_OPS:
+            return []
         value_so_far = " ".join(head[2:])
         if value_so_far and value_so_far.count('"') % 2 == 0:
             # `\where event_type = "purchase" |` is done: a `\where` carries one
@@ -384,9 +601,16 @@ class CommandPalette(OptionList):
             self.action = action
             super().__init__()
 
-    def __init__(self, session: Session, **kwargs) -> None:
+    def __init__(
+        self, session: Session, *, source_id: str | None = None,
+        workspace_actions: bool = True, parameters: Callable[[], Iterable[str]] | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.session = session
+        self.source_id = source_id
+        self.workspace_actions = workspace_actions
+        self.parameters = parameters
         self.editor = None
         self._view: View | None = None
         self._labels: list[str] = []
@@ -423,18 +647,32 @@ class CommandPalette(OptionList):
         it is off, and `ctrl+comma` is the way back to Settings.
         """
         editor = self.editor
+        if self.session.busy:
+            self.close()
+            return
         if editor is None:
             return
         row, column = editor.cursor_location
         line = editor.document[row]
-        if column > 0 and line[column - 1] == "\\":
-            # An explicit `\` is a summon: it lifts Escape's dismissal.
+        if column > 0 and (
+            line[column - 1] == "\\"
+            or (self.parameters is not None and line[column - 1] == "@" and _parameter_token(line[:column]))
+        ):
+            # An explicit `\` or function parameter `@` lifts Escape's dismissal.
             self._dismissed = False
-        view = (
-            view_for(self.session, editor.text, line, column)
-            if self.session.intellisense and not self._dismissed
-            else None
-        )
+        with self.session.target_source(self.source_id):
+            view = (
+                view_for(
+                    self.session, editor.text, line, column,
+                    parameters=self.parameters() if self.parameters is not None else (),
+                )
+                if self.session.intellisense and not self._dismissed
+                else None
+            )
+        if view is not None and not self.workspace_actions:
+            view = View(view.start, view.token, [e for e in view.entries if not e.action], view.phase, view.end)
+            if not view.entries:
+                view = None
         if view is None:
             self.close()
             return
@@ -528,8 +766,9 @@ class CommandPalette(OptionList):
             if command.startswith("\\") and command[1:].lower() in CLAUSE_NAMES:
                 self._take_clause(editor, row, column, view, command[1:].lower())
             else:
-                editor.replace(entry.insert, (row, view.start), (row, column))
-                editor.cursor_location = (row, view.start + len(entry.insert))
+                end = column if view.end is None else view.end
+                editor.replace(entry.insert, (row, view.start), (row, end))
+                editor.cursor_location = (row, view.start + len(entry.insert) - entry.cursor_back)
         self.sync()
         return True
 
@@ -542,7 +781,8 @@ class CommandPalette(OptionList):
         the command breaks the line first, so it never lands after whatever the
         caret happened to be sitting in.
         """
-        target = clause_line(editor.text, row + 1, name)
+        with self.session.target_source(self.source_id):
+            target = clause_line(editor.text, row + 1, name)
         if target is not None and target != row + 1:
             editor.replace("", (row, view.start), (row, column))
             editor.cursor_location = (target - 1, len(editor.document[target - 1]))
@@ -556,3 +796,96 @@ class CommandPalette(OptionList):
         editor.replace(f"{prefix}{command}{suffix}", (row, view.start), (row, column))
         line, start = (row + 1, len(indent)) if prefix else (row, view.start)
         editor.cursor_location = (line, start + len(command))
+
+
+class EditorPane(Vertical):
+    """The document editor and its palette, and the owner of the palette's keys.
+
+    They are claimed here rather than on the editor itself for two reasons: a
+    TextArea's own key handler cannot be suppressed from a subclass (Textual
+    dispatches every `_on_key` in the MRO), and here they stay scoped — only
+    while the focus is inside this pane, so Enter keeps selecting rows in the
+    results table and every other widget keeps its own keys.
+    """
+
+    BINDINGS = [
+        Binding("up", "palette_up", "Cursor up", show=False, priority=True),
+        Binding("down", "palette_down", "Cursor down", show=False, priority=True),
+        Binding("enter", "palette_enter", "Newline", show=False, priority=True),
+        Binding("escape", "palette_escape", "Close the palette", show=False, priority=True),
+        # TextArea binds `home,ctrl+a` to "cursor line start"; in an editor the
+        # user means select all, and the pane claims the key to say so.
+        Binding("ctrl+a", "select_all", "Select all", show=False, priority=True),
+        Binding("tab", "palette_tab", "Accept suggestion", show=False, priority=True),
+    ]
+
+    @property
+    def editor(self) -> TextArea:
+        """The document editor."""
+        return self.query_one(TextArea)
+
+    @property
+    def palette(self) -> CommandPalette:
+        """The `\\` overlay."""
+        return self.query_one(CommandPalette)
+
+    def on_mount(self) -> None:
+        self.palette.attach(self.editor)
+
+    @on(TextArea.Changed)
+    def _editor_changed(self) -> None:
+        self.palette.sync()
+
+    @on(TextArea.SelectionChanged)
+    def _editor_caret_moved(self) -> None:
+        if self.palette.is_open:
+            self.palette.sync()
+
+    @on(OptionList.OptionSelected)
+    def _palette_clicked(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.palette.accept(event.option_index)
+        self.editor.focus()
+
+    def action_palette_up(self) -> None:
+        """Move the palette's highlight, or the caret when it is closed."""
+        if self.palette.is_open:
+            self.palette.move(-1)
+        else:
+            self.editor.action_cursor_up()
+
+    def action_palette_down(self) -> None:
+        """Move the palette's highlight, or the caret when it is closed."""
+        if self.palette.is_open:
+            self.palette.move(1)
+        else:
+            self.editor.action_cursor_down()
+
+    def action_palette_enter(self) -> None:
+        """Accept the highlighted suggestion, or insert a newline.
+
+        An accept that would change nothing is not an accept: the palette
+        closes and Enter means what it always means.
+        """
+        palette = self.palette
+        if palette.is_open and palette.accept_highlighted():
+            return
+        palette.close()
+        editor = self.editor
+        if editor.read_only:
+            return
+        start, end = editor.selection
+        editor.replace("\n", start, end, maintain_selection_offset=False)
+
+    def action_palette_escape(self) -> None:
+        """Escape shows and hides the popup; it does nothing else to the document."""
+        self.palette.escape()
+
+    def action_select_all(self) -> None:
+        """`ctrl+a` selects the whole document (TextArea would go to line start)."""
+        self.editor.select_all()
+
+    def action_palette_tab(self) -> None:
+        """`tab` accepts the highlighted suggestion — it never moves focus."""
+        if self.palette.is_open:
+            self.palette.accept_highlighted()
