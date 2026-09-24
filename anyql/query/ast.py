@@ -10,11 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-ClauseKind = Literal["with", "from", "join", "select", "where", "group", "order", "case"]
+ClauseKind = Literal["with", "from", "join", "union", "intersect", "except", "select", "where", "group", "order", "case"]
 
 AggregateFn = Literal["sum", "avg", "count", "min", "max"]
 TemporalFn = Literal["year", "month", "day", "quarter", "hour", "minute", "second"]
 RankFn = Literal["rank", "dense_rank", "row_number"]
+SetOpKind = Literal["union", "intersect", "except"]
 Direction = Literal["asc", "desc"]
 
 
@@ -176,6 +177,25 @@ class JoinClause:
 
 
 @dataclass
+class SetOpClause:
+    """One `\\union` / `\\intersect` / `\\except` clause (SQL's deduplicating default).
+
+    The operation runs against the accumulated left query, in document order,
+    exactly like a `\\join` runs against the accumulated left table.
+    """
+
+    line: int  # 1-based document line the command lives on.
+    op: SetOpKind  # union keeps both sides, intersect only shared rows, except subtracts.
+    # Dataset or CTE the operation runs against (`\\union events`, `\\union recent`).
+    dataset: str
+    # SQL's default: rows are deduplicated. `\\union all` keeps duplicates.
+    distinct: bool = True
+
+    def to_json(self) -> dict:
+        return {"line": self.line, "op": self.op, "dataset": self.dataset, "distinct": self.distinct}
+
+
+@dataclass
 class QueryError:
     line: int
     message: str
@@ -244,6 +264,9 @@ class QueryAST:
     from_: FromClause | None = None
     # `\join` clauses in document order (applied left-deep onto `from`).
     joins: list[JoinClause] = field(default_factory=list)
+    # `\union`/`\intersect`/`\except` clauses in document order (applied onto the
+    # built left query, before `\order`/`\limit`).
+    set_ops: list[SetOpClause] = field(default_factory=list)
     select: list[SelectItem] = field(default_factory=list)
     where: WhereClause | None = None
     group_by: list[GroupTerm] = field(default_factory=list)
@@ -258,6 +281,7 @@ class QueryAST:
             "with": [c.to_json() for c in self.with_],
             "from": self.from_.to_json() if self.from_ else None,
             "joins": [j.to_json() for j in self.joins],
+            "setOps": [s.to_json() for s in self.set_ops],
             "select": [s.to_json() for s in self.select],
             "where": self.where.to_json() if self.where else None,
             "groupBy": [g.to_json() for g in self.group_by],

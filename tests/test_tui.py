@@ -189,6 +189,36 @@ def test_a_typed_document_fills_the_results_table():
     run_app(scenario)
 
 
+def test_a_typed_document_merges_two_tables_and_compiles_the_merge():
+    """A `\\union all` document runs and renders its merge in SQL too."""
+
+    async def scenario(app, pilot):
+        app.editor.load_text("")
+        await type_document(
+            pilot,
+            "\\with big\n"
+            "  \\from events\n"
+            "\\from big\n"
+            "\\select user_id\n"
+            "\\union all users\n"
+            "\\order user_id\n"
+            "\\limit 2",
+        )
+        await pilot.press("ctrl+enter")
+
+        table = results_table(app)
+        assert text_of(app, "#results-error") == ""
+        assert table.row_count == 2
+        # 100 events + 25 users, ascending: the smallest id twice.
+        assert [str(table.get_cell_at((row, 0))) for row in range(2)] == ["1", "1"]
+        assert text_of(app, "#results-status").startswith("2 rows · ")
+
+        await pilot.press("ctrl+k")
+        assert "UNION ALL" in app.query_one("#sql-text", TextArea).text
+
+    run_app(scenario)
+
+
 def test_a_parser_error_shows_and_does_not_execute():
     """A settled bad line stops the run at the parser, with its message."""
 
@@ -385,7 +415,21 @@ def test_palette_lists_commands_actions_and_inserts():
         await pilot.press("\\")
 
         labels = app.palette.view.labels
-        for command in ("from", "open", "join", "select", "where", "group", "order", "case", "limit", "with"):
+        for command in (
+            "from",
+            "open",
+            "join",
+            "union",
+            "intersect",
+            "except",
+            "select",
+            "where",
+            "group",
+            "order",
+            "case",
+            "limit",
+            "with",
+        ):
             assert f"\\{command}" in labels
         assert [entry.label for entry in app.palette.view.entries if entry.action] == [
             "Run",
@@ -540,6 +584,30 @@ def test_the_palette_view_picks_its_span_and_its_offers():
     assert view_for(session, half, half, len(half)).labels == ["purchase"]
     done = '\\where event_type = "purchase" '
     assert view_for(session, done, done, len(done)) is None
+
+
+def test_set_op_offers_the_documents_tables_and_its_modifier():
+    """`\\union` completes a table name, and spells out `all`/`distinct` once."""
+    session = Session()
+    doc = '\\with recent\n  \\from events\n\\from recent\n\\union '
+
+    # The document's own CTE leads the source's datasets.
+    names = view_for(session, doc, "\\union ", len("\\union "))
+    assert names.labels[:2] == ["recent", "events"]
+    assert names.phase == "argument"
+
+    # The modifier leads the argument, and is done offering once it is there.
+    assert view_for(session, doc, "\\union al", len("\\union al")).labels == ["all"]
+    after = view_for(session, doc, "\\union all ", len("\\union all "))
+    assert after.labels[:2] == ["recent", "events"]
+    assert "all" not in after.labels
+
+    # `\union events |` names a table: the clause takes nothing more.
+    done = "\\union events "
+    assert view_for(session, doc, done, len(done)) is None
+
+    commands = view_for(session, "\\", "\\", 1).labels
+    assert "\\union" in commands and "\\intersect" in commands and "\\except" in commands
 
 
 def test_suggestions_match_inside_a_name_not_only_at_its_start():

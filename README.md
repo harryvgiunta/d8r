@@ -23,7 +23,8 @@ document  →  datasource (which schema it points at)  →  dialect (what SQL it
 ```
 
 - **The document is the source of truth.** A short clause language (`\from`,
-  `\join`, `\select`, `\where`, `\group`, `\order`, `\case`, `\limit`, `\with`)
+  `\join`, `\union`, `\intersect`, `\except`, `\select`, `\where`, `\group`,
+  `\order`, `\case`, `\limit`, `\with`)
   parses to a pure AST. No hand-written SQL anywhere in the stack.
 - **The datasource is the schema context.** Pick one and the schema tree,
   completion, and validation all follow it. The bundled registry holds a live
@@ -104,12 +105,15 @@ Type `\` anywhere in the document. The palette appears under the caret and
 follows what you type:
 
 - On a bare `\` it lists the clause commands — `\from`, `\open`, `\join`,
-  `\select`, `\where`, `\group`, `\order`, `\case`, `\limit`, `\with` — plus the
+  `\union`, `\intersect`, `\except`, `\select`, `\where`, `\group`, `\order`,
+  `\case`, `\limit`, `\with` — plus the
   app's actions: **Run**, **Compile**, **Data source…**, **History**. Typing a
   prefix filters the list; Enter completes the command in place and leaves a
   space for its argument.
-- After a command it offers that command's arguments: dataset names for
-  `\from`/`\open`/`\join`, column names (with their dtype and dataset) for
+- After a command it offers that command's arguments: table names for
+  `\from`/`\open`/`\join` and the set operations (this document's `\with` names
+  first, then the active source's datasets — and `all`/`distinct` ahead of the
+  name until one is typed), column names (with their dtype and dataset) for
   `\select`/`\group`/`\order`, and for `\where` a three-step chain — column,
   then operator, then that column's distinct values. Numeric values are inserted
   bare, text values quoted (`\where event_type = "purchase"`).
@@ -200,7 +204,7 @@ error strings — lives in **[docs/AST.md](docs/AST.md)**.
 ## Tests
 
 ```bash
-uv run pytest -q                          # 170 tests: the language/engine contract + the TUI end to end
+uv run pytest -q                          # 203 tests: the language/engine contract + the TUI end to end
 uv run python verify/check_canonical.py   # the language gate — prints MATCH
 ```
 

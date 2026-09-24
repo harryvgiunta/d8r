@@ -42,6 +42,9 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("from", "set the source dataset"),
     ("open", "same as \\from — the dataset spelling"),
     ("join", "append an inner join"),
+    ("union", "append a set union"),
+    ("intersect", "keep only rows both sides have"),
+    ("except", "subtract the other table's rows"),
     ("select", "append a projection"),
     ("where", "set the row filter"),
     ("group", "append a grouping key"),
@@ -68,7 +71,16 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
 DATASET_COMMANDS = frozenset({"from", "open", "join"})
 COLUMN_COMMANDS = frozenset({"select", "group", "order"})
 
-# The ten clause commands: accepting one takes its own line, or the line the
+# The set-operation commands; their argument is `[all|distinct] <dataset>` — the
+# modifier leads, and the name is what is being completed either way.
+SET_OP_COMMANDS = frozenset({"union", "intersect", "except"})
+SET_OP_MODIFIERS: tuple[tuple[str, str], ...] = (
+    ("all", "keep duplicate rows"),
+    ("distinct", "drop duplicate rows"),
+)
+SET_OP_MODIFIER_WORDS = frozenset(name for name, _ in SET_OP_MODIFIERS)
+
+# The clause commands: accepting one takes its own line, or the line the
 # current block already gives that clause.
 CLAUSE_NAMES = frozenset(name for name, _ in COMMANDS)
 
@@ -300,7 +312,7 @@ def view_for(session: Session, doc: str, line: str, column: int) -> View | None:
         return View(start=slash, token=word, entries=entries) if entries else None
 
     command = word.lower()
-    arguments = DATASET_COMMANDS | {"group", "where"}
+    arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where"}
     if command in arguments:
         token, offset = _word(rest)
     else:
@@ -308,13 +320,20 @@ def view_for(session: Session, doc: str, line: str, column: int) -> View | None:
         token = segment.strip()
     start = slash + 1 + len(word) + len(gap) + offset
 
-    if command in DATASET_COMMANDS:
-        if rest[:offset].split():
+    if command in DATASET_COMMANDS or command in SET_OP_COMMANDS:
+        head = rest[:offset].split()
+        # `\union all |` still takes a name: the modifier is not a table.
+        modifier = head[0].lower() if head and head[0].lower() in SET_OP_MODIFIER_WORDS else ""
+        head = head[1:] if modifier else head
+        if head:
             # `\from events |` is done: a table is already named there, and the
             # rest of the clause (`as alias`, `on col`) takes no dataset — so a
             # stray Enter cannot append a second one.
             return None
-        rows = [(0, name, detail, f"{name} ") for name, detail in session.dataset_entries()]
+        rows = [(0, name, detail, f"{name} ") for name, detail in session.dataset_entries(doc)]
+        if command in SET_OP_COMMANDS and not modifier:
+            # The modifier leads the argument, and only once.
+            rows += [(1, name, detail, f"{name} ") for name, detail in SET_OP_MODIFIERS]
         entries = _offers(rows, token)
     elif command == "select":
         call = _CALL_RE.match(token)

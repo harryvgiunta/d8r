@@ -129,7 +129,7 @@ anyql/
                   VALUE_POOL_LIMIT), palette.py (`\` rules, matching, offers),
                   settings.py (the `\settings` menu), add_source.py (the
                   `ctrl+o` modal), app.tcss
-tests/            pytest suite (186: 155 query/engine + 31 TUI) + fixtures/
+tests/            pytest suite (203: 170 query/engine + 33 TUI) + fixtures/
 spec/             canonical-query.anyql ↔ canonical-query.ast.json (the contract)
 docs/AST.md       language contract — read before touching anyql/query/
 verify/           check_canonical.py — the language gate
@@ -150,7 +150,7 @@ command runs in the project's `.venv`.
 uv sync                                      # create/refresh the project environment (.venv)
 uv run anyql                                 # launch the IDE in this terminal
 uv run python -m anyql                       # the same entry point, module form
-uv run pytest -q                             # the whole suite (170 tests)
+uv run pytest -q                             # the whole suite (203 tests)
 uv run python verify/check_canonical.py      # language contract gate → prints MATCH
 uv run python -m anyql.engine.make_data      # regenerate demo Parquet + fixtures
 ```
@@ -162,9 +162,9 @@ only dependency records, and there is no second requirements file.
 
 ## Verification bar
 
-- `uv run pytest -q` must pass — 186 tests: the query/engine contract
-  (parser regimes, payload mapping, datasources, D1 sources, execute vs
-  fixtures) plus the TUI end to end.
+- `uv run pytest -q` must pass — 203 tests: the query/engine contract
+  (parser regimes, payload mapping, datasources, D1 sources, set operations,
+  execute vs fixtures) plus the TUI end to end.
 - `uv run python verify/check_canonical.py` must print `MATCH` — deep equality of
   `parse_query(canonical)` against `spec/canonical-query.ast.json`.
 - **UI changes are verified headlessly with Textual's pilot**
@@ -188,8 +188,8 @@ only dependency records, and there is no second requirements file.
   schema, capabilities, completion, and the tree all pick both up.
 - Checked-in JSON fixtures under `tests/fixtures/` are deep-equality targets:
   `expected_schema.json`, `expected_rows.json`, `expected_mock_rows.json` (all
-  three written by `make_data.py`) plus the window/case/CTE/join/alias row
-  fixtures.
+  three written by `make_data.py`) plus the window/case/CTE/join/alias/set-op
+  row fixtures.
 - **The canonical fixture pair is the language contract:**
   `spec/canonical-query.anyql` ↔ `spec/canonical-query.ast.json`. Parser
   semantics changes update both files and `docs/AST.md` together, and must keep
@@ -236,8 +236,8 @@ Beyond the keys, the `\` palette carries the workspace actions: `\results`,
 nothing is ever written into the document — and `\settings` opens the
 full-screen menu, the one place every setting lives: Show/Hide Menus (all four
 panes), Intellisense, Keybindings (read live off the widget classes), Data
-source, and Dialect. Accepting one of the ten clause commands instead takes its
-own line, or the line that clause already has in the block being edited.
+source, and Dialect. Accepting one of the thirteen clause commands instead takes
+its own line, or the line that clause already has in the block being edited.
 
 Provided by Textual, not by this app: `ctrl+q` quits (`textual/app.py`,
 `App.BINDINGS`), and the results/history tables use `DataTable`'s own keys
@@ -248,8 +248,11 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
 
 ## Working notes (verified the hard way)
 
-- **Not a git repo**: no diff or `git status` safety net; enumerate touched
-  files deliberately, and no `git` verification commands.
+- **Git: a single initial commit, no history behind it.** The whole tree was
+  committed once (`Initial commit: anyQL IDE`), so `git status`/`git diff` show
+  exactly your working-tree changes against that baseline — there is no earlier
+  history to blame or bisect. `.venv/`, `__pycache__/`, and `.pytest_cache/` are
+  gitignored; the bundled Parquet and the D1 snapshot are committed on purpose.
 - **Parser validation has two regimes.** Unknown-table, qualified-prefix, and
   CTE-shadows-dataset errors fire **only when the schema registry is non-empty**
   (`set_schema_state`). Duplicate table identifiers, duplicate CTE names, nested
@@ -292,7 +295,7 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
 - **`ctrl+a` selects the whole document.** `TextArea` binds `home,ctrl+a` to
   line start, so `EditorPane` claims the key for the same reason.
 - **A clause command takes its own line — or the line its clause has.**
-  Accepting `\where` (any of the ten) asks `clause_line`
+  Accepting `\where` (any of the thirteen) asks `clause_line`
   (`anyql/query/parser.py:286`) for that clause in the block the caret is
   editing: found, the caret goes there and the document is untouched; not found,
   the command breaks the line first. `\open` is `\from`; a repeated clause

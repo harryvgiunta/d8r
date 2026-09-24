@@ -251,9 +251,19 @@ class Session:
             ]
         return rows
 
-    def dataset_entries(self) -> list[tuple[str, str]]:
-        """(dataset, detail) rows for the palette's `\\from`/`\\open`/`\\join`."""
-        return [(name, f"{entry['rows']} rows") for name, entry in self.source.datasets.items()]
+    def dataset_entries(self, doc: str) -> list[tuple[str, str]]:
+        """(table, detail) rows for the dataset-taking palette clauses.
+
+        The document's own `\\with` names lead: a CTE is addressable by name
+        from a later `\\from`/`\\open`/`\\join`/`\\union` — and it is the table
+        the user just wrote — so it belongs in the offers. Then the active
+        source's datasets, in registry order.
+        """
+        ctes = [(cte.name, "cte") for cte in parse_query(doc).with_]
+        return [
+            *ctes,
+            *((name, f"{entry['rows']} rows") for name, entry in self.source.datasets.items()),
+        ]
 
     def values_for(self, doc: str, column: str) -> list[str]:
         """A column's distinct values, for the `\\where` value search.

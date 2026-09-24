@@ -7,5 +7,9 @@
 \select sum(amount) over (partition by customer_id) as customer_total
 \select rank() over (order by placed_at desc) as recency_rank
 \case flag = when amount > 100 then "high" else "low"
+\union archived
+\union all events
+\intersect other
+\except staging
 \order customer_total desc
 \limit 5

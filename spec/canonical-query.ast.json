@@ -11,6 +11,7 @@
           "alias": null
         },
         "joins": [],
+        "setOps": [],
         "select": [],
         "where": {
           "line": 3,
@@ -33,6 +34,32 @@
     "alias": null
   },
   "joins": [],
+  "setOps": [
+    {
+      "line": 10,
+      "op": "union",
+      "dataset": "archived",
+      "distinct": true
+    },
+    {
+      "line": 11,
+      "op": "union",
+      "dataset": "events",
+      "distinct": false
+    },
+    {
+      "line": 12,
+      "op": "intersect",
+      "dataset": "other",
+      "distinct": true
+    },
+    {
+      "line": 13,
+      "op": "except",
+      "dataset": "staging",
+      "distinct": true
+    }
+  ],
   "select": [
     {
       "line": 5,
@@ -102,7 +129,7 @@
   "groupBy": [],
   "orderBy": [
     {
-      "line": 10,
+      "line": 14,
       "target": "customer_total",
       "direction": "desc",
       "resolvesTo": 3

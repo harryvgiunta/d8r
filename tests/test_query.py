@@ -788,6 +788,78 @@ def test_join_qualified_left_only_sees_identifiers_established_before_it(loaded)
     assert messages(ast) == ['unknown column "z.user_id" — "z" is not an open table: e, u']
 
 
+# --- `\union` / `\intersect` / `\except` -------------------------------------
+
+
+def test_set_op_parses_with_sql_defaults_and_modifiers():
+    ast = parse_query(
+        "\\from events\n"
+        "\\union archived\n"
+        "\\union all events\n"
+        "\\intersect distinct users\n"
+        "\\except staging\n"
+        "\\select user_id"
+    )
+    assert ast.errors == []
+    assert [(s.line, s.op, s.dataset, s.distinct) for s in ast.set_ops] == [
+        (2, "union", "archived", True),
+        (3, "union", "events", False),
+        (4, "intersect", "users", True),
+        (5, "except", "staging", True),
+    ]
+    assert payload_from_ast(ast)["setOps"] == [
+        {"op": "union", "dataset": "archived", "distinct": True},
+        {"op": "union", "dataset": "events", "distinct": False},
+        {"op": "intersect", "dataset": "users", "distinct": True},
+        {"op": "except", "dataset": "staging", "distinct": True},
+    ]
+
+
+def test_set_op_commands_are_case_insensitive_and_keep_document_order():
+    ast = parse_query("\\from events\n\\UNION Users\n\\Intersect ALL us\n\\EXCEPT them\n\\limit 2")
+    assert ast.errors == []
+    assert [(s.op, s.dataset, s.distinct) for s in ast.set_ops] == [
+        ("union", "Users", True),
+        ("intersect", "us", False),
+        ("except", "them", True),
+    ]
+
+
+def test_set_op_rejects_a_bare_modifier_and_a_malformed_argument():
+    # `\union all` names nothing: the modifier is not the table.
+    ast = parse_query("\\from events\n\\union all\n\\select user_id")
+    assert messages(ast) == ["\\union expects `[all|distinct] <dataset>`"]
+    assert ast.set_ops == []
+
+    ast = parse_query("\\from events\n\\intersect all 3x\n\\select user_id")
+    assert messages(ast) == ["\\intersect expects `[all|distinct] <dataset>`"]
+
+    ast = parse_query("\\from events\n\\except\n\\select user_id")
+    assert messages(ast) == ["\\except expects arguments"]
+
+
+def test_set_op_on_the_typing_line_is_quiet():
+    assert parse_query("\\from events\n\\union all").errors == []
+    assert parse_query("\\from events\n\\union ").errors == []
+
+
+def test_set_op_unknown_table_only_once_the_registry_loaded():
+    ast = parse_query("\\from events\n\\union nope\n\\limit 2")
+    assert ast.errors == []  # registry empty: the parser knows nothing yet
+
+    set_schema_state(TABLES)
+    ast = parse_query("\\from events\n\\union nope\n\\limit 2")
+    assert messages(ast) == ['unknown table "nope" — loaded datasets: events, users']
+
+    # A CTE defined earlier is a table here, exactly as for `\from`/`\join`.
+    ast = parse_query("\\with recent\n  \\from events\n\\from events\n\\union recent\n\\limit 2")
+    assert ast.errors == []
+
+    # A forward reference is not: the CTE does not exist yet at that line.
+    ast = parse_query("\\from events\n\\union recent\n\\with recent\n  \\from events\n\\limit 2")
+    assert messages(ast) == ['unknown table "recent" — loaded datasets: events, users']
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -837,6 +909,12 @@ def test_payload_maps_the_canonical_document():
     assert payload["dataset"] == "recent"
     assert payload["alias"] is None
     assert payload["joins"] == []
+    assert payload["setOps"] == [
+        {"op": "union", "dataset": "archived", "distinct": True},
+        {"op": "union", "dataset": "events", "distinct": False},
+        {"op": "intersect", "dataset": "other", "distinct": True},
+        {"op": "except", "dataset": "staging", "distinct": True},
+    ]
     assert payload["where"] is None
     assert payload["groupBy"] == []
     assert payload["limit"] == 5
@@ -881,6 +959,7 @@ def test_payload_maps_the_canonical_document():
                 "dataset": "orders",
                 "alias": None,
                 "joins": [],
+                "setOps": [],
                 "select": [],
                 "where": {"column": "status", "op": "=", "value": "paid"},
                 "groupBy": [],

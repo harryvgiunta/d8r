@@ -11,6 +11,7 @@ from operator import eq, ge, gt, le, lt, ne
 
 import ibis
 import ibis.expr.types as ir
+from ibis.common.exceptions import IbisError
 
 __all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql"]
 
@@ -224,6 +225,10 @@ def _case_column(frames: list[tuple[str, ir.Table]], spec: object) -> ir.Column:
 
 RANK_FNS = frozenset({"rank", "dense_rank", "row_number"})
 
+# `\union`/`\intersect`/`\except` -> the ibis set operation on the accumulated
+# left (`\except` is SQL's EXCEPT, ibis' `difference`).
+SET_OP_METHODS = {"union": "union", "intersect": "intersect", "except": "difference"}
+
 
 def _window_frame(frames: list[tuple[str, ir.Table]], spec: object):
     """A select item's `window` object -> an ibis window (>= 1 of partition/order)."""
@@ -275,6 +280,52 @@ def _windowed_column(
         raise PayloadError(f"unknown aggregate: {fn!r}")
     column = col(frames, aggregate.get("arg"))
     return _aggregate(column, fn).over(window).name(name)
+
+
+def _apply_set_ops(con, expr: ir.Table, set_ops: object, ctes: dict[str, ir.Table] | None) -> ir.Table:
+    """Apply `setOps` left-deep, in document order, onto the built left query.
+
+    The accumulated left's output columns define what each operation is over:
+    the operand is projected to exactly those columns (in that order), so extra
+    operand columns are dropped and a column the operand lacks is the user-level
+    error below. `distinct` is SQL's default for all three — `\\union all`
+    keeps duplicates. A schema conflict ibis still refuses (a column that exists
+    on both sides with different types) surfaces as a `PayloadError` too, so no
+    set-operation mistake reaches the UI as an internal error.
+    """
+    if set_ops is None:
+        return expr
+    if not isinstance(set_ops, list):
+        raise PayloadError("setOps must be an array")
+    for spec in set_ops:
+        if not isinstance(spec, dict):
+            raise PayloadError("setOp specs must be objects")
+        op = spec.get("op")
+        method = SET_OP_METHODS.get(op)
+        if method is None:
+            raise PayloadError(f"unknown set operation: {op!r}")
+        dataset = spec.get("dataset")
+        distinct = spec.get("distinct", True)
+        if not isinstance(distinct, bool):
+            raise PayloadError("setOp distinct must be a boolean")
+        right = get_table(con, dataset, ctes)
+        target = [str(name) for name in expr.columns]
+        operand = [str(name) for name in right.columns]
+        missing = [name for name in target if name not in operand]
+        if missing:
+            raise PayloadError(
+                f'\\{op} "{dataset}" is missing {", ".join(missing)} — '
+                f'it projects: {", ".join(operand)}'
+            )
+        # ibis' set operations align by name and need equal schemas: the operand
+        # is projected to the left's columns, in the left's order.
+        if operand != target:
+            right = right.select(target)
+        try:
+            expr = getattr(expr, method)(right, distinct=distinct)
+        except IbisError as exc:
+            raise PayloadError(f'\\{op} "{dataset}": {" ".join(str(exc).split())}') from exc
+    return expr
 
 
 def _star_columns(frames: list[tuple[str, ir.Table]]) -> list[ir.Column]:
@@ -446,6 +497,10 @@ def build(con, payload: dict, ctes: dict[str, ir.Table] | None = None) -> ir.Tab
     elif computed:
         expr = expr.mutate(computed)
     # else: empty select on a single table -> all columns unchanged
+
+    # Set operations run over the projection above, so a trailing `\order` and
+    # `\limit` apply to the merged result (SQL's own reading of the document).
+    expr = _apply_set_ops(con, expr, payload.get("setOps"), cte_tables)
 
     if order_by:
         sorts = []

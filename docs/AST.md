@@ -36,6 +36,9 @@ document together.
 | `\from` | `<dataset> [as] alias` | sets `from` (a later `\from`/`\open` replaces it) |
 | `\open` | `<dataset> [as] alias` | identical to `\from` — the dataset-source spelling |
 | `\join` | `<dataset> [as] alias on col[ = col]` | appends to `joins` (repeatable; always INNER) |
+| `\union` | `[all\|distinct] <dataset\|cte>` | appends to `setOps` (repeatable; distinct unless `all`) |
+| `\intersect` | `[all\|distinct] <dataset\|cte>` | appends to `setOps` (repeatable; keeps shared rows) |
+| `\except` | `[all\|distinct] <dataset\|cte>` | appends to `setOps` (repeatable; subtracts the operand) |
 | `\select` | expression | appends to `select` |
 | `\where` | `column op value` | sets `where` (a later `\where` replaces) |
 | `\group` | `column[ column…]` | appends to `groupBy` |
@@ -47,8 +50,8 @@ Commands are case-insensitive (`\FROM` is `\from`); the command name is
 lowercased into the AST. A line that does not start with `\` is the error
 `` not a command — lines start with \ ``; an unknown name is
 `unknown command "\<name>"`; a command that needs arguments and got none is
-`\<cmd> expects arguments` (`from`, `open`, `join`, `select`, `where`, `group`,
-`order`, `limit`, `case`, `with`).
+`\<cmd> expects arguments` (`from`, `open`, `join`, `union`, `intersect`,
+`except`, `select`, `where`, `group`, `order`, `limit`, `case`, `with`).
 
 Argument rules:
 
@@ -138,8 +141,9 @@ Argument rules:
   indented; a flush line ends it. The body must be non-empty
   (`\with a expects an indented body`), and the name must be a bare identifier
   (`\with expects a bare CTE name`).
-- A CTE is addressable by name from a later `\from`/`\join`, in document order
-  (a *forward* reference is `unknown table "x"`); nested CTEs (a `\with` inside a
+- A CTE is addressable by name from a later `\from`/`\join` (and as a
+  `\union`/`\intersect`/`\except` operand), in document order (a *forward*
+  reference is `unknown table "x"`); nested CTEs (a `\with` inside a
   body) are the error `nested CTEs are not supported`; a repeated name is
   `duplicate CTE name "a"`; a name colliding with a *loaded* dataset is
   `CTE name "events" shadows dataset "events"` (the engine's build order would
@@ -148,6 +152,32 @@ Argument rules:
   scoped to its own open tables, and it sees every CTE defined **before** it.
   Body errors bubble to the document with their absolute line numbers;
   `with_[i].body.errors` is always empty.
+
+### Set operations
+
+- `\union` / `\intersect` / `\except` append to `setOps` in document order,
+  exactly as `\join` appends to `joins`: the operations run left-deep over the
+  accumulated left query, so `\union a` then `\except b` is `(left ∪ a) \ b`.
+  `\except` is SQL's `EXCEPT` — it subtracts the operand's rows.
+- The modifier is SQL's and precedes the name: `\union [all|distinct] <name>`.
+  Absent means `distinct`, so `\union` deduplicates and `\union all` keeps
+  duplicates; all three take both spellings (`\intersect all`, `\except
+  distinct`). A bare modifier names nothing and is
+  `` \union expects `[all|distinct] <dataset>` ``.
+- The operand is a **table name** — a dataset of the active source or a CTE
+  defined **before** the clause (the same rule as `\from`/`\join`, including
+  the forward-reference error `unknown table "x"`). Any table a `\from` accepts
+  is a legal operand.
+- The **left query's output columns define the operation**: the operand is
+  projected to exactly those columns, in that order, so extra operand columns
+  are dropped and one the operand lacks is the engine's
+  `` \union "x" is missing <col> — it projects: … ``. A column present on both
+  sides with different types is refused the same way, as a `PayloadError`.
+- Set operations apply after the projection (`\select`, `\case`, window items)
+  and **before** `\order`/`\limit`: a trailing `\order`/`\limit` orders and caps
+  the merged result, which is SQL's own reading of the document. A block is
+  still one query — an operand is a name, never an inline sub-query, so anything
+  more involved goes in a `\with` body.
 
 ## Errors, and the line being typed
 
@@ -183,6 +213,7 @@ Argument rules:
   "with": [{ "line": 1, "name": "recent", "body": { /* full QueryAST; errors always [] */ } }],
   "from": { "line": 4, "table": "recent", "alias": null },        // or null
   "joins": [{ "line": 2, "dataset": "users", "alias": "u", "left": "user_id", "right": "id" }],
+  "setOps": [{ "line": 10, "op": "union", "dataset": "archived", "distinct": true }],  // op: union|intersect|except
   "select": [{
     "line": 7, "raw": "sum(amount) over (partition by customer_id) as customer_total",
     "column": null,          // plain column, else null
@@ -213,6 +244,7 @@ Argument rules:
   `limit must be a non-negative integer` and leaves the previous value in place.
 - `value`/`then`/`else` strings are stored with surrounding quotes stripped;
   `raw` keeps the line as typed (the `\case` raw excludes the command word).
+- `setOps[i].distinct` is SQL's default (`true`) unless the clause said `all`.
 - `resolvesTo` is a 1-based index into `select` when an `\order` target matches
   a select alias or column, else `null`. It also covers derived aliases:
   `\order amount_sum` resolves to a `sum(amount)` select item. A `\case` output
@@ -258,14 +290,17 @@ groups by year); alone in the select list they project row-wise
 Typing `\` opens the palette; the pure rule behind it is `view_for(...)` in
 `anyql/tui/palette.py`, and the language surface it exposes is:
 
-- the ten clause commands above, plus the app's own actions (`Run`, `Compile`,
+- the thirteen clause commands above, plus the app's own actions (`Run`, `Compile`,
   `Data source…`, `History`, and the four that change the workspace: `Results`,
   `SQL` and `Schema` show/hide their pane, `Settings` opens the full-screen
   `\settings` menu) — actions are **not** document commands and never enter the
   AST;
-- argument offers: dataset names for `\from`/`\open`/`\join` — but only while the
-  clause is still nameless, since `\from events |` takes an alias, not a second
-  table — this document's open-table columns for `\select`/`\group`/`\order`
+- argument offers: table names for `\from`/`\open`/`\join` and the three set
+  operations — this document's `\with` names first, then the active source's
+  datasets — but only while the clause is still nameless, since `\from events |`
+  takes an alias, not a second table; `\union`/`\intersect`/`\except` offer
+  `all`/`distinct` before their name is typed and drop them once it is. This
+  document's open-table columns for `\select`/`\group`/`\order`
   (the cross-dataset pool when the document has no `\from` yet), and for
   `\where` the chain column → capability operator → that column's distinct
   values (numeric values inserted bare, text values quoted), which stop once the

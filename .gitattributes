@@ -1,0 +1,5 @@
+# The project's files are LF on disk: keep it that way so a Windows editor — or
+# a tool that rewrites a file with the platform's line ending — never turns
+# every line into a diff. `text=auto` leaves the bundled binaries (Parquet, the
+# D1 SQLite snapshot) alone; git detects those as binary.
+* text=auto eol=lf

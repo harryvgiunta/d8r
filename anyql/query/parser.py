@@ -25,6 +25,7 @@ from .ast import (
     QueryError,
     RankCall,
     SelectItem,
+    SetOpClause,
     TemporalCall,
     WhereClause,
     WindowFrame,
@@ -52,6 +53,9 @@ _JOIN_RE = re.compile(
 )
 # `\from`/`\open <dataset> [as] <alias>` — a bare second identifier is the alias.
 _FROM_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?$", re.IGNORECASE)
+# `\union`/`\intersect`/`\except [all|distinct] <dataset>` — the modifier comes
+# first, and absent means SQL's default (`distinct`): rows are deduplicated.
+_SET_OP_RE = re.compile(r"^(?:(all|distinct)\s+)?([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
 _CMD_RE = re.compile(r"^\\([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$")
 # `\case <alias> = when …` — the tail is scanned for when/then/else segments.
 _CASE_HEAD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
@@ -72,8 +76,27 @@ _WHEN_HEAD_RE = re.compile(r"^when\b", re.IGNORECASE | re.ASCII)
 _INDENT_RE = re.compile(r"^\s", re.ASCII)
 
 NEEDS_ARGS = frozenset(
-    {"from", "open", "join", "select", "where", "group", "order", "limit", "case", "with"}
+    {
+        "from",
+        "open",
+        "join",
+        "union",
+        "intersect",
+        "except",
+        "select",
+        "where",
+        "group",
+        "order",
+        "limit",
+        "case",
+        "with",
+    }
 )
+
+# The set-operation commands. Each takes `[all|distinct] <dataset|cte>`.
+SET_OP_COMMANDS = frozenset({"union", "intersect", "except"})
+# `\union all` on its own names nothing: a bare modifier is half a clause.
+SET_OP_MODIFIERS = frozenset({"all", "distinct"})
 
 _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
 
@@ -462,6 +485,33 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             i += 1
             continue
 
+        if cmd in SET_OP_COMMANDS:
+            sm = _SET_OP_RE.match(rest)
+            modifier = sm.group(1).lower() if sm and sm.group(1) else ""
+            if sm is None or (not modifier and sm.group(2).lower() in SET_OP_MODIFIERS):
+                # `\union all` names nothing: a modifier is not the table.
+                err(f"\\{cmd} expects `[all|distinct] <dataset>`")
+                i += 1
+                continue
+            name = sm.group(2)
+            ast.set_ops.append(
+                SetOpClause(
+                    line=line,
+                    op=cmd,  # type: ignore[arg-type]
+                    dataset=name,
+                    distinct=modifier != "all",
+                )
+            )
+            # Like `\from`/`\join`: only complain once the schema has loaded,
+            # and a CTE defined earlier is a table for this purpose.
+            if schema_tables() and not table_by_name(name) and name not in visible_ctes():
+                err(
+                    f'unknown table "{name}" — loaded datasets: '
+                    + ", ".join(t.name for t in schema_tables())
+                )
+            i += 1
+            continue
+
         if cmd == "select":
             # One `\select` line may carry several comma-separated expressions;
             # each segment parses exactly like a single-expression line. A
@@ -716,8 +766,10 @@ def payload_from_ast(ast: QueryAST) -> dict:
     An empty select list means "all columns", `\\join` clauses pass through in
     document order (always a list, possibly empty), `\\order` targets pass
     through verbatim (the engine resolves aliases first, then raw columns),
-    `\\limit` maps to `limit`. Column strings may be qualified (`users.score`,
-    `e.user_id` — identifiers, not necessarily dataset names) and reach the
+    `\\limit` maps to `limit`. `\\union`/`\\intersect`/`\\except` pass through as
+    `setOps` in document order (always a list, possibly empty) with SQL's
+    deduplicating default baked in (`distinct`). Column strings may be qualified
+    (`users.score`, `e.user_id` — identifiers, not necessarily dataset names) and reach the
     engine untouched. Table aliases ride along (`alias`, always present, `None`
     when unaliased). Aggregate select items carry the derived auto-alias
     (`auto_alias`) when the user gave none — the engine re-derives the same
@@ -729,6 +781,9 @@ def payload_from_ast(ast: QueryAST) -> dict:
         "joins": [
             {"dataset": j.dataset, "alias": j.alias, "left": j.left, "right": j.right}
             for j in ast.joins
+        ],
+        "setOps": [
+            {"op": s.op, "dataset": s.dataset, "distinct": s.distinct} for s in ast.set_ops
         ],
         "select": [
             {

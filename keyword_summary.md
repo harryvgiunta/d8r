@@ -15,6 +15,7 @@ This file documents all keyword tokens and their regex patterns defined in
 | `_ORDER_RE` | `^({_COL})(?:\s+(asc|desc))?$` (IGNORECASE) | Order by: `col [asc|desc]` |
 | `_JOIN_RE` | `^([A-Za-z_][A-Za-z0-9_]*)` `(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?` `\s+on\s+` `([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)` `(?:\s*=\s*([A-Za-z_][A-Za-z0-9_]*))?$` (IGNORECASE) | Join: `\join dataset [as alias] on left [= right]` |
 | `_FROM_RE` | `^([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?$` (IGNORECASE) | From/open: `dataset [as alias]` |
+| `_SET_OP_RE` | `^(?:(all\|distinct)\s+)?([A-Za-z_][A-Za-z0-9_]*)$` (IGNORECASE) | Union/intersect/except: `[all\|distinct] dataset` — no modifier means SQL's `distinct` |
 | `_CMD_RE` | `^\\([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$` | Command: `\command args` |
 | `_CASE_HEAD_RE` | `^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$` | Case head: `alias =` |
 | `_OVER_TAIL_RE` | `^\s*(.*?)\s+over\s*\(\s*([^()]*)\s*\)\s*$` (IGNORECASE) | Over frame tail: captures expr and inner content |
@@ -38,5 +39,8 @@ This file documents all keyword tokens and their regex patterns defined in
 - `_JOIN_RE` has 4 capture groups: dataset, optional alias, left identifier, optional right identifier.
 - `_OVER_TAIL_RE` captures the expression and the content inside `over()`.
 - `_AS_RE` uses non-greedy `.*?` to match up to the first `as`.
+- `_SET_OP_RE` has 2 capture groups: the optional modifier and the table name; a
+  bare modifier (`\union all`) matches with `all` as the *name*, so the parser
+  rejects that shape explicitly instead of looking up a dataset called `all`.
 - `_WHERE_RE` supports `=`, `!=`, `>=`, `<=`, `>`, `<`, `like` operators.
 - `_LIMIT_RE` matches pure ASCII digit strings (since Python `\d` is broader than TS `/^\d+$/`).
