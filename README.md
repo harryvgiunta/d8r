@@ -362,6 +362,10 @@ this form connects to an existing database rather than provisioning one.
 For offline work, enter an existing SQLite database file in **Local snapshot**.
 This overrides the live fields and never syncs with Cloudflare. Snapshot paths
 are not remembered. No bundled snapshot is opened implicitly.
+The bundled `anyql/engine/d1/d1.sqlite` is entirely synthetic: three demo
+stations and twelve temperature readings, with no production data or credentials.
+Regenerate it with `uv run python -m anyql.engine.make_data`; the generator
+builds a fresh file rather than reusing pages from an existing database.
 
 Live sources ship their compiled SQLite SQL to Cloudflare's D1 REST API and run
 on the real engine there; snapshots run on a real SQLite engine in-process. The
@@ -467,6 +471,9 @@ written as wrapped strings. Beyond the clauses above:
 - **Temp tables**: `\temp event_totals` keeps the document's rows as a table the
   rest of the session can name (`\from event_totals`); `\drop event_totals`
   removes it. They live on the connection and die with the process.
+  Creation refuses `sqlite_` and `_cf_` prefixes, case-insensitively. Creation,
+  replacement, and drop target only the temporary namespace, never persistent
+  snapshot tables, including tables hidden from the schema explorer.
 - **Transactions**: `\begin` opens one, `\commit`/`\rollback` end it,
   `\savepoint s` / `\rollback to s` / `\release s` sit inside it. Each run is one
   statement, so `\begin` in one run and `\rollback` in the next is the usual

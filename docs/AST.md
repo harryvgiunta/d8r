@@ -545,6 +545,11 @@ already taken by a dataset is
 `"<name>" is already a dataset — pick another temp name`; `\drop` refuses
 anything that is not a temp table this session created
 (`"<name>" is not a temp table`).
+Creation also refuses names beginning with `sqlite_` or `_cf_`, case-insensitively,
+at execution time (`"<name>" is reserved — pick another temp name`). This protects
+internal tables hidden from the dataset registry. Creation, replacement, and
+drop explicitly target the backend's temporary namespace; a persistent table
+with the same name is never dropped, even if the session's registry is stale.
 
 ```anyql
 \from events
@@ -553,8 +558,8 @@ anything that is not a temp table this session created
 \temp event_totals
 ```
 
-Re-running the document rewrites the table (`CREATE OR REPLACE TEMPORARY
-TABLE`), which is what an IDE's run key should do. `\temp` needs a query
+Re-running the document replaces the table (a temp-qualified `DROP` followed by
+`CREATE TEMPORARY TABLE … AS`), which is what an IDE's run key should do. `\temp` needs a query
 (`\temp needs a query to keep — this document has no \from`), and a live D1
 source cannot hold one at all (`a live D1 source cannot hold a temp table — it
 is reached over HTTP`), since nothing about it is local. A snapshot can.

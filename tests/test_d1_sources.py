@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import closing
 
 import httpx
 import pytest
@@ -29,6 +30,7 @@ from anyql.engine import (
     execute_remote,
     expression,
 )
+from anyql.engine.make_data import write_d1_snapshot
 from tests.conftest import DATA_DIR
 
 SNAPSHOT_TABLES = {"orders", "customers"}
@@ -117,10 +119,55 @@ def test_snapshot_source_requires_an_explicit_path(tmp_path):
 
 
 def test_bundled_snapshot_opens():
-    """The D1 snapshot anyQL ships is a real database the registry can read."""
+    """The shipped snapshot contains only the known synthetic datasets and rows."""
     source = add_sqlite_source("d1", str(DATA_DIR.parent / "d1" / "d1.sqlite"))
-    assert source.datasets
-    assert all(not name.startswith(("_cf_", "sqlite_")) for name in source.datasets)
+    try:
+        assert {name: entry["rows"] for name, entry in source.datasets.items()} == {
+            "stations": 3,
+            "readings": 12,
+        }
+        assert source.con.table("stations").columns == ("station_id", "label")
+        assert source.con.table("readings").columns == (
+            "reading_id", "station_id", "temperature_c",
+        )
+        stations = execute(source.con, {
+            "dataset": "stations",
+            "orderBy": [{"target": "station_id", "direction": "asc"}],
+        }, dialect=source.dialect)
+        assert stations["rows"] == [[1, "Demo North"], [2, "Demo Central"], [3, "Demo South"]]
+        readings = execute(source.con, {
+            "dataset": "readings",
+            "orderBy": [{"target": "reading_id", "direction": "asc"}],
+        }, dialect=source.dialect)
+        assert readings["rows"] == [
+            [1, 1, 18.0], [2, 2, 18.5], [3, 3, 19.0],
+            [4, 1, 19.5], [5, 2, 20.0], [6, 3, 20.5],
+            [7, 1, 21.0], [8, 2, 21.5], [9, 3, 22.0],
+            [10, 1, 22.5], [11, 2, 23.0], [12, 3, 23.5],
+        ]
+    finally:
+        source.con.disconnect()
+
+
+def test_snapshot_generation_replaces_old_pages_deterministically(tmp_path):
+    """Deleted content in an old file must not survive synthetic regeneration."""
+    old = tmp_path / "old.sqlite"
+    marker = "discarded-fixture-only-marker-" * 1000
+    with closing(sqlite3.connect(old)) as con:
+        con.execute("PRAGMA secure_delete = OFF")
+        con.execute("CREATE TABLE discarded (value TEXT)")
+        con.execute("INSERT INTO discarded VALUES (?)", (marker,))
+        con.commit()
+        con.execute("DROP TABLE discarded")
+        con.commit()
+    assert marker.encode()[:100] in old.read_bytes()
+
+    write_d1_snapshot(old)
+    expected = write_d1_snapshot(tmp_path / "new" / "fresh.sqlite").read_bytes()
+    assert old.read_bytes() == expected
+    assert marker.encode()[:100] not in expected
+    write_d1_snapshot(old)
+    assert old.read_bytes() == expected
 
 
 # ---------------------------------------------------------------------------

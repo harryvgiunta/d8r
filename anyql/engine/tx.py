@@ -102,18 +102,33 @@ def create_temp(con, name: str, expr) -> None:
     A temp table is a *write* like any other: the DDL and the rows it inserts
     both take part in an open transaction, and a rollback takes them back out.
     """
+    if name.lower().startswith(("sqlite_", "_cf_")):
+        raise PayloadError(f'"{name}" is reserved — pick another temp name')
+    table = _temp_name(con, name)
     sql = str(ibis.to_sql(expr))
-    _statement(con, f'DROP TABLE IF EXISTS "{name}"', f'cannot replace temp table "{name}"')
+    _statement(con, f'DROP TABLE IF EXISTS {table}', f'cannot replace temp table "{name}"')
     _statement(
         con,
-        f'CREATE TEMPORARY TABLE "{name}" AS {sql}',
+        f'CREATE TEMPORARY TABLE {table} AS {sql}',
         f'cannot create temp table "{name}"',
     )
 
 
 def drop_temp(con, name: str) -> None:
-    """Drop a temp table; the caller has already checked the name is one of ours."""
-    _statement(con, f'DROP TABLE IF EXISTS "{name}"', f'cannot drop temp table "{name}"')
+    """Drop only from the temp namespace, even if the caller's registry is stale."""
+    table = _temp_name(con, name)
+    _statement(con, f'DROP TABLE IF EXISTS {table}', f'cannot drop temp table "{name}"')
+
+
+def _temp_name(con, name: str) -> str:
+    """Qualify every DDL target so name resolution cannot reach persistent tables."""
+    engine = engine_of(con)
+    if engine == "sqlite":
+        return f'"temp"."{name}"'
+    if engine == "duckdb":
+        # DuckDB's temp catalog has its own main schema, as in ibis.create_table.
+        return f'"temp"."main"."{name}"'
+    raise PayloadError(f"the {engine} engine has no supported temp namespace")
 
 
 def temp_handle(con, name: str, schema) -> object:

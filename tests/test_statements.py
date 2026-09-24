@@ -39,6 +39,28 @@ def snapshot(tmp_path) -> DataSource:
     return add_sqlite_source("snap", str(path))
 
 
+@pytest.fixture(params=["sqlite", "duckdb"])
+def temp_backend(request, tmp_path):
+    """Independent synthetic databases, including a persistent name collision."""
+    if request.param == "sqlite":
+        con = ibis.sqlite.connect(tmp_path / "temp-isolation.sqlite")
+        con.con.isolation_level = None
+        persistent = '"main"'
+        temporary = '"temp"'
+    else:
+        con = ibis.duckdb.connect(tmp_path / "temp-isolation.duckdb")
+        persistent = f'"{con.current_catalog}"."main"'
+        temporary = '"temp"."main"'
+    try:
+        con.con.execute("CREATE TABLE t (a INTEGER)")
+        con.con.execute("INSERT INTO t VALUES (1), (2), (3)")
+        con.con.execute("CREATE TABLE collision (a INTEGER)")
+        con.con.execute("INSERT INTO collision VALUES (99)")
+        yield con, persistent, temporary
+    finally:
+        con.con.close()
+
+
 def live_source() -> DataSource:
     """A source shaped like a live D1: it answers over HTTP, so it is *not* local."""
     con = ibis.duckdb.connect()
@@ -122,6 +144,82 @@ def test_a_live_source_can_hold_neither_a_temp_table_nor_a_transaction():
         "a live D1 source cannot hold a temp table — it is reached over HTTP"
     )
 
+
+
+@pytest.mark.parametrize("name", ["_cf_KV", "_CF_kv", "sqlite_sequence", "SQLITE_SEQUENCE"])
+def test_reserved_temp_names_preserve_hidden_sqlite_tables(tmp_path, name):
+    path = tmp_path / "hidden-tables.sqlite"
+    with sqlite3.connect(path) as raw:
+        raw.executescript(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT);"
+            "INSERT INTO t VALUES (7);"
+            "CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO _cf_KV VALUES ('synthetic-key', 'synthetic-value');"
+        )
+    raw.close()
+    source = add_sqlite_source("snap", str(path))
+    try:
+        snap = Session({"snap": source})
+        assert set(source.datasets) == {"t"}
+        outcome = snap.run(f"\\from t\n\\temp {name}\n")
+        assert not outcome.ok and "reserved" in outcome.error
+        assert snap.temp_tables() == []
+        assert source.con.con.execute("SELECT * FROM main._cf_KV").fetchall() == [
+            ("synthetic-key", "synthetic-value")
+        ]
+        assert source.con.con.execute("SELECT * FROM main.sqlite_sequence").fetchall() == [("t", 7)]
+        source.con.con.execute("INSERT INTO main.t DEFAULT VALUES")
+        assert source.con.con.execute("SELECT a FROM main.t ORDER BY a").fetchall() == [(7,), (8,)]
+    finally:
+        source.con.con.close()
+
+
+def test_reserved_temp_rejection_preserves_existing_temp_and_transaction(temp_backend):
+    con, _, temporary = temp_backend
+    expr = con.table("t")
+    con.con.execute(f'CREATE TEMPORARY TABLE {temporary}."_cF_private" AS SELECT 42 AS a')
+    tx.begin(con)
+    try:
+        with pytest.raises(expression.PayloadError, match="reserved"):
+            tx.create_temp(con, "_cF_private", expr)
+        assert con.con.execute(f'SELECT a FROM {temporary}."_cF_private"').fetchall() == [(42,)]
+        tx.create_temp(con, "inside", expr)
+        tx.rollback(con)
+        # The failed reserved-name attempt neither commits nor aborts our transaction.
+        with pytest.raises(Exception, match="inside"):
+            con.con.execute(f'SELECT a FROM {temporary}."inside"')
+        assert con.con.execute(f'SELECT a FROM {temporary}."_cF_private"').fetchall() == [(42,)]
+    finally:
+        tx.drop_temp(con, "_cF_private")
+
+
+def test_temp_replacement_preserves_persistent_collision_and_rolls_back(temp_backend):
+    con, persistent, temporary = temp_backend
+    expr = con.table("t")
+    tx.create_temp(con, "collision", expr.filter(expr.a == 1))
+    assert con.con.execute(f'SELECT a FROM {persistent}."collision"').fetchall() == [(99,)]
+    tx.begin(con)
+    tx.create_temp(con, "collision", expr.filter(expr.a > 1))
+    assert con.con.execute(f'SELECT a FROM {temporary}."collision" ORDER BY a').fetchall() == [(2,), (3,)]
+    tx.rollback(con)
+    assert con.con.execute(f'SELECT a FROM {temporary}."collision"').fetchall() == [(1,)]
+    assert con.con.execute(f'SELECT a FROM {persistent}."collision"').fetchall() == [(99,)]
+
+
+def test_drop_temp_never_falls_back_to_persistent_collision(temp_backend):
+    con, persistent, temporary = temp_backend
+    expr = con.table("t")
+    tx.drop_temp(con, "collision")
+    assert con.con.execute(f'SELECT a FROM {persistent}."collision"').fetchall() == [(99,)]
+    tx.create_temp(con, "collision", expr.filter(expr.a == 2))
+    tx.begin(con)
+    tx.drop_temp(con, "collision")
+    assert con.con.execute(f'SELECT a FROM {persistent}."collision"').fetchall() == [(99,)]
+    tx.rollback(con)
+    assert con.con.execute(f'SELECT a FROM {temporary}."collision"').fetchall() == [(2,)]
+    tx.drop_temp(con, "collision")
+    tx.drop_temp(con, "collision")
+    assert con.con.execute('SELECT a FROM "collision"').fetchall() == [(99,)]
 
 # --- transactions ------------------------------------------------------------
 

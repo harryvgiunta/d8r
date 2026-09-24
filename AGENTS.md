@@ -225,8 +225,11 @@ only dependency records, and there is no second requirements file.
   `spec/canonical-query.anyql` ↔ `spec/canonical-query.ast.json`. Parser
   semantics changes update both files and `docs/AST.md` together, and must keep
   `verify/check_canonical.py` printing `MATCH`.
-- The shipped D1 snapshot (`anyql/engine/d1/d1.sqlite`) is a real database
-  opened only when a caller names it — never a hidden default.
+- The shipped D1 snapshot (`anyql/engine/d1/d1.sqlite`) contains only synthetic
+  `stations` (3 rows) and `readings` (12 rows). `make_data.py` builds a fresh
+  SQLite file and atomically replaces the destination, never opening or copying
+  an old snapshot. Never bundle production exports, PII, or authentication data.
+  It is opened only when a caller names it — never a hidden default.
 
 ## Keybindings (copied from the code — do not invent)
 
@@ -284,11 +287,10 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
 
 ## Working notes (verified the hard way)
 
-- **Git: a single initial commit, no history behind it.** The whole tree was
-  committed once (`Initial commit: anyQL IDE`), so `git status`/`git diff` show
-  exactly your working-tree changes against that baseline — there is no earlier
-  history to blame or bisect. `.venv/`, `__pycache__/`, and `.pytest_cache/` are
-  gitignored; the bundled Parquet and the D1 snapshot are committed on purpose.
+- **Git history was rewritten to remove a production snapshot.** Do not merge
+  pre-purge history or restore the old database from another clone or backup.
+  `.venv/`, `__pycache__/`, and `.pytest_cache/` are gitignored; only synthetic
+  Parquet and SQLite fixtures belong in the repository.
 - **Parser validation has two regimes.** Unknown-table, qualified-prefix, and
   CTE-shadows-dataset errors fire **only when the schema registry is non-empty**
   (`set_schema_state`). Duplicate table identifiers, duplicate CTE names, nested
@@ -382,6 +384,10 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   table the name resolves to now, never a snapshot of a dropped one. (All of a document's
   directives run before its query, so a `\begin` and a `\rollback` in the *same*
   document cannot wrap the table it keeps.)
+  Temp DDL explicitly targets SQLite's `temp` schema or DuckDB's `temp.main`
+  namespace, so replacement and drop never fall back to persistent tables.
+  `tx.create_temp` refuses `sqlite_` and `_cf_` prefixes case-insensitively,
+  before compilation or any database mutation.
 - **ibis' `create_table`/`drop_table` are unusable in this build.** With the
   locked sqlglot (30.19), `sge.Drop(...).sql("duckdb")` renders `DROP TABLE IF
   EXISTS` with **no name**, so `drop_table` (and every `overwrite=True` path)

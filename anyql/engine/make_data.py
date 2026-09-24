@@ -1,13 +1,14 @@
 """Deterministic data generator for anyQL's engine.
 
 Pure arithmetic — no randomness anywhere, so re-running reproduces byte-identical
-Parquet files. Run from the repo root:
+Parquet and SQLite files. Run from the repo root:
 
     python -m anyql.engine.make_data       # or: python anyql/engine/make_data.py
 
 Outputs:
 - anyql/engine/data/events.parquet, anyql/engine/data/users.parquet
 - anyql/engine/data/<mock-id>/*.parquet (mock datasource mirrors)
+- anyql/engine/d1/d1.sqlite (invented stations and temperature readings)
 - tests/fixtures/expected_schema.json, expected_rows.json,
   expected_mock_rows.json
 """
@@ -16,8 +17,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sqlite3
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import ibis
 import pyarrow as pa
@@ -88,6 +91,35 @@ def users_table() -> pa.Table:
     )
 
 
+def write_d1_snapshot(path: Path | None = None) -> Path:
+    """Replace the snapshot with a fresh database, never opening the old file."""
+    path = HERE / "d1" / "d1.sqlite" if path is None else Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".synthetic-d1-", dir=path.parent) as directory:
+        fresh = Path(directory) / "d1.sqlite"
+        con = sqlite3.connect(fresh)
+        try:
+            with con:
+                con.execute("CREATE TABLE stations (station_id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+                con.execute(
+                    "CREATE TABLE readings (reading_id INTEGER PRIMARY KEY, "
+                    "station_id INTEGER NOT NULL REFERENCES stations(station_id), "
+                    "temperature_c REAL NOT NULL)"
+                )
+                con.executemany(
+                    "INSERT INTO stations VALUES (?, ?)",
+                    [(1, "Demo North"), (2, "Demo Central"), (3, "Demo South")],
+                )
+                con.executemany(
+                    "INSERT INTO readings VALUES (?, ?, ?)",
+                    ((i + 1, i % 3 + 1, 18.0 + i * 0.5) for i in range(12)),
+                )
+        finally:
+            con.close()
+        fresh.replace(path)
+    return path
+
+
 def main() -> None:
     try:
         from anyql.engine import datasources
@@ -153,6 +185,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"wrote {FIXTURES_DIR / 'expected_mock_rows.json'}")
+
+    print(f"wrote {write_d1_snapshot()} (synthetic stations and readings)")
 
 
 if __name__ == "__main__":
