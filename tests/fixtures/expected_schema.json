@@ -1,0 +1,25 @@
+{
+  "dataset": "events",
+  "columns": [
+    {
+      "name": "timestamp",
+      "type": "timestamp"
+    },
+    {
+      "name": "user_id",
+      "type": "int64"
+    },
+    {
+      "name": "event_type",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "float64"
+    },
+    {
+      "name": "path",
+      "type": "string"
+    }
+  ]
+}

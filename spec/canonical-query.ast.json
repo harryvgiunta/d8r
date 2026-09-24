@@ -1,0 +1,129 @@
+{
+  "with": [
+    {
+      "line": 1,
+      "name": "recent",
+      "body": {
+        "with": [],
+        "from": {
+          "line": 2,
+          "table": "orders",
+          "alias": null
+        },
+        "joins": [],
+        "select": [],
+        "where": {
+          "line": 3,
+          "raw": "status = \"paid\"",
+          "column": "status",
+          "op": "=",
+          "value": "paid"
+        },
+        "groupBy": [],
+        "orderBy": [],
+        "cases": [],
+        "limit": null,
+        "errors": []
+      }
+    }
+  ],
+  "from": {
+    "line": 4,
+    "table": "recent",
+    "alias": null
+  },
+  "joins": [],
+  "select": [
+    {
+      "line": 5,
+      "raw": "customer_id",
+      "column": "customer_id",
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "alias": null
+    },
+    {
+      "line": 6,
+      "raw": "month(placed_at)",
+      "column": null,
+      "star": false,
+      "aggregate": null,
+      "temporal": {
+        "fn": "month",
+        "arg": "placed_at"
+      },
+      "rank": null,
+      "window": null,
+      "alias": null
+    },
+    {
+      "line": 7,
+      "raw": "sum(amount) over (partition by customer_id) as customer_total",
+      "column": null,
+      "star": false,
+      "aggregate": {
+        "fn": "sum",
+        "arg": "amount"
+      },
+      "temporal": null,
+      "rank": null,
+      "window": {
+        "partitionBy": [
+          "customer_id"
+        ],
+        "order": null
+      },
+      "alias": "customer_total"
+    },
+    {
+      "line": 8,
+      "raw": "rank() over (order by placed_at desc) as recency_rank",
+      "column": null,
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": {
+        "fn": "rank"
+      },
+      "window": {
+        "partitionBy": [],
+        "order": {
+          "column": "placed_at",
+          "direction": "desc"
+        }
+      },
+      "alias": "recency_rank"
+    }
+  ],
+  "where": null,
+  "groupBy": [],
+  "orderBy": [
+    {
+      "line": 10,
+      "target": "customer_total",
+      "direction": "desc",
+      "resolvesTo": 3
+    }
+  ],
+  "cases": [
+    {
+      "line": 9,
+      "raw": "flag = when amount > 100 then \"high\" else \"low\"",
+      "alias": "flag",
+      "whens": [
+        {
+          "column": "amount",
+          "op": ">",
+          "value": "100",
+          "then": "high"
+        }
+      ],
+      "else": "low"
+    }
+  ],
+  "limit": 5,
+  "errors": []
+}

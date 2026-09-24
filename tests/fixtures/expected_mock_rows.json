@@ -1,0 +1,20 @@
+{
+  "columns": [
+    "region",
+    "amount_sum"
+  ],
+  "rows": [
+    [
+      "emea",
+      823.5
+    ],
+    [
+      "amer",
+      798.75
+    ],
+    [
+      "apac",
+      699.75
+    ]
+  ]
+}

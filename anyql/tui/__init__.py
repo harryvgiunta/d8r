@@ -1,0 +1,11 @@
+"""anyQL's Textual terminal UI — the application itself.
+
+The React front end and its HTTP sidecar are gone: this package is the whole
+product. It renders the `\\command` document, the live schema, and the rows the
+engine returns, all in one process, with no server anywhere.
+"""
+
+from .app import AnyqlApp, EditorPane, ResultsTable, main
+from .session import PREVIEW_ROW_CAP, Session
+
+__all__ = ["AnyqlApp", "EditorPane", "PREVIEW_ROW_CAP", "ResultsTable", "Session", "main"]
