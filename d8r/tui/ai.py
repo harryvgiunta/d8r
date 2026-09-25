@@ -20,9 +20,9 @@ from textual.widgets import Button, Static, TextArea
 from textual.worker import Worker
 from textual.timer import Timer
 
-from anyql.ai import client
-from anyql.ai.context import AIContext, AIProposal
-from anyql.ai.diagnostics import AIDiagnostics
+from d8r.ai import client
+from d8r.ai.context import AIContext, AIProposal
+from d8r.ai.diagnostics import AIDiagnostics
 
 
 
@@ -510,7 +510,7 @@ class AIPanel(Vertical):
                 self._draw_transcript(self._transcript)
                 self._status("Reply below to continue." if self.function_mode else "Response complete.")
                 return
-            summary = re.sub(r"^```(?:anyql|json)[^\S\r\n]*\r?\n.*?^```[^\S\r\n]*$", "", answer,
+            summary = re.sub(r"^```(?:d8r|json)[^\S\r\n]*\r?\n.*?^```[^\S\r\n]*$", "", answer,
                              flags=re.MULTILINE | re.DOTALL | re.IGNORECASE).strip() if self.function_mode else answer
             self._transcript = prefix + (summary or "Function draft ready for review.") + "\n\n"
             self._draw_transcript(self._transcript)

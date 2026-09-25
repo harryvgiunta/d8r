@@ -19,7 +19,7 @@ from contextlib import closing
 import httpx
 import pytest
 
-from anyql.engine import (
+from d8r.engine import (
     CloudflareD1,
     D1Error,
     add_d1_live_source,
@@ -30,7 +30,7 @@ from anyql.engine import (
     execute_remote,
     expression,
 )
-from anyql.engine.make_data import write_d1_snapshot
+from d8r.engine.make_data import write_d1_snapshot
 from tests.conftest import DATA_DIR
 
 SNAPSHOT_TABLES = {"orders", "customers"}
@@ -268,7 +268,7 @@ def test_live_source_registers_without_leaking_the_token():
     ("WEIRD_TYPE", 0, "string"),
 ])
 def test_declared_types_map_longest_prefix_first(declared, notnull, expected):
-    from anyql.engine.d1api import _ibis_type
+    from d8r.engine.d1api import _ibis_type
 
     assert _ibis_type(declared, notnull) == expected
 

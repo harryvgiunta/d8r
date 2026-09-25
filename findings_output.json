@@ -3,7 +3,7 @@
     {
       "severity": "High",
       "title": "Set operations cause duplicate column errors",
-      "location": "anyql/engine/expression.py:989 _build_set_op or _apply_set_ops",
+      "location": "d8r/engine/expression.py:989 _build_set_op or _apply_set_ops",
       "scenario": "When UNION/INTERSECT/EXCEPT combines two branches projecting the same column name (e.g., both selecting event_type), the build step at line 989 attempts SELECT [*] on a combined expression, causing Ibis to raise Duplicate column name event_type in result set. This blocks any set-operation query with overlapping projection columns.",
       "fix": "The _apply_set_ops function needs to explicitly rename/alias duplicate columns from right branch before appending to left, or the select-item dispatch should deduplicate column names during set-op assembly. Check _star_columns and _apply_set_ops for the dedup logic that already exists and ensure it runs for set ops too.",
       "confirmed_by_probe": true
@@ -11,7 +11,7 @@
     {
       "severity": "Medium",
       "title": "DISTINCT before set operations fails",
-      "location": "anyql/engine/expression.py:946 _build function, col lookup",
+      "location": "d8r/engine/expression.py:946 _build function, col lookup",
       "scenario": "When DISTINCT is placed before a UNION/INTERSECT/EXCEPT, the build step at line 946 tries to resolve column name against frames that only contain the first branch's tables, raising PayloadError unknown column. DISTINCT after set operations works correctly.",
       "fix": "The build function needs to handle DISTINCT at the pipeline level after set operations are resolved, or move DISTINCT processing to occur after _apply_set_ops completes rather than during _build.",
       "confirmed_by_probe": true
@@ -19,7 +19,7 @@
     {
       "severity": "Medium",
       "title": "DuckDB engine rejects savepoints",
-      "location": "anyql/engine/tx.py:86 savepoint()",
+      "location": "d8r/engine/tx.py:86 savepoint()",
       "scenario": "Calling savepoint on a DuckDB backed connection raises PayloadError the duckdb engine has no savepoints it keeps whole transactions begin commit rollback. The tx.py functions all delegate to savepoint_statement which calls statement, and DuckDB throws TransactionException for transaction nesting. This is deliberate engine behavior, but the error message and API surface are misleading if callers expect savepoint support.",
       "fix": "Either add a clear warning to the docstring of savepoint/rollback_to/release that DuckDB does not support savepoints, or make tx.py engine-aware and skip/no-op savepoint operations when the engine is DuckDB.",
       "confirmed_by_probe": true
@@ -27,7 +27,7 @@
     {
       "severity": "Low",
       "title": "Temporal year alone is not grouped; with GROUP BY it becomes a grouping key",
-      "location": "anyql/engine/expression.py _windowed_column and _aggregate",
+      "location": "d8r/engine/expression.py _windowed_column and _aggregate",
       "scenario": "When year timestamp is used without GROUP BY, it produces row-wise extraction. When used with GROUP BY year, the extracted part becomes a derived grouping column and the query correctly groups by it. The TEMPORAL_FNS check in build keys off dtype families.",
       "fix": "Document the behavioral difference year without GROUP BY row-wise extraction; year with GROUP BY grouping key. The existing tests already document this boundary.",
       "confirmed_by_probe": true
@@ -35,7 +35,7 @@
     {
       "severity": "Medium",
       "title": "Scalar subquery requires explicit alias",
-      "location": "anyql/engine/expression.py:750 _scalar_subquery_column",
+      "location": "d8r/engine/expression.py:750 _scalar_subquery_column",
       "scenario": "Writing select without an alias in SELECT raises PayloadError a scalar subquery needs an alias write . The consumer must write select as subname. This is a contract constraint.",
       "fix": "Improve the error message to show the exact syntax Scalar subquery must be aliased write (SELECT ...) as name.",
       "confirmed_by_probe": true
@@ -43,7 +43,7 @@
     {
       "severity": "Low",
       "title": "Like operator uses CONTAINS internally",
-      "location": "anyql/engine/expression.py predicate or like match",
+      "location": "d8r/engine/expression.py predicate or like match",
       "scenario": "The like operator compiles to SQL CONTAINS t0 path /P/ rather than SQL LIKE. This means trailing wildcards behave differently. Users expecting standard SQL LIKE may be surprised.",
       "fix": "Either document the CONTAINS vs LIKE semantic difference, or adjust the compile path to use standard LIKE.",
       "confirmed_by_probe": true
@@ -51,7 +51,7 @@
     {
       "severity": "Low",
       "title": "Regex operator requires string column type",
-      "location": "anyql/engine/expression.py:_regex_match:400",
+      "location": "d8r/engine/expression.py:_regex_match:400",
       "scenario": "Using where user_id ~ 1 raises PayloadError needs a string column user_id is int64. The regex match operation only works on string-typed columns.",
       "fix": "This is correct type-gate behavior. No fix needed unless we want to auto-cast.",
       "confirmed_by_probe": true
@@ -59,7 +59,7 @@
     {
       "severity": "Low",
       "title": "temp table namespace targeting",
-      "location": "anyql/engine/tx.py:_temp_name",
+      "location": "d8r/engine/tx.py:_temp_name",
       "scenario": "Temp table names are qualified as tempmainname via _temp_name. This ensures temp names cannot reach persistent tables, but also means temp table names are engine-scoped. For DuckDB, this always produces tempmainname prefix.",
       "fix": "No fix needed this is working as designed the temp namespace isolation is intentional.",
       "confirmed_by_probe": true
@@ -67,7 +67,7 @@
     {
       "severity": "Low",
       "title": "count with empty input returns 0 rows",
-      "location": "anyql/engine/expression.py:_aggregate",
+      "location": "d8r/engine/expression.py:_aggregate",
       "scenario": "When from events select count as n limit 0 is executed against the events dataset, the result has 0 rows and 1 column [n]. This is because the limit 0 cuts before any rows are produced.",
       "fix": "No fix needed this is correct behavior per the pipeline.",
       "confirmed_by_probe": true
@@ -75,7 +75,7 @@
     {
       "severity": "Nit",
       "title": "Pipeline order matches documented flow",
-      "location": "anyql/engine/expression.py pipeline sequence",
+      "location": "d8r/engine/expression.py pipeline sequence",
       "scenario": "The engine pipeline order sourcejoins filter projectionaggregation set ops distinct order limit matches the documented invariant. All probed queries confirm this ordering is correct and consistent.",
       "fix": "No fix needed this is verified correct.",
       "confirmed_by_probe": true

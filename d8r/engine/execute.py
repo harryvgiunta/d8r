@@ -1,6 +1,6 @@
 """Execute an ExecutePayload against a registered Ibis DuckDB connection.
 
-Kept separate from the UI so `anyql.engine.make_data` can compute fixtures with
+Kept separate from the UI so `d8r.engine.make_data` can compute fixtures with
 the exact same serialization the result pane renders.
 """
 

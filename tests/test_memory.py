@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from anyql.ai.client import AIConfig
-from anyql import storage
-from anyql.tui.session import Session
+from d8r.ai.client import AIConfig
+from d8r import storage
+from d8r.tui.session import Session
 
 
 DATABASE = "12345678-1234-5678-9abc-123456789abc"
@@ -195,20 +195,20 @@ def test_explicit_directory_overrides_environment_without_startup_writes(sources
 
 
 def test_default_directory_ignores_legacy_platform_locations(tmp_path, monkeypatch):
-    monkeypatch.delenv("ANYQL_DATA_DIR")
+    monkeypatch.delenv("D8R_DATA_DIR")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "legacy-windows"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "legacy-xdg"))
-    assert storage.data_directory() == tmp_path / ".anyql"
-    assert not (tmp_path / ".anyql").exists()
+    assert storage.data_directory() == tmp_path / ".d8r"
+    assert not (tmp_path / ".d8r").exists()
 
 
 def test_data_directory_environment_expands_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("ANYQL_DATA_DIR", "~/custom-anyql")
-    assert storage.data_directory() == tmp_path / "custom-anyql"
+    monkeypatch.setenv("D8R_DATA_DIR", "~/custom-d8r")
+    assert storage.data_directory() == tmp_path / "custom-d8r"
 
 
 @pytest.mark.parametrize("kind", ["memory", "settings"])

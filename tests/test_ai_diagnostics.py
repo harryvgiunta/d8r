@@ -2,8 +2,8 @@
 import json
 from urllib.parse import quote
 
-from anyql.ai import diagnostics
-from anyql.ai.diagnostics import AIDiagnostics
+from d8r.ai import diagnostics
+from d8r.ai.diagnostics import AIDiagnostics
 
 
 def test_known_credentials_are_redacted_before_truncation_and_copy():

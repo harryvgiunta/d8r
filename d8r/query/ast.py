@@ -1,4 +1,4 @@
-"""The anyQL query AST — ported from an earlier TypeScript implementation.
+"""The D8R query AST — ported from an earlier TypeScript implementation.
 
 The Python side spells fields in snake_case; `to_json()` emits the documented
 wire shape (exactly the keys `spec/canonical-query.ast.json` carries), so the

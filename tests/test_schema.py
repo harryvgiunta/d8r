@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from anyql.engine import PayloadError, datasources, expression
+from d8r.engine import PayloadError, datasources, expression
 from tests.conftest import FIXTURES_DIR
 
 

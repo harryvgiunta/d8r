@@ -12,9 +12,9 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from anyql.engine import expression
-from anyql.engine.execute import execute
-from anyql.query import (
+from d8r.engine import expression
+from d8r.engine.execute import execute
+from d8r.query import (
     ColumnDef,
     TableDef,
     parse_query,
@@ -214,7 +214,7 @@ def test_the_cap_compiles_to_a_row_number_filter(con):
     sql = expression.compile_sql(expr)
     assert "ROW_NUMBER()" in sql and "PARTITION BY" in sql and "<= 2" in sql
     # The numbering is scaffolding, not an output column.
-    assert "anyql_lateral_row" not in [str(name) for name in expr.columns]
+    assert "d8r_lateral_row" not in [str(name) for name in expr.columns]
 
 
 # --- the mistakes the engine names ------------------------------------------

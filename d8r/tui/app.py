@@ -1,7 +1,7 @@
-"""anyQL's Textual application: editor, explorer, results — all in-process.
+"""D8R's Textual application: editor, explorer, results — all in-process.
 
 There is no webserver behind this app and none in front of it: the document is
-parsed by `anyql.query`, executed by `anyql.engine`, and everything the widgets
+parsed by `d8r.query`, executed by `d8r.engine`, and everything the widgets
 show comes back as plain Python. The TUI is a *consumer* of those two layers —
 it never re-implements a rule of the language or the engine.
 """
@@ -29,9 +29,9 @@ from textual.widgets import (
     Tree,
 )
 
-from anyql.ai.context import AIProposal
-from anyql.engine import DIALECTS, DIALECT_BY_NAME, DataSource, capabilities_for
-from anyql.query import ColumnDef
+from d8r.ai.context import AIProposal
+from d8r.engine import DIALECTS, DIALECT_BY_NAME, DataSource, capabilities_for
+from d8r.query import ColumnDef
 
 from .add_source import AddSourceModal
 from .ai import AIPanel, AITarget
@@ -92,11 +92,11 @@ def dataset_label(name: str, rows: int) -> Text:
     return Text.assemble((name, "bold"), "  ", (f"{rows} rows", "dim"))
 
 
-class AnyqlApp(App):
+class D8RApp(App):
     """The data IDE: a `\\command` document, the live schema, and the rows."""
 
     CSS_PATH = "app.tcss"
-    TITLE = "anyQL"
+    TITLE = "D8R"
     SUB_TITLE = "data IDE"
 
     # The panes `\results`, `\sql`, `\history` and `\schema` show and hide, and
@@ -153,7 +153,7 @@ class AnyqlApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="header"):
-            yield Static("anyQL", id="app-title")
+            yield Static("D8R", id="app-title")
             yield Select(
                 self._source_options(),
                 allow_blank=False,
@@ -824,8 +824,8 @@ class AnyqlApp(App):
 
 
 def main() -> None:
-    """`python -m anyql` — run the app."""
-    AnyqlApp().run()
+    """`python -m d8r` — run the app."""
+    D8RApp().run()
 
 
-__all__ = ["AnyqlApp", "main"]
+__all__ = ["D8RApp", "main"]

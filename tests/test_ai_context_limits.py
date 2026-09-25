@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-from anyql.ai import context as context_module
-from anyql.ai.client import AIConfig
-from anyql.ai.context import AIContext
-from anyql.tui.session import Session
+from d8r.ai import context as context_module
+from d8r.ai.client import AIConfig
+from d8r.ai.context import AIContext
+from d8r.tui.session import Session
 
 
 def test_configured_sample_default_and_requested_limits_return_bounded_rows(sources):

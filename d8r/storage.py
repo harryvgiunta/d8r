@@ -14,8 +14,8 @@ import tempfile
 import time
 from uuid import UUID
 
-from anyql.ai.client import AIConfig
-from anyql.engine.datasources import DIALECT_BY_NAME
+from d8r.ai.client import AIConfig
+from d8r.engine.datasources import DIALECT_BY_NAME
 
 # How long a lock or temp file may exist before it is assumed to belong to a
 # crashed save. A save is two writes plus one fsync (sub-second), so anything
@@ -25,10 +25,10 @@ _STALE_SECONDS = 60.0
 
 def data_directory() -> Path:
     """Resolve the user data directory without creating it."""
-    override = os.environ.get("ANYQL_DATA_DIR")
+    override = os.environ.get("D8R_DATA_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".anyql"
+    return Path.home() / ".d8r"
 
 
 def _object(pairs: list[tuple[str, object]]) -> dict:
@@ -164,7 +164,7 @@ class _JSONStore:
         except (OSError, ValueError, RecursionError):
             self.error = (
                 f"Cannot load local {self._name} at {self.path}: invalid or unreadable file. "
-                "The original file is unchanged; repair it or move it aside, then restart anyQL. "
+                "The original file is unchanged; repair it or move it aside, then restart D8R. "
                 "Local saves are disabled until restart."
             )
         self._sweep()
@@ -240,7 +240,7 @@ class _JSONStore:
             if self._read() != self._snapshot:
                 raise ValueError(
                     f"Local {self._name} changed outside this session at {self.path}; nothing was saved. "
-                    f"Copy your unsaved draft and restart anyQL to load the latest {self._name}."
+                    f"Copy your unsaved draft and restart D8R to load the latest {self._name}."
                 )
             with tempfile.NamedTemporaryFile(
                 mode="wb", prefix=f".{self._name}-", suffix=".tmp", dir=self.path.parent, delete=False,
@@ -253,7 +253,7 @@ class _JSONStore:
             if self._read() != self._snapshot:
                 raise ValueError(
                     f"Local {self._name} changed outside this session at {self.path}; nothing was saved. "
-                    f"Copy your unsaved draft and restart anyQL to load the latest {self._name}."
+                    f"Copy your unsaved draft and restart D8R to load the latest {self._name}."
                 )
             os.replace(temporary, self.path)
             temporary = None

@@ -22,18 +22,18 @@ from pathlib import Path
 import pytest
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static, TabbedContent, TextArea
 
-import anyql
-from anyql.engine import DIALECTS, add_sqlite_source
-from anyql.query import SchemaContext
-from anyql.tui.add_source import AddSourceModal
-from anyql.tui.app import AnyqlApp
-from anyql.tui.palette import VALUE_SUGGESTIONS, view_for
-from anyql.tui.session import PREVIEW_ROW_CAP, VALUE_POOL_LIMIT, Session
-from anyql.tui.settings import SettingsScreen
-from anyql.tui.fn import FnScreen
+import d8r
+from d8r.engine import DIALECTS, add_sqlite_source
+from d8r.query import SchemaContext
+from d8r.tui.add_source import AddSourceModal
+from d8r.tui.app import D8RApp
+from d8r.tui.palette import VALUE_SUGGESTIONS, view_for
+from d8r.tui.session import PREVIEW_ROW_CAP, VALUE_POOL_LIMIT, Session
+from d8r.tui.settings import SettingsScreen
+from d8r.tui.fn import FnScreen
 from tests.conftest import REPO_ROOT
 
-TUI_DIR = Path(anyql.__file__).resolve().parent / "tui"
+TUI_DIR = Path(d8r.__file__).resolve().parent / "tui"
 
 # A document typed the way a person types one: `\` opens the palette, Enter
 # either accepts a suggestion or means a newline, and nothing is swallowed.
@@ -45,7 +45,7 @@ KEY_NAMES = {" ": "space", "\n": "enter"}
 
 def run_app(scenario):
     """Mount a fresh app headlessly and hand it (and its pilot) to `scenario`."""
-    app = AnyqlApp()
+    app = D8RApp()
 
     async def drive():
         async with app.run_test(size=(140, 45)) as pilot:
@@ -62,16 +62,16 @@ async def type_document(pilot, text: str) -> None:
         await pilot.press(KEY_NAMES.get(character, character))
 
 
-def text_of(app: AnyqlApp, selector: str) -> str:
+def text_of(app: D8RApp, selector: str) -> str:
     """A Static's text, without its styling."""
     return str(app.query_one(selector, Static).content)
 
 
-def results_table(app: AnyqlApp) -> DataTable:
+def results_table(app: D8RApp) -> DataTable:
     return app.query_one("#results-table", DataTable)
 
 
-def history_table(app: AnyqlApp) -> DataTable:
+def history_table(app: D8RApp) -> DataTable:
     return app.query_one("#history-table", DataTable)
 
 
@@ -125,12 +125,12 @@ def test_app_boots_on_the_demo_source():
 
 
 def test_the_module_entry_point_boots_the_app():
-    """`python -m anyql` really starts the IDE — proven, not assumed."""
-    with Path(REPO_ROOT, "anyql", "__main__.py").open("rb") as handle:
+    """`python -m d8r` really starts the IDE — proven, not assumed."""
+    with Path(REPO_ROOT, "d8r", "__main__.py").open("rb") as handle:
         assert handle.read()  # the entry point exists where -m looks for it
 
     process = subprocess.Popen(
-        [sys.executable, "-m", "anyql"],
+        [sys.executable, "-m", "d8r"],
         cwd=REPO_ROOT,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -149,7 +149,7 @@ def test_the_module_entry_point_boots_the_app():
         process.wait(timeout=20)
 
     screen = rendered.decode("utf-8", "replace")
-    assert "anyQL" in screen  # the header
+    assert "D8R" in screen  # the header
     assert "Document" in screen  # the editor pane
     assert "ready · demo · duckdb" in screen  # the footer's status line
 
@@ -185,7 +185,7 @@ def test_a_typed_document_fills_the_results_table():
 
 def test_pending_run_keeps_keys_responsive_and_owns_its_submission(monkeypatch):
     """A delayed real query cannot steal edits or share its connection mid-run."""
-    from anyql.tui import session as session_module
+    from d8r.tui import session as session_module
 
     started = threading.Event()
     release = threading.Event()
@@ -267,8 +267,8 @@ def test_pending_run_keeps_keys_responsive_and_owns_its_submission(monkeypatch):
 
 
 def test_background_run_recovers_after_execution_errors(monkeypatch):
-    from anyql.engine import PayloadError
-    from anyql.tui import session as session_module
+    from d8r.engine import PayloadError
+    from d8r.tui import session as session_module
 
     started = threading.Event()
     release = threading.Event()
@@ -309,7 +309,7 @@ def test_background_run_recovers_after_execution_errors(monkeypatch):
 
 
 def test_quit_does_not_cancel_a_pending_temp_write_or_render_after_unmount(monkeypatch):
-    from anyql.tui import session as session_module
+    from d8r.tui import session as session_module
 
     started = threading.Event()
     release = threading.Event()
@@ -324,7 +324,7 @@ def test_quit_does_not_cancel_a_pending_temp_write_or_render_after_unmount(monke
     monkeypatch.setattr(session_module, "materialize", delayed_materialize)
 
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         document = "\\from users\n\\select user_id\n\\limit 2\n\\temp kept"
         try:
             async with app.run_test(size=(140, 45)) as pilot:
@@ -1344,7 +1344,7 @@ def test_settings_switches_the_source_and_the_one_dialect():
 
 def test_settings_restore_hidden_panes_source_and_custom_dialect():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             assert not app.session.settings_path.exists()
@@ -1358,7 +1358,7 @@ def test_settings_restore_hidden_panes_source_and_custom_dialect():
             await pick(pilot, app, "Intellisense")
             saved = app.session.settings_path.read_bytes()
 
-        restored = AnyqlApp()
+        restored = D8RApp()
         async with restored.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             assert restored.session.active_id == "postgres"
@@ -1374,7 +1374,7 @@ def test_settings_restore_hidden_panes_source_and_custom_dialect():
 
 def test_failed_settings_save_keeps_previous_workspace_and_controls():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             # Another process saves after this app loaded its settings snapshot.
@@ -1444,7 +1444,7 @@ def test_the_tui_reaches_no_http_server():
             offenders[path.name] = hits
     assert offenders == {}
 
-    import anyql.tui  # noqa: F401  (imported for its side effect on sys.modules)
+    import d8r.tui  # noqa: F401  (imported for its side effect on sys.modules)
 
     loaded = {name.split(".")[0] for name in sys.modules}
     assert not (FORBIDDEN & loaded)
@@ -2060,7 +2060,7 @@ def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
     monkeypatch.setattr(Session, "build_live_source", build_source)
 
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.press("ctrl+o")
             modal = app.screen
@@ -2080,7 +2080,7 @@ def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
             assert SECRET not in text_of(app, "#status")
             saved = app.session.storage_path.read_bytes()
 
-        restored = AnyqlApp()
+        restored = D8RApp()
         async with restored.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             assert "orders-db" not in restored.session.sources
@@ -2119,7 +2119,7 @@ def saved_d1_session():
 
 
 def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(monkeypatch, saved_d1_session):
-    from anyql.engine import D1Error
+    from d8r.engine import D1Error
     from tests.test_d1_sources import SECRET
 
     calls = []
@@ -2132,7 +2132,7 @@ def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(m
     before = saved_d1_session.storage_path.read_bytes()
 
     async def scenario():
-        app = AnyqlApp(saved_d1_session)
+        app = D8RApp(saved_d1_session)
         async with app.run_test(size=(140, 45)) as pilot:
             assert not calls
             await pilot.click("#source-select")
@@ -2171,7 +2171,7 @@ def test_saved_dropdown_without_token_prompts_before_connecting(monkeypatch, sav
     monkeypatch.setattr(session, "build_live_source", connect)
 
     async def scenario():
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.click("#source-select")
             await pilot.press("end", "enter")
@@ -2206,7 +2206,7 @@ def test_saved_sources_reconnect_in_secondary_pickers(monkeypatch, saved_d1_sess
     monkeypatch.setattr(saved_d1_session, "build_live_source", connect)
 
     async def scenario():
-        app = AnyqlApp(saved_d1_session)
+        app = D8RApp(saved_d1_session)
         async with app.run_test(size=(140, 45)) as pilot:
             original = app.editor.text
             assert not connected

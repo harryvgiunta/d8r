@@ -17,16 +17,16 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from anyql.ai.client import AIConfig
-from anyql.ai.config import import_yolo_config
+from d8r.ai.client import AIConfig
+from d8r.ai.config import import_yolo_config
 
-from anyql.engine import DIALECT_BY_NAME, DIALECTS
+from d8r.engine import DIALECT_BY_NAME, DIALECTS
 
 from .add_source import AddSourceModal
 from .palette import prompt
 
 if TYPE_CHECKING:
-    from .app import AnyqlApp
+    from .app import D8RApp
 
 # Sidebar order is also the keyboard navigation order.
 MENUS: dict[str, str] = {
@@ -57,12 +57,12 @@ def binding_rows() -> list[Row]:
     """
     from textual.app import App as TextualApp
 
-    from .app import AnyqlApp
+    from .app import D8RApp
     from .results import ResultsTable
     from .palette import EditorPane
 
     groups = (
-        ("app", AnyqlApp.BINDINGS),
+        ("app", D8RApp.BINDINGS),
         ("document", EditorPane.BINDINGS),
         ("results", ResultsTable.BINDINGS),
         ("settings", SettingsScreen.BINDINGS),
@@ -91,7 +91,7 @@ class SettingsScreen(ModalScreen[None]):
         Binding("right", "details", "Details", show=False),
     ]
 
-    def __init__(self, ide: "AnyqlApp", **kwargs) -> None:
+    def __init__(self, ide: "D8RApp", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
         self.menu = "general"
@@ -301,7 +301,7 @@ class DefaultRowsScreen(ModalScreen[None]):
     #rows-settings-error { color: $error; }
     """
 
-    def __init__(self, ide: "AnyqlApp", **kwargs) -> None:
+    def __init__(self, ide: "D8RApp", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
 
@@ -362,7 +362,7 @@ class AIProviderScreen(ModalScreen[None]):
     #ai-settings-error { color: $error; }
     """
 
-    def __init__(self, ide: "AnyqlApp", *, focus_field: str = "ai-base-url", **kwargs) -> None:
+    def __init__(self, ide: "D8RApp", *, focus_field: str = "ai-base-url", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
         self.focus_field = focus_field

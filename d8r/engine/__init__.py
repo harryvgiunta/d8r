@@ -1,4 +1,4 @@
-"""anyQL's Python engine: the datasource registry plus payload execution.
+"""D8R's Python engine: the datasource registry plus payload execution.
 
 Three seams, no UI:
 
@@ -11,12 +11,12 @@ Three seams, no UI:
 * `execute` — running a payload (`execute`, `execute_remote`, `materialize`)
   and the rows that come back in the shape a result pane renders.
 * `tx` — the statements a payload cannot carry: transactions, savepoints,
-  and the temp tables a document keeps (`anyql.engine.tx`).
+  and the temp tables a document keeps (`d8r.engine.tx`).
 
 Everything a caller needs is re-exported here. Two faults are the user's to
 read and nothing else: `PayloadError` for a bad payload or dialect choice, and
 `D1Error` for a D1-side failure. The name `execute` below is the *function*;
-its module is importable as `from anyql.engine.execute import execute_remote`.
+its module is importable as `from d8r.engine.execute import execute_remote`.
 """
 
 from __future__ import annotations

@@ -11,8 +11,8 @@ from decimal import Decimal
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Input, Select, Static
 
-from anyql.tui.results import ExportModal, ResultsTable
-from anyql.tui.session import PREVIEW_ROW_CAP, RunOutcome
+from d8r.tui.results import ExportModal, ResultsTable
+from d8r.tui.session import PREVIEW_ROW_CAP, RunOutcome
 
 
 def outcome() -> RunOutcome:

@@ -6,9 +6,9 @@ import sqlite3
 
 import pytest
 
-from anyql.engine import add_sqlite_source, expression
-from anyql.engine.execute import execute
-from anyql.query import parse_query, payload_from_ast
+from d8r.engine import add_sqlite_source, expression
+from d8r.engine.execute import execute
+from d8r.query import parse_query, payload_from_ast
 
 
 def run(doc: str, con, **kwargs) -> dict:
@@ -183,7 +183,7 @@ def test_malformed_scalar_calls_error_only_after_the_typing_line(call):
 
 
 def test_nested_scalar_references_obey_table_aliases():
-    from anyql.query import ColumnDef, SchemaContext, TableDef
+    from d8r.query import ColumnDef, SchemaContext, TableDef
 
     schema = SchemaContext([TableDef("events", columns=[ColumnDef("path", "string")])])
     doc = "\\from events e\n\\select concat(upper(events.path), 'x')\n\\limit 1"

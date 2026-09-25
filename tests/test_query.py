@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from anyql.query import (  # noqa: E402  (repo root added to sys.path above)
+from d8r.query import (  # noqa: E402  (repo root added to sys.path above)
     CaseBranch,
     ColumnDef,
     TableDef,
@@ -81,7 +81,7 @@ def read(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-CANONICAL_DOC = read("spec/canonical-query.anyql").replace("\r\n", "\n")
+CANONICAL_DOC = read("spec/canonical-query.d8r").replace("\r\n", "\n")
 
 
 # --- canonical fixture (empty registry — the parser-only regime) -------------

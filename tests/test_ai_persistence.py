@@ -8,14 +8,14 @@ import httpx
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Static, TextArea
 
-from anyql.ai import client
-from anyql.ai.client import AIConfig
-from anyql.ai.context import AIContext
-from anyql.tui.ai import AIPanel, AITarget
-from anyql.tui.session import HistoryEntry, Session
+from d8r.ai import client
+from d8r.ai.client import AIConfig
+from d8r.ai.context import AIContext
+from d8r.tui.ai import AIPanel, AITarget
+from d8r.tui.session import HistoryEntry, Session
 
 
-ANSWER = "Review this draft.\n```anyql\n\\from events\n\\limit 2\n```"
+ANSWER = "Review this draft.\n```d8r\n\\from events\n\\limit 2\n```"
 
 
 def _frame(delta: dict, finish=None) -> bytes:

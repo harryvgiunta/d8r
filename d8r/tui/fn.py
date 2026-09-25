@@ -1,6 +1,6 @@
 """The `\\fn` page: the function library, and the editor for one function.
 
-A table-valued function here is a named anyQL document with a positional
+A table-valued function here is a named D8R document with a positional
 signature: the body is an ordinary query whose `@params` are filled with the
 arguments of each call (the engine sees literals; ibis never learns a function
 exists). This screen is where those definitions are authored — a list of what
@@ -29,15 +29,15 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
-from anyql.ai.context import AIProposal
-from anyql.query import is_identifier
+from d8r.ai.context import AIProposal
+from d8r.query import is_identifier
 
 from .ai import AIPanel, AITarget
 
 from .palette import CommandPalette, EditorPane, prompt
 
 if TYPE_CHECKING:
-    from .app import AnyqlApp
+    from .app import D8RApp
 
 NEW = "＋ New function…"
 
@@ -96,7 +96,7 @@ class FnScreen(ModalScreen[None]):
     ]
 
     def __init__(
-        self, ide: "AnyqlApp", focus: str = "", new_name: str = "", new_body: str = "",
+        self, ide: "D8RApp", focus: str = "", new_name: str = "", new_body: str = "",
         *, restore_draft: bool = True, **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -157,7 +157,7 @@ class FnScreen(ModalScreen[None]):
                     yield Static("Parameters — names in argument order (no @)", classes="field-label")
                     yield Input(self._initial_fields["parameters"], placeholder="min_amount", id="fn-params")
                     yield Static(
-                        "Body — an anyQL document; `@param` binds an argument",
+                        "Body — an D8R document; `@param` binds an argument",
                         classes="field-label",
                     )
                     with FnBodyPane(id="fn-body-pane"):

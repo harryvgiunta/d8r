@@ -11,9 +11,9 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from anyql.engine import expression
-from anyql.engine.execute import execute
-from anyql.query import parse_query, payload_from_ast
+from d8r.engine import expression
+from d8r.engine.execute import execute
+from d8r.query import parse_query, payload_from_ast
 
 
 def messages(ast) -> list[str]:

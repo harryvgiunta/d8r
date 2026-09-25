@@ -11,7 +11,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from anyql.ai import client as ai
+from d8r.ai import client as ai
 
 SECRET = "never-echo-this-api-key"
 CONFIG = ai.AIConfig("https://provider.invalid/v1", "test-model", SECRET)
@@ -96,7 +96,7 @@ def transport(monkeypatch):
 
 def test_byte_boundaries_multiline_events_and_multiple_streamed_tools(transport):
     calls = []
-    final = "Here is the full replacement:\n```anyql\n\\from café\n```"
+    final = "Here is the full replacement:\n```d8r\n\\from café\n```"
     first = (
         b"\xef\xbb\xbf: keepalive\r\n\r\n"
         + b'event: message\r\ndata: {"choices": [],\r\ndata: "usage": null}\r\n\r\n'
@@ -240,7 +240,7 @@ def test_auth_failure_does_not_retry_or_expose_response(transport):
 
 
 def test_partial_visible_answer_is_never_replayed_or_committed(transport):
-    partial = "```anyql\n\\from users\n```"
+    partial = "```d8r\n\\from users\n```"
     requests = transport(lambda request: stream_response(event(delta(partial)), httpx.ReadError(SECRET)))
     messages = [{"role": "user", "content": "Suggest a query"}]
     events = []

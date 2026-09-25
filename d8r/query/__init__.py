@@ -1,4 +1,4 @@
-"""The anyQL language layer: AST, parser, alias rules, and schema snapshots."""
+"""The D8R language layer: AST, parser, alias rules, and schema snapshots."""
 
 from .alias import auto_alias, effective_alias
 from .ast import (

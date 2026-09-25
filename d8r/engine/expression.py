@@ -1,4 +1,4 @@
-"""Pure payload -> Ibis expression compilation for anyQL's Python engine.
+"""Pure payload -> Ibis expression compilation for D8R's Python engine.
 
 No UI concerns live here: user-facing mistakes raise `PayloadError`, which the
 caller surfaces to the user as-is.
@@ -15,7 +15,7 @@ import ibis
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisError
 
-from anyql.query.functions import SCALAR_FUNCTIONS
+from d8r.query.functions import SCALAR_FUNCTIONS
 
 __all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql"]
 
@@ -132,7 +132,7 @@ def _outer_ref(ref: object, frames: list[tuple[str, ir.Table]]) -> bool:
     return any(prefix == name for name, _ in frames)
 
 
-_LATERAL_ROW = "anyql_lateral_row"
+_LATERAL_ROW = "d8r_lateral_row"
 
 
 def _body_column(right: ir.Table, ref: object, what: str) -> ir.Column:
@@ -246,7 +246,7 @@ def _cap_lateral_rows(
     frame may only depend on one relation, and the join may have renamed a right
     column that shares its name with a left one.
     """
-    helpers = [f"_anyql_order_{index}" for index in range(len(orders))]
+    helpers = [f"_d8r_order_{index}" for index in range(len(orders))]
     clash = next((name for name in (*helpers, _LATERAL_ROW) if name in expr.columns), "")
     if clash:
         raise PayloadError(f'column name "{clash}" collides with the lateral row cap')

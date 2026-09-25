@@ -1,4 +1,4 @@
-/* anyQL's dark stylesheet: a data IDE in the terminal.
+/* D8R's dark stylesheet: a data IDE in the terminal.
    Theme tokens come from `textual-dark`, so the app stays dark by design. */
 
 Screen {

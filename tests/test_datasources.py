@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from anyql.engine import (
+from d8r.engine import (
     DIALECTS,
     PayloadError,
     capabilities_for,

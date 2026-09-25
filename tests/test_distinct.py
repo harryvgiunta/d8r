@@ -7,9 +7,9 @@ from collections import Counter
 
 import pytest
 
-from anyql.engine import add_sqlite_source, expression
-from anyql.engine.execute import execute
-from anyql.query import EMPTY_SCHEMA, FnDef, SchemaContext, clause_line, parse_query, payload_from_ast
+from d8r.engine import add_sqlite_source, expression
+from d8r.engine.execute import execute
+from d8r.query import EMPTY_SCHEMA, FnDef, SchemaContext, clause_line, parse_query, payload_from_ast
 
 
 def run(doc: str, con, *, schema=EMPTY_SCHEMA, **kwargs) -> dict:

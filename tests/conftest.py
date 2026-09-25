@@ -1,7 +1,7 @@
 """Shared fixtures: one engine registry bound to the real bundled data tree.
 
 `DATA_DIR` is the engine's own Parquet tree (resolved from this file, not the
-working directory), so every test runs against the data anyQL actually ships.
+working directory), so every test runs against the data D8R actually ships.
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from anyql.engine import DataSource, datasources
+from d8r.engine import DataSource, datasources
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = REPO_ROOT / "anyql" / "engine" / "data"
+DATA_DIR = REPO_ROOT / "d8r" / "engine" / "data"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 FIRST10_PAYLOAD = {
@@ -56,7 +56,7 @@ ALIAS_REVENUE_PAYLOAD = {
 @pytest.fixture(autouse=True)
 def _isolated_memory(tmp_path, monkeypatch):
     """No test reads or writes the user's durable memory, settings, or credentials."""
-    monkeypatch.setenv("ANYQL_DATA_DIR", str(tmp_path / "anyql-data"))
+    monkeypatch.setenv("D8R_DATA_DIR", str(tmp_path / "d8r-data"))
 
 
 @pytest.fixture(scope="session")

@@ -6,12 +6,12 @@ import asyncio
 import ibis
 import pytest
 
-from anyql.engine.execute import execute
-from anyql.query import ColumnDef, FnDef, SchemaContext, TableDef, clause_line, parse_query, payload_from_ast
-from anyql.query.parser import MAX_FUNCTION_DEPTH, MAX_FUNCTION_EXPANSIONS, MAX_NUMERIC_CHARS, block_extent
-from anyql.storage import MemoryStore
-from anyql.tui.app import AnyqlApp
-from anyql.tui.session import Session
+from d8r.engine.execute import execute
+from d8r.query import ColumnDef, FnDef, SchemaContext, TableDef, clause_line, parse_query, payload_from_ast
+from d8r.query.parser import MAX_FUNCTION_DEPTH, MAX_FUNCTION_EXPANSIONS, MAX_NUMERIC_CHARS, block_extent
+from d8r.storage import MemoryStore
+from d8r.tui.app import D8RApp
+from d8r.tui.session import Session
 
 
 @pytest.mark.parametrize("clause", [
@@ -179,7 +179,7 @@ def test_malformed_function_templates_cannot_swallow_following_commands():
 
 def test_completion_survives_oversized_paste_and_persisted_cycles():
     install_legacy_cycle()
-    app = AnyqlApp()
+    app = D8RApp()
 
     async def drive():
         async with app.run_test(size=(120, 40)) as pilot:

@@ -36,7 +36,7 @@ from textual.message import Message
 from textual.widgets import OptionList, TextArea
 from textual.widgets.option_list import Option
 
-from anyql.query import (
+from d8r.query import (
     AGGREGATES,
     REGEX_OPS,
     SUBQUERY_OPS,
@@ -47,7 +47,7 @@ from anyql.query import (
     is_identifier,
     param_spans,
 )
-from anyql.query.functions import SCALAR_FUNCTIONS, ArgumentKind
+from d8r.query.functions import SCALAR_FUNCTIONS, ArgumentKind
 
 from .session import Session, looks_numeric
 

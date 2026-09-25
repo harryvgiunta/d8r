@@ -1,15 +1,17 @@
-# anyQL
+# D8R
+
+Pronounced “Datuhr” — a playful take on “data”.
 
 **A keyboard-first IDE for querying data — one document, any datasource, any
 dialect, right in your terminal.**
 
-anyQL is a real application, not a mockup. It is a pure-Python
+D8R is a real application, not a mockup. It is a pure-Python
 [Textual](https://textual.textualize.io) TUI: what you type is a document in a
 short `\command` language, that document is parsed into an AST, the AST builds a
 real [ibis](https://ibis-project.org) expression, and the rows you see come from
 real query execution on an in-process DuckDB — or, if you add one, on your own
 Cloudflare D1 database. There is no server to start, no browser, and no port to
-open. `uv run anyql` is the whole app.
+open. `uv run d8r` is the whole app.
 
 ## The model
 
@@ -40,13 +42,15 @@ document  →  datasource (which schema it points at)  →  dialect (what SQL it
 ## Install and run
 
 ```bash
+git clone https://github.com/harryvgiunta/d8r.git
+cd d8r
 uv sync          # create/refresh the project environment (.venv)
-uv run anyql     # launch the IDE
+uv run d8r     # launch the IDE
 ```
 
 Dependencies are declared in `pyproject.toml` and locked in `uv.lock`; nothing
 is installed globally, and every command runs in the project's `.venv`. Python
-`>=3.13` is required (pinned in `.python-version`). `uv run python -m anyql` is
+`>=3.13` is required (pinned in `.python-version`). `uv run python -m d8r` is
 the equivalent module form.
 
 A fresh session opens on the `demo` source with a real query already in the
@@ -55,7 +59,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 ## The screen
 
 ```
-┌ anyQL   [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ]  duckdb ───────────┐
+┌ D8R   [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ]  duckdb ───────────┐
 │ Schema              │ Document                                               │
 │  events  100 rows   │  \from events                                          │
 │   ▸ timestamp       │  \select event_type                                    │
@@ -98,8 +102,8 @@ for the current category. Tab/Shift+Tab switch panels; Left or Escape returns
 to the sidebar without losing the selected category. Escape from the sidebar
 closes Settings. Connection and provider forms return to the same page and row.
 
-Preferences are loaded from `~/.anyql/settings.json` and saved when changed.
-You can also edit the JSON while anyQL is closed; restart to load edits. Settings
+Preferences are loaded from `~/.d8r/settings.json` and saved when changed.
+You can also edit the JSON while D8R is closed; restart to load edits. Settings
 shows the actual file path. See [Configuration and backups](#configuration-and-backups)
 for the directory override, file format, and credential handling.
 
@@ -138,7 +142,7 @@ The provider form opens with that field focused. Edit an OpenAI-compatible
 **Chat Completions** base URL (including `/v1`), model, and masked API key, then
 choose **Save** to persist changes; **Cancel** or Escape discards them.
 A full `/chat/completions` URL also works. This calls your provider;
-anyQL does not host an endpoint or use OMP as a dependency. The separate OpenAI
+D8R does not host an endpoint or use OMP as a dependency. The separate OpenAI
 Responses API is not supported by this adapter.
 
 For the existing yolo setup, **Import yolo key** fills `https://yolo-auto.com/v1`,
@@ -265,9 +269,9 @@ Start over, a target/source switch, or exiting discards them. Copy anything need
 before doing so. Logs can contain schema, sample values, and query text; review
 them before sharing. There is no automatic log file.
 
-For capability investigations, inspect the attempted `validate_anyql` text and
+For capability investigations, inspect the attempted `validate_d8r` text and
 its error alongside the returned schema/capabilities. That validator checks the
-anyQL parser, not Ibis execution: rejection may identify a missing anyQL mapping
+D8R parser, not Ibis execution: rejection may identify a missing D8R mapping
 for an operation that Ibis supports. A parser-valid draft can still fail later
 during compilation or execution. Such Run errors remain in the Results pane;
 the AI diagnostic log does not execute proposals to diagnose them.
@@ -329,7 +333,7 @@ arguments you type yourself — the palette has no suggestions for them.
 
 Add `\distinct` to remove duplicate output rows; `\unique` is an alias:
 
-```anyql
+```d8r
 \from events
 \select event_type
 \distinct
@@ -346,7 +350,7 @@ work in function bodies, CTEs, and inline subqueries.
 Use Ibis string operations in `\select`, including nested calls and quoted
 literal arguments:
 
-```anyql
+```d8r
 \from events
 \select concat(upper(event_type), ':', string(user_id)) as label
 \select substr(path, 1) as route
@@ -397,7 +401,7 @@ A fresh `@` reopens a dismissed popup, unless IntelliSense is disabled.
 **Save** writes the function to local disk. **Run preview** (`ctrl+r`) saves
 and calls the function with the preview arguments; its rows do not enter History.
 Saved names, ordered parameters, descriptions, and bodies load automatically
-when anyQL starts. **Delete** (`ctrl+d`) removes the definition from disk too.
+when D8R starts. **Delete** (`ctrl+d`) removes the definition from disk too.
 Draft edits and AI **Apply** are autosaved separately in `workspace.json`, not
 committed as function definitions. Returning from the function editor refreshes
 IntelliSense at the existing caret, so newly saved calls appear without retyping;
@@ -411,7 +415,7 @@ The library's **How parameters work** panel gives a complete example. On the
 `demo` target, set **Name** to `events_above`, **Parameters** to `min_amount`
 (no `@` in that field), and **Body** to:
 
-```anyql
+```d8r
 \from events
 \where amount > @min_amount
 \select user_id, amount
@@ -492,9 +496,9 @@ databases can connect with zero tables; this form connects rather than provision
 For offline work, enter an existing SQLite database file in **Local snapshot**.
 This overrides the live fields and never syncs with Cloudflare. Snapshot paths
 are not remembered. No bundled snapshot is opened implicitly.
-The bundled `anyql/engine/d1/d1.sqlite` is entirely synthetic: three demo
+The bundled `d8r/engine/d1/d1.sqlite` is entirely synthetic: three demo
 stations and twelve temperature readings, with no production data or credentials.
-Regenerate it with `uv run python -m anyql.engine.make_data`; the generator
+Regenerate it with `uv run python -m d8r.engine.make_data`; the generator
 builds a fresh file rather than reusing pages from an existing database.
 
 Live sources ship their compiled SQLite SQL to Cloudflare's D1 REST API and run
@@ -505,15 +509,15 @@ logged or displayed unmasked. **Test connection** and **Cancel** save nothing.
 
 ## Configuration and backups
 
-The default home is `~/.anyql` on every platform (`%USERPROFILE%\.anyql` on
-Windows). Set `ANYQL_DATA_DIR` before launching to use another directory:
+The default home is `~/.d8r` on every platform (`%USERPROFILE%\.d8r` on
+Windows). Set `D8R_DATA_DIR` before launching to use another directory:
 
 ```powershell
-$env:ANYQL_DATA_DIR = "D:\anyql-home"
-uv run anyql
+$env:D8R_DATA_DIR = "D:\d8r-home"
+uv run d8r
 ```
 
-On macOS/Linux: `ANYQL_DATA_DIR=/path/to/anyql-home uv run anyql`.
+On macOS/Linux: `D8R_DATA_DIR=/path/to/d8r-home uv run d8r`.
 An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 
 | File | Saved contents |
@@ -562,15 +566,15 @@ outside the app take effect on restart, not through live reload.
 your workspace. They are plaintext, not encrypted.** In addition to credentials
 in settings/memory, workspace chats can contain schema, sampled data, query text,
 and unsent drafts. Keep backups private and never commit them to source control.
-Restore files into the chosen home while anyQL is closed. New directories/files
+Restore files into the chosen home while D8R is closed. New directories/files
 are owner-only on POSIX; Windows uses filesystem ACLs. Result buffers, temporary
 tables, transactions, partial AI streams and diagnostic logs remain memory-only.
 
 For an existing installation, copy `memory.json` from the former platform data
-directory into `~/.anyql`, or point `ANYQL_DATA_DIR` at that existing directory.
-Former defaults were `%LOCALAPPDATA%\anyql` on Windows,
-`~/Library/Application Support/anyql` on macOS, and `$XDG_DATA_HOME/anyql` (or
-`~/.local/share/anyql`) on Linux. No files are moved automatically. Old profiles
+directory into `~/.d8r`, or point `D8R_DATA_DIR` at that existing directory.
+Former defaults were `%LOCALAPPDATA%\d8r` on Windows,
+`~/Library/Application Support/d8r` on macOS, and `$XDG_DATA_HOME/d8r` (or
+`~/.local/share/d8r`) on Linux. No files are moved automatically. Old profiles
 without tokens load unchanged; their next **Add**/**Connect** saves the supplied token.
 
 Writes use a temporary file, a save lock, and atomic replacement. Failed writes
@@ -623,7 +627,7 @@ editor. AI context reads use the same connection reservation.
 
 ## The language
 
-```anyql
+```d8r
 \from events
 \select event_type
 \select sum(amount) as total
@@ -685,8 +689,8 @@ terminal are needed to check a change.
 ## Layout
 
 ```
-anyql/
-  __main__.py   `uv run python -m anyql`
+d8r/
+  __main__.py   `uv run python -m d8r`
   query/        pure language layer (parser, AST, alias rules, immutable schema context)
   engine/       ibis/DuckDB execution, datasource registry, dialects, D1 client,
                 transactions/savepoints/temp tables (tx.py), deterministic demo

@@ -1,4 +1,4 @@
-"""`python -m anyql` opens the data IDE in this terminal."""
+"""`python -m d8r` opens the data IDE in this terminal."""
 
 from .tui.app import main
 

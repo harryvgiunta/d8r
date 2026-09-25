@@ -1,4 +1,4 @@
-"""Datasource registry for anyQL's Python engine.
+"""Datasource registry for D8R's Python engine.
 
 A datasource is a named connection carrying its own dataset schemas. `demo`
 is the bundled Parquet directory executed on a real in-process DuckDB; other
@@ -28,7 +28,7 @@ import ibis
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from anyql.query.functions import SCALAR_FUNCTIONS
+from d8r.query.functions import SCALAR_FUNCTIONS
 
 from .d1api import CloudflareD1, schema_connection
 from .expression import PayloadError, compile_sql
@@ -365,7 +365,7 @@ class DataSource:
     dir: Path
     con: object = None
     datasets: dict[str, dict] = field(default_factory=dict)
-    # A live Cloudflare D1 connection (anyql.engine.d1api.CloudflareD1) when
+    # A live Cloudflare D1 connection (d8r.engine.d1api.CloudflareD1) when
     # kind == "d1-live". Its presence tells the caller to ship compiled SQLite
     # SQL over the D1 HTTP API instead of executing on a local `con`.
     d1: object = None
@@ -514,9 +514,9 @@ def load(
 #   * live (`kind="d1-live"`): the database reached over Cloudflare's HTTPS
 #     API with the user's own credentials. Real schemas are pulled into unbound
 #     ibis tables so payloads compile to SQLite SQL exactly like every other
-#     source; the SQL is then run back through the API (`anyql.engine.execute`).
+#     source; the SQL is then run back through the API (`d8r.engine.execute`).
 #
-# A snapshot is the user's own file (outside `anyql/engine/data/`, never
+# A snapshot is the user's own file (outside `d8r/engine/data/`, never
 # regenerated). Live clients hold credentials in memory for requests; explicit
 # Add in the TUI saves the profile and token through the local storage layer.
 # ---------------------------------------------------------------------------
@@ -536,7 +536,7 @@ def _ingest_sqlite(source: DataSource) -> DataSource:
     # the thread check off — the same single shared, in-process connection the
     # demo source already relies on. `isolation_level=None` is autocommit: the
     # driver stops wrapping statements in transactions of its own, which leaves
-    # `\begin`/`\savepoint`/`\commit` (anyql.engine.tx) as the only transaction
+    # `\begin`/`\savepoint`/`\commit` (d8r.engine.tx) as the only transaction
     # control on the connection. The snapshot is opened read-only from the
     # user's point of view (queries never write; a temp table lives in SQLite's
     # temp schema, not in the database file).
@@ -596,7 +596,7 @@ def add_d1_live_source(
     The database is reached over its HTTPS API, never opened locally. Its real
     schemas are pulled once into unbound ibis tables — enough for the explorer
     and for compiling every payload to SQLite SQL; the SQL is then run back
-    through the API (see `anyql.engine.execute`). A bad token or unknown database
+    through the API (see `d8r.engine.execute`). A bad token or unknown database
     raises `D1Error` during introspection, before anything registers.
     """
     d1 = client or CloudflareD1(account_id=account_id, api_token=api_token, database=database)

@@ -10,9 +10,9 @@ document. No terminal and no network: the `Session` seams its own schema.
 
 from __future__ import annotations
 
-from anyql.query import parse_body, parse_query
-from anyql.tui.palette import view_for
-from anyql.tui.session import Session
+from d8r.query import parse_body, parse_query
+from d8r.tui.palette import view_for
+from d8r.tui.session import Session
 
 HOT_BODY = "\\from events\n\\where amount > @min_amount\n\\select user_id, amount"
 

@@ -1,4 +1,4 @@
-"""Shared alias semantics for anyQL — ported from an earlier TypeScript build.
+"""Shared alias semantics for D8R — ported from an earlier TypeScript build.
 
 The aggregate auto-alias rule is one implementation shared by the payload
 builder, order-target resolution, and `\\order` completion. The engine

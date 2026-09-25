@@ -2,13 +2,13 @@
 
 A D1 database *is* SQLite: Cloudflare runs a real SQLite engine and answers SQL
 through a small REST API (`/accounts/<id>/d1/database/<db>/query|raw`). So a
-remote D1 source reuses every piece of anyQL's query machinery unchanged: the
+remote D1 source reuses every piece of D8R's query machinery unchanged: the
 payload is built against *unbound* ibis tables carrying the D1 database's real
 schemas, compiled to the SQLite dialect, and the resulting SQL text is POSTed to
 the API — which runs it on the actual D1 engine and answers with the rows.
 
 This module owns the HTTPS round-trip and schema introspection. User queries
-come from `anyql.engine.expression`; discovery issues read-only SQLite SQL.
+come from `d8r.engine.expression`; discovery issues read-only SQLite SQL.
 
 The client holds the token in memory and uses it per request; it never persists
 or renders credentials. Explicit Add in the TUI saves credentials through the

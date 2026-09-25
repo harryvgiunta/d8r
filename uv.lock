@@ -24,7 +24,7 @@ wheels = [
 ]
 
 [[package]]
-name = "anyql"
+name = "d8r"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

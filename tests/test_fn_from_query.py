@@ -7,10 +7,10 @@ import sqlite3
 
 from textual.widgets import Input, OptionList, Select, TextArea
 
-from anyql.engine import add_sqlite_source
-from anyql.tui.app import AnyqlApp
-from anyql.tui.fn import FnScreen, NEW
-from anyql.tui.session import Session
+from d8r.engine import add_sqlite_source
+from d8r.tui.app import D8RApp
+from d8r.tui.fn import FnScreen, NEW
+from d8r.tui.session import Session
 
 
 async def pick_function(screen, pilot, name):
@@ -33,7 +33,7 @@ def test_query_draft_saves_explicitly_and_calls_on_the_captured_source(tmp_path)
     document = "\\from readings\n\\where amount > 20\n\\select id, amount\n"
 
     async def scenario():
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(150, 58)) as pilot:
             app.editor.load_text(document)
             await pilot.pause()
@@ -77,7 +77,7 @@ def test_button_draft_neither_infers_parameters_nor_saves_invalid_body_on_cancel
     document = "\\from events\n\\where amount > @minimum\n\\select user_id"
 
     async def scenario():
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(150, 58)) as pilot:
             app.editor.load_text(document)
             await pilot.pause()
@@ -106,7 +106,7 @@ def test_palette_action_copies_the_query_not_its_invocation():
     document = "\\from events\n\\select user_id\n\\limit 2\n"
 
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(150, 58)) as pilot:
             app.editor.load_text(document + "\\Query")
             app.editor.move_cursor((3, len("\\Query")))
@@ -136,7 +136,7 @@ def test_prefill_never_overwrites_saved_entries_or_later_new_drafts():
     persisted = session.storage_path.read_bytes()
 
     async def scenario():
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(150, 58)) as pilot:
             app.editor.load_text(document)
             await pilot.pause()

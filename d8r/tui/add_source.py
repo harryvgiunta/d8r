@@ -15,7 +15,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
-from anyql.engine import D1Error, DataSource, PayloadError
+from d8r.engine import D1Error, DataSource, PayloadError
 
 
 class AddSourceModal(ModalScreen):

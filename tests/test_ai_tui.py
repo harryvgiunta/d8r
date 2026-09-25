@@ -8,17 +8,17 @@ import threading
 import httpx
 from textual.widgets import Button, Input, OptionList, Static, TextArea
 
-from anyql.ai import client
-from anyql.ai.client import AIConfig
-from anyql.ai.context import AIContext
-from anyql.tui.ai import AIPanel
-from anyql.tui.app import AnyqlApp
-from anyql.tui.fn import FnScreen
-from anyql.tui.session import Session
-from anyql.tui.settings import AIProviderScreen, SettingsScreen
+from d8r.ai import client
+from d8r.ai.client import AIConfig
+from d8r.ai.context import AIContext
+from d8r.tui.ai import AIPanel
+from d8r.tui.app import D8RApp
+from d8r.tui.fn import FnScreen
+from d8r.tui.session import Session
+from d8r.tui.settings import AIProviderScreen, SettingsScreen
 
 PROPOSAL = "\\from events\n\\select event_type\n\\limit 2"
-ANSWER = "Here is the replacement.\n```anyql\n" + PROPOSAL + "\n```"
+ANSWER = "Here is the replacement.\n```d8r\n" + PROPOSAL + "\n```"
 
 
 def frame(delta: dict, finish=None) -> bytes:
@@ -61,7 +61,7 @@ def configured():
 
 def test_settings_save_cancel_and_masked_key():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(150, 58)) as pilot:
             await pilot.press("ctrl+comma")
             screen = app.screen
@@ -94,7 +94,7 @@ def test_settings_save_cancel_and_masked_key():
             form.query_one("#ai-sample-rows", Input).value = "1"
             await pilot.press("escape")
             assert app.session.ai_config.model == "test"
-        restored = AnyqlApp()
+        restored = D8RApp()
         async with restored.run_test(size=(150, 58)) as pilot:
             restored.push_screen(AIProviderScreen(restored))
             await pilot.pause()
@@ -115,7 +115,7 @@ def test_settings_edits_selected_provider_field_and_returns_to_it():
     async def scenario():
         session = configured()
         session.update_settings(ai=session.ai_config)
-        app = AnyqlApp(session=session)
+        app = D8RApp(session=session)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.press("ctrl+comma")
             screen = app.screen
@@ -155,7 +155,7 @@ def test_settings_edits_selected_provider_field_and_returns_to_it():
 
 def test_provider_fields_remain_keyboard_reachable_on_small_screen():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(AIProviderScreen(app))
             await pilot.pause()
@@ -182,7 +182,7 @@ def test_invalid_provider_budgets_block_atomic_save_without_exposing_values():
         session.update_settings(ai=session.ai_config)
         original = session.ai_config
         saved = session.settings_path.read_bytes()
-        app = AnyqlApp(session=session)
+        app = D8RApp(session=session)
         async with app.run_test(size=(80, 24)) as pilot:
             app.push_screen(AIProviderScreen(app))
             await pilot.pause()
@@ -222,7 +222,7 @@ def test_invalid_provider_budgets_block_atomic_save_without_exposing_values():
 
 def test_provider_save_failure_keeps_form_and_previous_settings():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(150, 58)) as pilot:
             app.push_screen(AIProviderScreen(app))
             await pilot.pause()
@@ -246,10 +246,10 @@ def test_provider_save_failure_keeps_form_and_previous_settings():
 
 def test_import_provider_then_cancel_does_not_save(monkeypatch):
     config = AIConfig(base_url="https://provider.invalid/v1", model="imported", api_key="imported-private-key")
-    monkeypatch.setattr("anyql.tui.settings.import_yolo_config", lambda: config)
+    monkeypatch.setattr("d8r.tui.settings.import_yolo_config", lambda: config)
 
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(150, 58)) as pilot:
             app.push_screen(AIProviderScreen(app))
             await pilot.pause()
@@ -298,7 +298,7 @@ def test_inline_stream_tools_and_apply_only(monkeypatch):
         install_provider(monkeypatch, provider)
         session = configured()
         session.run("\\from events\n\\select user_id\n\\limit 1")
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
             app.editor.load_text("")
             app.editor.focus()
@@ -351,7 +351,7 @@ def test_failed_tool_attempts_remain_copyable_without_entering_chat_history(monk
         requests.append(body)
         if len(requests) == 1:
             call = {"index": 0, "id": "validate-attempt", "type": "function", "function": {
-                "name": "validate_anyql", "arguments": json.dumps({"text": attempted}),
+                "name": "validate_d8r", "arguments": json.dumps({"text": attempted}),
             }}
             data = frame({"tool_calls": [call]}, "tool_calls") + b"data: [DONE]\n\n"
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data)
@@ -367,7 +367,7 @@ def test_failed_tool_attempts_remain_copyable_without_entering_chat_history(monk
         session.ai_config = AIConfig("https://provider.invalid/v1", "test", "test-secret", max_attempts=1)
         session.d1_profiles = [{"account_id": "saved-account", "database": "11111111-2222-3333-4444-555555555555",
                                 "display": "Saved D1", "api_token": "d1-private-token"}]
-        app = AnyqlApp(session)
+        app = D8RApp(session)
         async with app.run_test(size=(120, 40)) as pilot:
             app.editor.focus()
             await pilot.press("\\", "A", "I", "enter")
@@ -424,7 +424,7 @@ def test_cancellation_stale_edits_and_source_isolation(monkeypatch):
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=Pending()) if len(requests) == 1 else httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion())
 
         install_provider(monkeypatch, provider)
-        app = AnyqlApp(configured())
+        app = D8RApp(configured())
         async with app.run_test(size=(160, 62)) as pilot:
             app.action_ai()
             panel = app.query_one("#workspace-ai", AIPanel)
@@ -454,7 +454,7 @@ def test_cancellation_stale_edits_and_source_isolation(monkeypatch):
 
 
 def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(monkeypatch):
-    from anyql.ai import context as context_module
+    from d8r.ai import context as context_module
 
     started = threading.Event()
     release = threading.Event()
@@ -477,7 +477,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
     install_provider(monkeypatch, provider)
 
     async def scenario():
-        app = AnyqlApp(configured())
+        app = D8RApp(configured())
         async with app.run_test(size=(160, 62)) as pilot:
             app.editor.load_text(PROPOSAL)
             app.action_ai()
@@ -518,14 +518,14 @@ def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
 
     def provider(request):
         requests.append(json.loads(request.content))
-        answer = "```json\n" + json.dumps(metadata) + "\n```\n```anyql\n" + body + "\n```"
+        answer = "```json\n" + json.dumps(metadata) + "\n```\n```d8r\n" + body + "\n```"
         return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion(answer))
 
     install_provider(monkeypatch, provider)
 
     async def scenario():
         from textual.widgets import Select
-        app = AnyqlApp(configured())
+        app = D8RApp(configured())
         async with app.run_test(size=(100, 35)) as pilot:
             app.action_fn()
             await pilot.pause()
@@ -607,7 +607,7 @@ def test_complete_function_proposals_reject_invalid_or_conflicting_definitions()
 
     def proposal(name="generated", parameters=None, body=PROPOSAL):
         metadata = {"name": name, "description": "Example", "parameters": parameters or [], "arguments": ""}
-        return context.read_proposal("```json\n" + json.dumps(metadata) + "\n```\n```anyql\n" + body + "\n```")
+        return context.read_proposal("```json\n" + json.dumps(metadata) + "\n```\n```d8r\n" + body + "\n```")
 
     assert context.validate_replacement(proposal()) is None
     assert context.validate_replacement(proposal(name="existing")) is not None

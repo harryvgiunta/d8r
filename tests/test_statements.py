@@ -17,8 +17,8 @@ from types import SimpleNamespace
 import ibis
 import pytest
 
-from anyql.engine import DataSource, add_sqlite_source, capabilities_for, datasources, expression, tx
-from anyql.tui.session import Session
+from d8r.engine import DataSource, add_sqlite_source, capabilities_for, datasources, expression, tx
+from d8r.tui.session import Session
 from tests.conftest import DATA_DIR
 
 

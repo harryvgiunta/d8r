@@ -1,14 +1,14 @@
-"""Deterministic data generator for anyQL's engine.
+"""Deterministic data generator for D8R's engine.
 
 Pure arithmetic — no randomness anywhere, so re-running reproduces byte-identical
 Parquet and SQLite files. Run from the repo root:
 
-    python -m anyql.engine.make_data       # or: python anyql/engine/make_data.py
+    python -m d8r.engine.make_data       # or: python d8r/engine/make_data.py
 
 Outputs:
-- anyql/engine/data/events.parquet, anyql/engine/data/users.parquet
-- anyql/engine/data/<mock-id>/*.parquet (mock datasource mirrors)
-- anyql/engine/d1/d1.sqlite (invented stations and temperature readings)
+- d8r/engine/data/events.parquet, d8r/engine/data/users.parquet
+- d8r/engine/data/<mock-id>/*.parquet (mock datasource mirrors)
+- d8r/engine/d1/d1.sqlite (invented stations and temperature readings)
 - tests/fixtures/expected_schema.json, expected_rows.json,
   expected_mock_rows.json
 """
@@ -122,12 +122,12 @@ def write_d1_snapshot(path: Path | None = None) -> Path:
 
 def main() -> None:
     try:
-        from anyql.engine import datasources
-        from anyql.engine.execute import execute
+        from d8r.engine import datasources
+        from d8r.engine.execute import execute
     except ImportError:  # direct-script execution: make repo root importable
         sys.path.insert(0, str(REPO_ROOT))
-        from anyql.engine import datasources
-        from anyql.engine.execute import execute
+        from d8r.engine import datasources
+        from d8r.engine.execute import execute
 
     data_dir = datasources.DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -190,5 +190,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Works as `python anyql/engine/make_data.py` and `python -m anyql.engine.make_data`.
+    # Works as `python d8r/engine/make_data.py` and `python -m d8r.engine.make_data`.
     main()

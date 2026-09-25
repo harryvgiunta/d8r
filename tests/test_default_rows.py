@@ -8,11 +8,11 @@ import json
 import pytest
 from textual.widgets import Button, DataTable, Input, OptionList, Static, TextArea
 
-from anyql.ai.client import AIConfig
-from anyql.ai.context import AIContext
-from anyql.tui.app import AnyqlApp
-from anyql.tui.session import Session
-from anyql.tui.settings import DefaultRowsScreen, SettingsScreen
+from d8r.ai.client import AIConfig
+from d8r.ai.context import AIContext
+from d8r.tui.app import D8RApp
+from d8r.tui.session import Session
+from d8r.tui.settings import DefaultRowsScreen, SettingsScreen
 
 
 DOCUMENT = "\\from events\n\\select user_id\n\\order user_id asc"
@@ -131,7 +131,7 @@ async def press_form_button(app, pilot, selector):
 
 def test_general_rows_form_saves_cancels_and_restores_at_80_by_24():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()
             app.editor.load_text(DOCUMENT)
@@ -175,7 +175,7 @@ def test_general_rows_form_saves_cancels_and_restores_at_80_by_24():
 
 def test_invalid_and_stale_form_saves_keep_draft_and_previous_setting():
     async def scenario():
-        app = AnyqlApp()
+        app = D8RApp()
         app.session.update_settings(default_rows=12)
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.pause()

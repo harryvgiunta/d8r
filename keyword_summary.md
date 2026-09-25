@@ -1,7 +1,7 @@
 # Keyword Tokens and Regex Patterns from parser.py
 
 This file documents all keyword tokens and their regex patterns defined in
-`anyql/query/parser.py`.
+`d8r/query/parser.py`.
 
 ## Token Definitions
 

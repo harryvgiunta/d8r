@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from anyql.engine import expression
-from anyql.engine.execute import execute
+from d8r.engine import expression
+from d8r.engine.execute import execute
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 

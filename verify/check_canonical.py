@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from anyql.query import parse_query  # noqa: E402  (path set above)
+from d8r.query import parse_query  # noqa: E402  (path set above)
 
 
 def sort_deep(value):
@@ -30,7 +30,7 @@ def canonical(value) -> str:
 
 
 def main() -> int:
-    doc = (ROOT / "spec" / "canonical-query.anyql").read_text(encoding="utf-8").replace("\r\n", "\n")
+    doc = (ROOT / "spec" / "canonical-query.d8r").read_text(encoding="utf-8").replace("\r\n", "\n")
     want = json.loads((ROOT / "spec" / "canonical-query.ast.json").read_text(encoding="utf-8"))
     got = parse_query(doc).to_json()
     if canonical(got) == canonical(want):

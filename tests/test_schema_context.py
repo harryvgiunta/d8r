@@ -4,10 +4,10 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from anyql.engine.execute import execute
-from anyql.query import Capabilities, ColumnDef, FnDef, SchemaContext, TableDef, parse_query, payload_from_ast
-from anyql.tui.palette import view_for
-from anyql.tui.session import Session
+from d8r.engine.execute import execute
+from d8r.query import Capabilities, ColumnDef, FnDef, SchemaContext, TableDef, parse_query, payload_from_ast
+from d8r.tui.palette import view_for
+from d8r.tui.session import Session
 
 
 def test_sessions_keep_their_own_datasets_and_function_signatures(sources, tmp_path):

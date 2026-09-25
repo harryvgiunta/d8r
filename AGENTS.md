@@ -1,8 +1,8 @@
-# anyQL — agent guide
+# D8R — agent guide
 
 ## What this repo is
 
-anyQL is the **actual application**: a keyboard-first **IDE for manipulating
+D8R is the **actual application**: a keyboard-first **IDE for manipulating
 data through Ibis**, running entirely in this terminal as a
 [Textual](https://textual.textualize.io) TUI. It is a code-IDE interaction model
 (one document, a `\` command palette, contextual completion, results/SQL/history
@@ -17,22 +17,22 @@ the user explicitly accepts with Apply.
 
 Three layers, one direction:
 
-- **Language** (`anyql/query/`) — `parse_query(doc, schema=...)` is a pure
+- **Language** (`d8r/query/`) — `parse_query(doc, schema=...)` is a pure
   function of document text and an immutable schema context; `payload_from_ast`
   maps the AST to the engine payload.
-- **Engine** (`anyql/engine/`) — in-process [ibis](https://ibis-project.org)
+- **Engine** (`d8r/engine/`) — in-process [ibis](https://ibis-project.org)
   over DuckDB: payload → expression (`build`) → SQL (`compile_sql`) → rows
   (`execute`). No SQL is hand-written anywhere.
-- **TUI** (`anyql/tui/`) — Textual widgets that *consume* the two layers above.
-  `Session` (`anyql/tui/session.py`) is the headless core; `app.py` wires it to
+- **TUI** (`d8r/tui/`) — Textual widgets that *consume* the two layers above.
+  `Session` (`d8r/tui/session.py`) is the headless core; `app.py` wires it to
   widgets; `palette.py` decides what `\` offers.
 
 ## Hard boundaries (never add these)
 
 | Off-limits | Do instead |
 | --- | --- |
-| Real database connections | DuckDB in-process over the Parquet under `anyql/engine/data/` |
-| An HTTP server or a browser UI | **The TUI is the app.** `uv run anyql`; nothing listens on a port |
+| Real database connections | DuckDB in-process over the Parquet under `d8r/engine/data/` |
+| An HTTP server or a browser UI | **The TUI is the app.** `uv run d8r`; nothing listens on a port |
 | Authentication | No login, no users, no session identity |
 | Credentials handling | Only the user-authorized D1 and AI-provider keys below; save locally as authorized, never log or echo them unmasked |
 | Persistence | Only custom functions, D1 profiles/tokens, app/AI settings, and the user-authorized workspace/history state below persist; runtime database/results state stays in memory |
@@ -41,11 +41,11 @@ Three layers, one direction:
 If a task seems to require one of these, it is out of scope. Build the *UI
 affordance* for it, not the feature.
 
-**User-authorized exception — Cloudflare D1.** Pointing anyQL at a real D1
+**User-authorized exception — Cloudflare D1.** Pointing D8R at a real D1
 database was an explicit, deliberate override of the rows above, so it is scoped
 exactly as narrowly as it is implemented today and nothing else may lean on it:
 `kind="d1-live"` reaches Cloudflare's official D1 REST API
-(`anyql/engine/d1api.py`) using credentials the *user* pastes into the
+(`d8r/engine/d1api.py`) using credentials the *user* pastes into the
 add-source modal, and `kind="d1"` opens a local `.sqlite` snapshot of a D1
 database through ibis's SQLite backend, entirely in-process. There is still no
 login/user/session concept. Credentials persist only through the local storage exception below.
@@ -53,18 +53,18 @@ The live path keeps the architecture intact: payloads build against *unbound*
 ibis tables carrying the D1 database's real schemas and compile to SQLite SQL
 exactly like every other source; only the execution seam differs — the compiled
 SQLite SQL is POSTed to D1's `/query`|`/raw` endpoints instead of run on a local
-connection (`execute_remote` in `anyql/engine/execute.py`). The client uses the
+connection (`execute_remote` in `d8r/engine/execute.py`). The client uses the
 token per request; explicit **Add** saves it locally for reuse. Tokens are never
 logged or rendered unmasked (the modal's API-token input is `password=True`,
 and the built source never renders it). Startup never connects automatically.
 
-**User-authorized exception — local configuration.** `anyql/storage.py` stores
+**User-authorized exception — local configuration.** `d8r/storage.py` stores
 custom functions (name, ordered parameters, body, description) and D1 profiles
 (account ID, resolved database UUID, display label, API token) in `memory.json`.
 `settings.json` stores Intellisense, pane visibility, selected source/dialect,
 default returned rows, and AI provider URL/model/API key/tool-round/call/sample
 limits/attempts/timeout. Configuration files are editable JSON under
-`~/.anyql` on every platform; `ANYQL_DATA_DIR` overrides that home, and explicit
+`~/.d8r` on every platform; `D8R_DATA_DIR` overrides that home, and explicit
 `Session(data_dir=...)` wins. Settings displays the resolved settings path.
 These files and backups contain plaintext secrets: protect them. New directories
 and files use owner-only POSIX modes; Windows relies on filesystem ACLs.
@@ -75,7 +75,7 @@ Saved profiles fill the masked token; legacy token-free profiles still load.
 Toggle preferences save on change; AI provider and default-row forms require explicit Save.
 Import only fills the form. Unavailable workspace targets restore as disconnected,
 never silently redirected to another source. No automatic directory migration:
-copy existing files or point ANYQL_DATA_DIR at their directory. Atomic replacement
+copy existing files or point D8R_DATA_DIR at their directory. Atomic replacement
 and stale-session detection protect all local files; a lock or
 temp file left by a crashed save clears itself after a minute. Invalid/unreadable
 files remain untouched, surface a safe UI error, and block saves to that file
@@ -105,13 +105,13 @@ Compile apply it to the top-level payload only when no explicit `\limit` exists.
 Explicit limits (including 0) win; `\temp` materialization is never implicitly
 capped. Text and AST are unchanged, and AI sample reads retain their own limits.
 
-**User-authorized exception — AI inference.** `anyql/ai/client.py` calls a
+**User-authorized exception — AI inference.** `d8r/ai/client.py` calls a
 user-configured OpenAI-compatible Chat Completions provider using the existing
 `httpx` dependency. Settings owns URL/model/masked key configuration, persisted
 only on Save; the optional yolo import reads the environment or `~/.omp/agent/.env`
 without modifying it. No OMP dependency or HTTP server; chats persist only under
 the durable workspace exception above.
-`anyql/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
+`d8r/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
 history, function definitions, and parser validation; it grants no shell/file or
 arbitrary query-execution tool. `\AI` opens an in-layout chat; the function form's
 Make with AI uses the same panel. Streaming is cancellable, retries and tool
@@ -132,8 +132,8 @@ sample rows, history, and submitted drafts may be sent to the configured provide
 - **No network in the UI.** No TUI module imports a server framework, and
   importing the app loads none — `tests/test_tui.py::test_the_tui_reaches_no_http_server`
   enforces exactly that, structurally and at import time. Network edges are the
-  live-D1 client inside the engine and the AI-provider client in `anyql/ai/`.
-- **Schema state lives at one seam.** `anyql/query/schema.py` defines the immutable
+  live-D1 client inside the engine and the AI-provider client in `d8r/ai/`.
+- **Schema state lives at one seam.** `d8r/query/schema.py` defines the immutable
   `SchemaContext` the parser's validation and palette both read.
   `Session.refresh_schema()` replaces its session-owned snapshot of tables,
   capabilities, column pool, and functions on source/schema/function changes.
@@ -148,10 +148,10 @@ sample rows, history, and submitted drafts may be sent to the configured provide
 
 ## The datasource registry
 
-`anyql/engine/datasources.py` owns it; `load()` builds it with no arguments
+`d8r/engine/datasources.py` owns it; `load()` builds it with no arguments
 (paths resolve from the engine's own directory, never the working directory):
 
-- **`demo`** — the bundled Parquet under `anyql/engine/data/` (`events` 100
+- **`demo`** — the bundled Parquet under `d8r/engine/data/` (`events` 100
   rows, `users` 25 rows) on a real in-process DuckDB. Default dialect `duckdb`.
 - **Four vendor mocks** — `postgres` (orders, customers), `mysql` (products,
   reviews), `snowflake` (campaigns, spend_log), `bigquery` (web_sessions,
@@ -177,8 +177,8 @@ independent rendering choice: any document can be compiled for any target, and
 ## Layout
 
 ```
-anyql/
-  __main__.py     `uv run python -m anyql` — opens the IDE in this terminal
+d8r/
+  __main__.py     `uv run python -m d8r` — opens the IDE in this terminal
   query/          pure language layer: parser.py (grammar + errors + payload +
                   block/clause lookup), ast.py (types + to_json), alias.py
                   (derived output names), schema.py (the registry seam)
@@ -197,12 +197,12 @@ anyql/
                   library + editor), add_source.py (the
                   `ctrl+o` modal), app.tcss
 tests/            pytest suite (298: 255 query/engine + 43 TUI) + fixtures/
-spec/             canonical-query.anyql ↔ canonical-query.ast.json (the contract)
-docs/AST.md       language contract — read before touching anyql/query/
+spec/             canonical-query.d8r ↔ canonical-query.ast.json (the contract)
+docs/AST.md       language contract — read before touching d8r/query/
 verify/           check_canonical.py — the language gate
 pyproject.toml    project metadata + pinned deps (runtime: ibis-framework[duckdb],
                   pyarrow, pyarrow-hotfix, httpx, textual; dev group: pytest),
-                  and the `anyql` console script (`anyql.tui.app:main`)
+                  and the `d8r` console script (`d8r.tui.app:main`)
 uv.lock           the resolved lockfile — `uv sync` installs exactly this
 .python-version   the interpreter pin (Python >=3.13)
 ```
@@ -215,10 +215,10 @@ command runs in the project's `.venv`.
 
 ```bash
 uv sync                                      # create/refresh the project environment (.venv)
-uv run anyql                                 # launch the IDE in this terminal
+uv run d8r                                 # launch the IDE in this terminal
 uv run pytest -q                             # the whole suite (298 tests)
 uv run python verify/check_canonical.py      # language contract gate → prints MATCH
-uv run python -m anyql.engine.make_data      # regenerate demo Parquet + fixtures
+uv run python -m d8r.engine.make_data      # regenerate demo Parquet + fixtures
 ```
 
 Dependencies are declared in `pyproject.toml` (runtime pins plus a `pytest` dev
@@ -243,11 +243,11 @@ only dependency records, and there is no second requirements file.
 
 ## Data conventions
 
-- Datasets are deterministic Parquet under `anyql/engine/data/` — demo files at
+- Datasets are deterministic Parquet under `d8r/engine/data/` — demo files at
   the root (`events.parquet`, `users.parquet`), mock mirrors under
   `data/<datasource-id>/`. Pure arithmetic, zero randomness: regenerating with
-  `uv run python -m anyql.engine.make_data` produces byte-identical files.
-- Add a demo dataset by dropping a Parquet file into `anyql/engine/data/`
+  `uv run python -m d8r.engine.make_data` produces byte-identical files.
+- Add a demo dataset by dropping a Parquet file into `d8r/engine/data/`
   (optionally with a `CATALOG` entry in `datasources.py` for its description);
   add a mock by extending `MOCKS` in `datasources.py` — `load()` calls
   `ensure_mock_data`, so missing mirrors are written on demand. Discovery,
@@ -257,10 +257,10 @@ only dependency records, and there is no second requirements file.
   three written by `make_data.py`) plus the window/case/CTE/join/alias/set-op
   row fixtures.
 - **The canonical fixture pair is the language contract:**
-  `spec/canonical-query.anyql` ↔ `spec/canonical-query.ast.json`. Parser
+  `spec/canonical-query.d8r` ↔ `spec/canonical-query.ast.json`. Parser
   semantics changes update both files and `docs/AST.md` together, and must keep
   `verify/check_canonical.py` printing `MATCH`.
-- The shipped D1 snapshot (`anyql/engine/d1/d1.sqlite`) contains only synthetic
+- The shipped D1 snapshot (`d8r/engine/d1/d1.sqlite`) contains only synthetic
   `stations` (3 rows) and `readings` (12 rows). `make_data.py` builds a fresh
   SQLite file and atomically replaces the destination, never opening or copying
   an old snapshot. Never bundle production exports, PII, or authentication data.
@@ -268,7 +268,7 @@ only dependency records, and there is no second requirements file.
 
 ## Keybindings (copied from the code — do not invent)
 
-App-level, `anyql/tui/app.py:223-232`:
+App-level, `d8r/tui/app.py:223-232`:
 
 | Keys | Action | Source |
 | --- | --- | --- |
@@ -279,7 +279,7 @@ App-level, `anyql/tui/app.py:223-232`:
 | `ctrl+o` | Add a data source (the D1 modal) | `app.py:228` |
 | `ctrl+comma` | Settings — the full-screen menu, and the way back when the Intellisense switch has the palette shut | `app.py:231` |
 
-While the focus is in the document pane, `anyql/tui/app.py:62-71`:
+While the focus is in the document pane, `d8r/tui/app.py:62-71`:
 
 | Keys | Action | Source |
 | --- | --- | --- |
@@ -289,16 +289,16 @@ While the focus is in the document pane, `anyql/tui/app.py:62-71`:
 | `ctrl+a` | Select the whole document (TextArea would go to line start) | `app.py:69` |
 | `tab` | Accept the highlighted suggestion — it never moves focus | `app.py:70` |
 
-Results explorer, `anyql/tui/app.py:158-160`:
+Results explorer, `d8r/tui/app.py:158-160`:
 
 | Keys | Action | Source |
 | --- | --- | --- |
 | `shift+left` / `shift+right` | Narrow / widen the column under the cell cursor | `app.py:159-160` |
 
-Add-source modal, `anyql/tui/add_source.py:27`: `escape` cancels (registers
-nothing). Settings menu, `anyql/tui/settings.py:90`: `escape` backs out one
+Add-source modal, `d8r/tui/add_source.py:27`: `escape` cancels (registers
+nothing). Settings menu, `d8r/tui/settings.py:90`: `escape` backs out one
 level, and leaves Settings from the root. Function library (`\fn`),
-`anyql/tui/fn.py`: `ctrl+r` previews the selected function (its grid shows the
+`d8r/tui/fn.py`: `ctrl+r` previews the selected function (its grid shows the
 call's rows, and a preview never lands in History), `ctrl+d` deletes it, `escape`
 back out. Clicking a palette row accepts it,
 like Enter on the highlight (`app.py` `_palette_clicked`).
@@ -373,7 +373,7 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   line start, so `EditorPane` claims the key for the same reason.
 - **A clause command takes its own line — or the line its clause has.**
   Accepting `\where` (or any clause command) asks `clause_line`
-  (`anyql/query/parser.py:286`) for that clause in the block the caret is
+  (`d8r/query/parser.py:286`) for that clause in the block the caret is
   editing: found, the caret goes there and the document is untouched; not found,
   the command breaks the line first. `\open` is `\from`, and `\unique` is
   `\distinct`; a repeated clause answers with its last line; a `\with` body
@@ -409,7 +409,7 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   dropped). Anything that is not an equality correlation is refused by name —
   never approximated — and a body table may not reuse a name from the left, or
   every reference to it would be ambiguous (`duplicate table identifier`). The
-  body's ordering columns are re-projected under `_anyql_order_N` names first:
+  body's ordering columns are re-projected under `_d8r_order_N` names first:
   a window frame may only depend on one relation.
 - **`\temp` is `CREATE TEMPORARY TABLE … AS`** around ibis' own rendering of the
   query, and the rows the pane shows are read back *from the table*. It is the
@@ -432,7 +432,7 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   EXISTS` with **no name**, so `drop_table` (and every `overwrite=True` path)
   raises a parser error; SQLite's `create_table` additionally wraps itself in
   `self.begin()`, which would commit the session's own transaction. Hence
-  `anyql/engine/tx.py` issues `DROP`/`CREATE TEMPORARY TABLE … AS` through the
+  `d8r/engine/tx.py` issues `DROP`/`CREATE TEMPORARY TABLE … AS` through the
   backend's own handle.
 - **`con.table(name)` commits an open SQLite transaction.** ibis' SQLite
   `get_schema` runs inside its own transaction, so introspection ends the

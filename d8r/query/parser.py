@@ -4,7 +4,7 @@ A **pure function of the document**: undo/redo of the doc restores AST states
 exactly because the AST is always recomputed from text. Ported 1:1 from the
 earlier TypeScript implementation (regex-for-regex, message-for-message, and the
 AST -> payload mapping alike); the contract is `docs/AST.md`, pinned by the
-`spec/canonical-query.anyql` / `spec/canonical-query.ast.json` fixture pair.
+`spec/canonical-query.d8r` / `spec/canonical-query.ast.json` fixture pair.
 """
 
 from __future__ import annotations

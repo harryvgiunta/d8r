@@ -1,5 +1,5 @@
 [project]
-name = "anyql"
+name = "d8r"
 version = "0.1.0"
 description = "A keyboard-first IDE for querying data through Ibis, in the terminal"
 requires-python = ">=3.13"
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-anyql = "anyql.tui.app:main"
+d8r = "d8r.tui.app:main"
 
 [dependency-groups]
 dev = [
@@ -24,7 +24,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["anyql"]
+packages = ["d8r"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

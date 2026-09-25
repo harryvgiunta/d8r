@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from anyql import storage
-from anyql.engine import DataSource
-from anyql.engine.d1api import schema_connection
-from anyql.tui.session import Session
+from d8r import storage
+from d8r.engine import DataSource
+from d8r.engine.d1api import schema_connection
+from d8r.tui.session import Session
 
 
 def test_query_history_survives_restart_without_reexecuting(sources, tmp_path):

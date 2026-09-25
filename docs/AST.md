@@ -1,14 +1,14 @@
-# anyQL AST contract
+# D8R AST contract
 
 The document is a sequence of `\command` lines. `parse_query(doc, schema=...)` —
-in **`anyql/query/parser.py`** — is a **pure function of the document text and
+in **`d8r/query/parser.py`** — is a **pure function of the document text and
 an immutable schema context**. The default context is empty. The AST is always
 recomputed from the text; editor state never changes parsing implicitly.
-The AST types and their `to_json()` wire shape live in **`anyql/query/ast.py`**;
-the derived output-name rules in **`anyql/query/alias.py`**; the immutable
-`SchemaContext` in **`anyql/query/schema.py`**. The TUI
-(`anyql/tui/`) is a consumer of all of it — `Session.run` calls `parse_query`
-then `payload_from_ast`, and `anyql/tui/palette.py` reads the same AST to decide
+The AST types and their `to_json()` wire shape live in **`d8r/query/ast.py`**;
+the derived output-name rules in **`d8r/query/alias.py`**; the immutable
+`SchemaContext` in **`d8r/query/schema.py`**. The TUI
+(`d8r/tui/`) is a consumer of all of it — `Session.run` calls `parse_query`
+then `payload_from_ast`, and `d8r/tui/palette.py` reads the same AST to decide
 what `\` offers.
 
 `Session.refresh_schema()` replaces that session's context with a complete
@@ -19,7 +19,7 @@ so an old snapshot remains coherent after source switches or function edits.
 
 The canonical contract is the pair:
 
-- `spec/canonical-query.anyql` — the exact command text
+- `spec/canonical-query.d8r` — the exact command text
 - `spec/canonical-query.ast.json` — the exact expected AST for that text
 
 Acceptance is:
@@ -123,7 +123,7 @@ window bounds accept at most 640 characters per numeric token. Oversized
 conversions become parser errors, never Python conversion exceptions; values
 are never truncated or clamped. Quoted digit strings are not numeric tokens.
 
-```anyql
+```d8r
 \from events
 \select user_id, 'x' as marker, '1' as text_one, 1 as number_one, null as missing
 \limit 2
@@ -150,7 +150,7 @@ Scalar calls accept bare or qualified columns, the typed literals above, and
 other catalog scalar calls. Names are case-insensitive and stored lowercase.
 For example:
 
-```anyql
+```d8r
 \from events e
 \select concat(upper(e.path), '-', string(e.user_id)) as label
 \select concat_ws(', ', e.path, 'it''s, literal text') as description
@@ -191,7 +191,7 @@ typed literal, or scalar call. Brackets denote optional positional arguments;
 
 Positions follow **Ibis**, not a backend SQL dialect's 1-based positions.
 `find`'s optional `start` is also 0-based; `substr` without a length extends to
-the end. anyQL builds Ibis expressions rather than writing SQL. Backend support
+the end. D8R builds Ibis expressions rather than writing SQL. Backend support
 and string/cast behavior (including Unicode, padding, and unusual offsets) can
 differ; unsupported operations surface as build/compile/execution errors.
 Live D1 does not offer `capitalize`, `reverse`, `repeat`, `lpad`, or `rpad`:
@@ -201,7 +201,7 @@ Arguments are not implicitly converted to text: use `concat(path,
 string(user_id))`, not `concat(path, user_id)` for a numeric ID. Type checks
 belong to the engine; parsing validates grammar and arity, not column dtypes.
 NULL remains a typed literal node, is passed to Ibis, and follows the operation's
-Ibis/backend semantics; anyQL does not replace NULLs or impose its own concat
+Ibis/backend semantics; D8R does not replace NULLs or impose its own concat
 NULL behavior.
 
 Unknown function names, wrong argument counts, and empty arguments such as
@@ -219,7 +219,7 @@ not dropped and are not grouping keys.
 Only `\select` gains expression syntax. `\where` and `\group` still take column
 names; compute a value in a CTE to filter or group it:
 
-```anyql
+```d8r
 \with labeled
   \from events
   \select user_id, lower(path) as normalized_path
@@ -323,7 +323,7 @@ output rows**, not source rows or each selected column separately. With no
 aliases participate just like plain columns. Duplicate NULL rows collapse,
 and empty input stays empty.
 
-```anyql
+```d8r
 \from events
 \select event_type
 \distinct
@@ -385,7 +385,7 @@ own). Every node inside it reports the document line the clause sits on, so a
 mistake in a body points at real text, and a body's errors bubble up to the
 document; `errors` on the nested AST is always `[]`.
 
-```anyql
+```d8r
 \from (\from events \select user_id, sum(amount) as total \group user_id) as totals
 \select totals.user_id
 \select totals.total
@@ -436,7 +436,7 @@ the body reads nothing from outside it, because the correlation is the body's
 `\where` and nothing deeper — there, an outer-looking value is an ordinary value
 again.
 
-```anyql
+```d8r
 \from users u
 \join lateral (\from events e \where e.user_id = u.user_id \order timestamp desc \limit 2) as recent
 \select u.user_id, u.region, recent.timestamp
@@ -468,11 +468,11 @@ left`): every reference to that name would be ambiguous.
 ### Table-valued functions
 
 A **table-valued function** is a named query the session holds (the `\fn` page,
-`anyql/tui/fn.py`) with a positional signature. Its **body** is an ordinary
-anyQL document written with `@name` parameter slots, and a call fills each slot
+`d8r/tui/fn.py`) with a positional signature. Its **body** is an ordinary
+D8R document written with `@name` parameter slots, and a call fills each slot
 with its argument:
 
-```anyql
+```d8r
 \from hot(1000) as h          # or \open, \join, \join lateral, or a set-op operand
 \select h.user_id, h.amount
 ```
@@ -530,7 +530,7 @@ Bounds are `<n> preceding`, `current row`, `<n> following` — either end also
 (`over (...) frame needs order by <col> [asc|desc] and bounds of …`). `rows`
 counts rows, `range` counts ordering values:
 
-```anyql
+```d8r
 \select sum(amount) over (partition by user_id order by timestamp rows between unbounded preceding and current row) as running_total
 \select sum(amount) over (order by timestamp range between 2 preceding and current row) as window_total
 ```
@@ -576,7 +576,7 @@ internal tables hidden from the dataset registry. Creation, replacement, and
 drop explicitly target the backend's temporary namespace; a persistent table
 with the same name is never dropped, even if the session's registry is stale.
 
-```anyql
+```d8r
 \from events
 \select event_type, sum(amount) as total
 \group event_type
@@ -597,7 +597,7 @@ document's query then runs last inside whatever state they left — which is how
 run in this IDE wraps one query in the session's transaction. A document of
 statements alone carries no query and answers with their status.
 
-```anyql
+```d8r
 \begin
 ```
 ```
@@ -795,7 +795,7 @@ groups by year); alone in the select list they project row-wise
 ## What the palette reads
 
 Typing `\` opens the palette; the pure rule behind it is `view_for(...)` in
-`anyql/tui/palette.py`, and the language surface it exposes is:
+`d8r/tui/palette.py`, and the language surface it exposes is:
 
 - the twenty clause commands above, plus the app's own actions (`Run`, `Compile`,
   `Data source…`, `History`, and the four that change the workspace: `Results`,
@@ -844,7 +844,7 @@ search reads the whole distinct pool the session fetched per column
 Accepting an offer replaces the typed span with the command/argument plus a
 trailing space; accepting one that would change nothing is not an acceptance, so
 Enter keeps meaning a newline. A **clause command** goes further: it asks
-`clause_line(doc, line, command)` in `anyql/query/parser.py` for that clause in
+`clause_line(doc, line, command)` in `d8r/query/parser.py` for that clause in
 the block the caret is editing — a `\with` body is a block of its own, `\open`
 is `\from`, and a repeated clause answers with its last line. Finding one, the
 accept writes nothing and moves the caret to that line; finding none, it breaks

@@ -8,10 +8,10 @@ import sqlite3
 import pytest
 from textual.widgets import DataTable, Input, Select, Static, TextArea
 
-from anyql.tui.add_source import AddSourceModal
-from anyql.tui.app import AnyqlApp
-from anyql.tui.fn import FnScreen
-from anyql.tui.session import Session
+from d8r.tui.add_source import AddSourceModal
+from d8r.tui.app import D8RApp
+from d8r.tui.fn import FnScreen
+from d8r.tui.session import Session
 
 
 def _forbidden(*args, **kwargs):
@@ -35,7 +35,7 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
     first.remember_d1("a" * 32, "00000000-0000-0000-0000-000000000001", "Production")
     target = f"saved-d1:{'a' * 32}:00000000-0000-0000-0000-000000000001"
     first.restore_source(target, "sqlite")
-    app = AnyqlApp(first)
+    app = D8RApp(first)
     document = "\\from events\n\\select id\n\\limit 7"
 
     identity = None
@@ -52,7 +52,7 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
     asyncio.run(edit())
     for name in ("build_live_source", "build_sqlite_source", "run", "compile", "save_fn"):
         monkeypatch.setattr(Session, name, _forbidden)
-    reopened = AnyqlApp(Session(data_dir=data_dir))
+    reopened = D8RApp(Session(data_dir=data_dir))
 
     async def restore():
         async with reopened.run_test(size=(140, 45)) as pilot:
@@ -77,7 +77,7 @@ def test_history_restores_recorded_snapshot_without_connecting_and_reconnects_ex
     data_dir = tmp_path / "state"
     first = Session(data_dir=data_dir)
     source, path = _snapshot(first, tmp_path)
-    app = AnyqlApp(first)
+    app = D8RApp(first)
     document = "\\from events\n\\select id"
 
     async def run_and_leave():
@@ -103,7 +103,7 @@ def test_history_restores_recorded_snapshot_without_connecting_and_reconnects_ex
 
     monkeypatch.setattr(Session, "build_sqlite_source", record_connection)
     monkeypatch.setattr(Session, "build_live_source", _forbidden)
-    reopened = AnyqlApp(Session(data_dir=data_dir))
+    reopened = D8RApp(Session(data_dir=data_dir))
 
     async def restore_history():
         async with reopened.run_test(size=(140, 45)) as pilot:
@@ -162,7 +162,7 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
     original = "\\from events\n\\limit 1"
     first.save_fn("saved_events", "", original, "Original definition")
     source, _ = _snapshot(first, tmp_path)
-    app = AnyqlApp(first)
+    app = D8RApp(first)
     body = "\\from events\n\\where id > @minimum\n\\select id"
     identity = None
 
@@ -188,7 +188,7 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
     asyncio.run(edit_draft())
     for name in ("build_live_source", "build_sqlite_source", "run", "compile", "save_fn"):
         monkeypatch.setattr(Session, name, _forbidden)
-    reopened = AnyqlApp(Session(data_dir=data_dir))
+    reopened = D8RApp(Session(data_dir=data_dir))
 
     async def restore_and_close():
         async with reopened.run_test(size=(140, 45)) as pilot:
@@ -214,7 +214,7 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
             assert not isinstance(reopened.screen, FnScreen)
 
     asyncio.run(restore_and_close())
-    third = AnyqlApp(Session(data_dir=data_dir))
+    third = D8RApp(Session(data_dir=data_dir))
 
     async def workspace_then_new_draft():
         async with third.run_test(size=(140, 45)) as pilot:
@@ -235,7 +235,7 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
 
 def test_autosave_failure_keeps_editor_available_and_retries_on_exit(tmp_path, monkeypatch):
     data_dir = tmp_path / "state"
-    app = AnyqlApp(Session(data_dir=data_dir))
+    app = D8RApp(Session(data_dir=data_dir))
     document = "\\from users\n\\select name"
 
     def fail_save(document):
@@ -257,7 +257,7 @@ def test_autosave_failure_keeps_editor_available_and_retries_on_exit(tmp_path, m
             app.exit()
 
     asyncio.run(edit_with_write_failure())
-    reopened = AnyqlApp(Session(data_dir=data_dir))
+    reopened = D8RApp(Session(data_dir=data_dir))
 
     async def restore_recovered_draft():
         async with reopened.run_test(size=(140, 45)) as pilot:
@@ -268,7 +268,7 @@ def test_autosave_failure_keeps_editor_available_and_retries_on_exit(tmp_path, m
 
 
 def test_saved_function_is_offered_at_unchanged_workspace_caret(tmp_path):
-    app = AnyqlApp(Session(data_dir=tmp_path / "state"))
+    app = D8RApp(Session(data_dir=tmp_path / "state"))
     prefix = "\\from quick_"
 
     async def scenario():
@@ -304,7 +304,7 @@ def test_saved_function_is_offered_at_unchanged_workspace_caret(tmp_path):
 
 @pytest.mark.parametrize(("suppression", "line"), [("disabled", "\\from "), ("dismissed", "\\from "), ("dismissed", "\\")])
 def test_returning_from_function_editor_respects_suppressed_completion(tmp_path, suppression, line):
-    app = AnyqlApp(Session(data_dir=tmp_path / "state"))
+    app = D8RApp(Session(data_dir=tmp_path / "state"))
 
     async def scenario():
         async with app.run_test(size=(140, 45)) as pilot:

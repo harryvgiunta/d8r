@@ -3,7 +3,7 @@
 Everything the widgets need to know is computed here in plain Python, so the
 Textual layer stays a thin shell and the tests can drive a `Session` without a
 terminal attached. Provider configuration is loaded from local settings; AI
-transport lives in `anyql.ai`, while database networking stays in the engine.
+transport lives in `d8r.ai`, while database networking stays in the engine.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from pathlib import Path
 from threading import RLock
 from uuid import uuid4
 
-from anyql.ai.client import AIConfig
+from d8r.ai.client import AIConfig
 
-from anyql.engine import (
+from d8r.engine import (
     D1Error,
     DIALECT_BY_NAME,
     DataSource,
@@ -46,7 +46,7 @@ from anyql.engine import (
     temp_handle,
     type_name,
 )
-from anyql.query import (
+from d8r.query import (
     Capabilities,
     ColumnDef,
     QueryAST,
@@ -59,7 +59,7 @@ from anyql.query import (
     parse_query,
     payload_from_ast,
 )
-from anyql.storage import MemoryStore, SettingsStore, WorkspaceStore
+from d8r.storage import MemoryStore, SettingsStore, WorkspaceStore
 
 PREVIEW_ROW_CAP = 10000
 """Rows the results DataTable buffers after query execution.
