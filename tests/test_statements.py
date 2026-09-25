@@ -17,7 +17,6 @@ import ibis
 import pytest
 
 from anyql.engine import DataSource, add_sqlite_source, capabilities_for, datasources, expression, tx
-from anyql.query import table_by_name
 from anyql.tui.session import Session
 from tests.conftest import DATA_DIR
 
@@ -92,7 +91,7 @@ def test_temp_keeps_the_query_and_shows_its_rows(session):
     assert session.source.datasets["spread"]["temp"] is True
     assert session.source.datasets["spread"]["rows"] == len(outcome.rows)
     # The table is a table now: the parser's registry and a later document see it.
-    assert table_by_name("spread") is not None
+    assert session.schema.table_by_name("spread") is not None
     later = session.run("\\from spread\n\\select event_type\n\\order event_type\n\\limit 2")
     assert later.ok and [row[0] for row in later.rows] == ["click", "purchase"]
 
@@ -110,7 +109,7 @@ def test_drop_removes_a_temp_table_and_only_temp_tables(session):
     outcome = session.run("\\drop doomed\n")
     assert outcome.ok and outcome.status == 'dropped temp table "doomed"'
     assert session.temp_tables() == []
-    assert table_by_name("doomed") is None
+    assert session.schema.table_by_name("doomed") is None
 
     # A bundled dataset is not the session's to drop, and neither is a stranger.
     assert "is not a temp table" in session.run("\\drop events\n").error
@@ -257,7 +256,7 @@ def test_rolling_back_takes_the_temp_table_with_it(session):
     assert outcome.status == "transaction rolled back · demo"
     # The engine rolled the DDL back, and the session's registry followed.
     assert session.temp_tables() == []
-    assert table_by_name("inside") is None
+    assert session.schema.table_by_name("inside") is None
     assert session.run("\\from inside\n\\select user_id\n").error.startswith("line 1: unknown table")
 
 
@@ -341,4 +340,5 @@ def test_capabilities_say_what_each_source_can_do():
         "savepoints": False,
         "temp": False,
         "transactions": False,
+        "regex": False,  # `~`/`!~` compile to `_IBIS_REGEX_SEARCH`; D1 has no UDFs
     }

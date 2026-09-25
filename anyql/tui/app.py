@@ -29,7 +29,7 @@ from textual.widgets import (
 
 from anyql.ai.context import AIProposal
 from anyql.engine import DIALECTS, DIALECT_BY_NAME, capabilities_for
-from anyql.query import ColumnDef, table_by_name
+from anyql.query import ColumnDef
 
 from .add_source import AddSourceModal
 from .ai import AIPanel, AITarget
@@ -605,7 +605,7 @@ class AnyqlApp(App):
 
     @on(Tree.NodeExpanded, "#schema-tree")
     def _dataset_expanded(self, event: Tree.NodeExpanded) -> None:
-        """Load a dataset's columns from the schema registry, once."""
+        """Load a dataset's columns from the session snapshot, once."""
         node = event.node
         data = node.data if isinstance(node.data, dict) else {}
         if data.get("kind") != "dataset" or data.get("loaded"):
@@ -614,7 +614,7 @@ class AnyqlApp(App):
             node.collapse()
             return
         node.remove_children()
-        table = table_by_name(data["name"])
+        table = self.session.schema.table_by_name(data["name"])
         if table is None:
             node.add_leaf(Text("not in the registry", style="dim"), data={"kind": "note"})
         else:

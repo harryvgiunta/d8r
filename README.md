@@ -389,11 +389,13 @@ library; it contains function text in plain JSON, so do not put secrets in bodie
 or descriptions. Cloudflare tokens, AI keys/configuration, chats, query history,
 unsaved documents, active-source choices, and temporary tables are not saved.
 
-Writes use a temporary file and atomic replacement. Failed writes leave the
-last saved library and current definitions unchanged. If another app instance
-has saved newer data, copy your unsaved draft and restart rather than overwrite
-it. An invalid/unreadable file produces a startup error and blocks saves: repair
-it or move it aside, then restart. The original file is not silently reset.
+Writes use a temporary file, a save lock, and atomic replacement. Failed writes
+leave the last saved library and current definitions unchanged. If another app
+instance has saved newer data, copy your unsaved draft and restart rather than
+overwrite it. A lock or temp file left by a crashed save clears itself after a
+minute — no manual cleanup. An invalid/unreadable file produces a startup error
+and blocks saves: repair it or move it aside, then restart. The original file is
+not silently reset.
 
 ## The results explorer
 
@@ -500,7 +502,7 @@ terminal are needed to check a change.
 ```
 anyql/
   __main__.py   `uv run python -m anyql`
-  query/        pure language layer (parser, AST, alias rules, schema registry)
+  query/        pure language layer (parser, AST, alias rules, immutable schema context)
   engine/       ibis/DuckDB execution, datasource registry, dialects, D1 client,
                 transactions/savepoints/temp tables (tx.py), deterministic demo
                 data, make_data.py

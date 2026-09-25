@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from anyql.engine import capabilities_for, execute, execute_remote
-from anyql.query import FnDef, parse_body
+from anyql.query import FnDef
 from anyql.query.parser import ParseOpts, parse_slice
 
 if TYPE_CHECKING:
@@ -128,10 +128,16 @@ class AIContext:
             return "The source changed; start a new chat."
         with self.session.target_source(self.source_id):
             if self.parameters is not None:
-                errors = parse_body(text, list(self.parameters))
-                return errors[0] if errors else None
+                try:
+                    self.session.validate_fn(
+                        self.function_name or "proposal", ", ".join(self.parameters), text, "",
+                    )
+                except ValueError as exc:
+                    return str(exc)
+                return None
             # Generated text is settled text, not a half-typed last line.
-            ast = parse_slice(text.split("\n"), ParseOpts(typing_line=0))
+            schema = self.session.schema
+            ast = parse_slice(text.split("\n"), ParseOpts(typing_line=0, schema=schema))
             if ast.errors:
                 error = ast.errors[0]
                 return f"line {error.line}: {error.message}"
@@ -228,7 +234,10 @@ class AIContext:
             else:
                 if "parameters" in args and self.parameters is not None:
                     with self.session.target_source(self.source_id):
-                        self.session.validate_fn("proposal", ", ".join(args["parameters"]), args["text"], "")
+                        self.session.validate_fn(
+                            self.function_name or "proposal",
+                            ", ".join(args["parameters"]), args["text"], "",
+                        )
                     error = None
                 else:
                     error = self.validate_proposal(args["text"])

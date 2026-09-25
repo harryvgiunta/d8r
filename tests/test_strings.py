@@ -92,6 +92,14 @@ def test_column_calls_group_implicitly_but_scalar_calls_do_not(con):
     assert explicitly_grouped["rows"] == [[kind.lower(), n, "OK"] for kind, n, _ in expected]
 
 
+def test_like_needs_a_string_column(con):
+    """`like` compares text; a numeric column is the user's mistake and is
+    named as one — the same shape as the regex guard."""
+    payload = payload_from_ast(parse_query("\\from events\n\\where amount like \"5\"\n\\limit 2"))
+    with pytest.raises(expression.PayloadError, match="`like` needs a string column"):
+        expression.build(con, payload)
+
+
 @pytest.mark.parametrize("call", [
     "lower(user_id)",
     "concat(path, 1)",
@@ -175,10 +183,10 @@ def test_malformed_scalar_calls_error_only_after_the_typing_line(call):
 
 
 def test_nested_scalar_references_obey_table_aliases():
-    from anyql.query import ColumnDef, TableDef, set_schema_state
+    from anyql.query import ColumnDef, SchemaContext, TableDef
 
-    set_schema_state([TableDef("events", columns=[ColumnDef("path", "string")])])
+    schema = SchemaContext([TableDef("events", columns=[ColumnDef("path", "string")])])
     doc = "\\from events e\n\\select concat(upper(events.path), 'x')\n\\limit 1"
-    errors = parse_query(doc).errors
+    errors = parse_query(doc, schema=schema).errors
     assert len(errors) == 1 and errors[0].line == 2
-    assert parse_query(doc.replace("upper(events.path)", "upper(e.path)")).errors == []
+    assert parse_query(doc.replace("upper(events.path)", "upper(e.path)"), schema=schema).errors == []

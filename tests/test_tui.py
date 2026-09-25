@@ -24,7 +24,7 @@ from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 
 import anyql
 from anyql.engine import DIALECTS, add_sqlite_source
-from anyql.query import capabilities, schema_tables, set_schema_state
+from anyql.query import SchemaContext
 from anyql.tui.add_source import AddSourceModal
 from anyql.tui.app import AnyqlApp
 from anyql.tui.palette import VALUE_SUGGESTIONS, view_for
@@ -75,19 +75,6 @@ def history_table(app: AnyqlApp) -> DataTable:
     return app.query_one("#history-table", DataTable)
 
 
-@pytest.fixture(autouse=True)
-def restore_schema_seam(_clean_schema_registry):
-    """The schema registry is process-global: hand it back as it was found.
-
-    It asks for the suite's reset first, so the seam this file found is the
-    empty one, whatever installed a schema before it.
-    """
-    tables = list(schema_tables())
-    caps = capabilities()
-    yield
-    set_schema_state(tables, caps)
-
-
 @pytest.fixture
 def snapshot(tmp_path: Path):
     """A local SQLite database, built the way a D1 snapshot arrives."""
@@ -132,7 +119,7 @@ def test_app_boots_on_the_demo_source():
             "document",
         ]
         # The seam the parser and the palette read is the active source's.
-        assert [table.name for table in schema_tables()] == ["events", "users"]
+        assert [table.name for table in app.session.schema.tables] == ["events", "users"]
 
     run_app(scenario)
 
@@ -493,7 +480,7 @@ def test_add_source_registers_a_local_snapshot(snapshot):
             assert [str(node.label) for node in app.query_one("#schema-tree").root.children] == [
                 "widgets  3 rows"
             ]
-            assert [table.name for table in schema_tables()] == ["widgets"]
+            assert [table.name for table in app.session.schema.tables] == ["widgets"]
             assert text_of(app, "#backend-pill") == "sqlite (D1 snapshot)"
             assert app.session.dialect == "sqlite"
 
@@ -519,8 +506,8 @@ def test_switching_source_repoints_the_schema_seam():
             "customers  20 rows",
             "orders  120 rows",
         ]
-        assert [table.name for table in schema_tables()] == ["customers", "orders"]
-        assert capabilities().backend == "postgres (mock)"
+        assert [table.name for table in app.session.schema.tables] == ["customers", "orders"]
+        assert app.session.schema.capabilities.backend == "postgres (mock)"
         assert text_of(app, "#backend-pill") == "postgres (mock)"
         assert app.session.dialect == "postgres"
         assert app.query_one("#dialect-select", Select).value == "postgres"
@@ -533,7 +520,7 @@ def test_switching_source_repoints_the_schema_seam():
 
         app.query_one("#source-select", Select).value = "demo"
         await pilot.pause()
-        assert [table.name for table in schema_tables()] == ["events", "users"]
+        assert [table.name for table in app.session.schema.tables] == ["events", "users"]
 
     run_app(scenario)
 
@@ -875,8 +862,8 @@ def test_string_completion_tracks_nested_arguments_and_quoted_commas():
 
 def test_string_completion_obeys_source_capabilities():
     session = Session()
-    caps = replace(capabilities(), functions={"string": ["upper"], "any": ["string"]})
-    set_schema_state(list(schema_tables()), caps)
+    caps = replace(session.schema.capabilities, functions={"string": ["upper"], "any": ["string"]})
+    session.schema = SchemaContext(session.schema.tables, caps, session.schema.fns)
     line = "\\select "
     view = view_for(session, "\\from events\n" + line, line, len(line))
     assert "upper" in view.labels
@@ -1348,7 +1335,7 @@ def test_settings_switches_the_source_and_the_one_dialect():
         await pick(pilot, app, "postgres")
         assert app.session.active_id == "postgres"
         assert app.query_one("#source-select", Select).value == "postgres"
-        assert [table.name for table in schema_tables()] == ["customers", "orders"]
+        assert [table.name for table in app.session.schema.tables] == ["customers", "orders"]
         assert text_of(app, "#backend-pill") == "postgres (mock)"
 
     run_app(scenario)
@@ -1730,7 +1717,7 @@ def test_fn_target_drives_completion_save_and_preview_without_changing_workspace
         assert app.session.history == []
         assert app.session.active_id == "mysql"
         assert app.session.dialect == "postgres"
-        assert [table.name for table in schema_tables()] == list(app.session.source.datasets)
+        assert [table.name for table in app.session.schema.tables] == list(app.session.source.datasets)
 
         # Validation and execution errors must restore the same workspace too.
         source.value = "mysql"
@@ -1747,7 +1734,7 @@ def test_fn_target_drives_completion_save_and_preview_without_changing_workspace
         assert screen.query_one("#fn-status", Static).has_class("error")
         assert app.session.active_id == "mysql"
         assert app.session.dialect == "postgres"
-        assert [table.name for table in schema_tables()] == list(app.session.source.datasets)
+        assert [table.name for table in app.session.schema.tables] == list(app.session.source.datasets)
         await pilot.press("ctrl+c")
         await pilot.pause()
         assert not isinstance(app.screen, FnScreen)
@@ -1879,7 +1866,7 @@ def test_fn_parameter_offers_follow_unsaved_declarations_and_function_switches()
         assert palette.view.labels == ["@admin_limit", "@min_amount"]
         await type_document(pilot, "min")
         assert palette.view.labels == ["@min_amount", "@admin_limit"]
-        assert app.session.fns["first"].params == ["old_name"]
+        assert tuple(app.session.fns["first"].params) == ("old_name",)
         params.value = ""
         await pilot.pause()
         assert not palette.is_open

@@ -7,7 +7,13 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from uuid import UUID
+
+# How long a lock or temp file may exist before it is assumed to belong to a
+# crashed save. A save is two writes plus one fsync (sub-second), so anything
+# older than a minute is debris, not an in-flight save.
+_STALE_SECONDS = 60.0
 
 
 def data_directory() -> Path:
@@ -111,12 +117,59 @@ class MemoryStore:
                 "The original file is unchanged; repair it or move it aside, then restart anyQL. "
                 "Local saves are disabled until restart."
             )
+        self._sweep()
 
     def _read(self) -> bytes | None:
         try:
             return self.path.read_bytes()
         except FileNotFoundError:
             return None
+
+    def _sweep(self) -> None:
+        """Remove temp files older than the grace period — orphaned debris of
+        crashed saves. Fresh ones belong to a save in flight, active or not."""
+        deadline = time.time() - _STALE_SECONDS
+        try:
+            artifacts = list(self.path.parent.glob(".memory-*.tmp"))
+        except OSError:
+            return
+        for artifact in artifacts:
+            try:
+                if artifact.stat().st_mtime < deadline:
+                    artifact.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _acquire_lock(self, lock: Path) -> None:
+        """Take the save lock, clearing it only when it is older than the
+        grace period — a crashed save's lock, not one being held now."""
+        for attempt in (0, 1):
+            try:
+                descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                if attempt:
+                    raise ValueError(
+                        f"Local memory is busy at {self.path}. Retry after the other "
+                        f"save finishes; a lock left by a crash clears itself after "
+                        f"{int(_STALE_SECONDS)} seconds."
+                    ) from None
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except FileNotFoundError:
+                    continue  # vanished between checks; retry the open
+                if age <= _STALE_SECONDS:
+                    raise ValueError(
+                        f"Local memory is busy at {self.path}. Retry after the other "
+                        f"save finishes; a lock left by a crash clears itself after "
+                        f"{int(_STALE_SECONDS)} seconds."
+                    ) from None
+                try:
+                    lock.unlink(missing_ok=True)
+                except OSError:
+                    pass  # raced another taker; retry the open
+                continue
+            os.close(descriptor)
+            return
 
     def save(self, functions: list[dict], profiles: list[dict[str, str]]) -> None:
         """Commit a complete snapshot, only if the loaded file is still current."""
@@ -129,15 +182,8 @@ class MemoryStore:
         locked = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError:
-                raise ValueError(
-                    f"Local memory is busy at {self.path}. Retry after the other save finishes. "
-                    f"If no anyQL instance is saving, remove the stale lock {lock}."
-                ) from None
+            self._acquire_lock(lock)
             locked = True
-            os.close(descriptor)
             if self._read() != self._snapshot:
                 raise ValueError(
                     f"Local memory changed outside this session at {self.path}; nothing was saved. "

@@ -52,7 +52,7 @@ def test_query_draft_saves_explicitly_and_calls_on_the_captured_source(tmp_path)
             await pilot.click("#fn-save")
             await pilot.pause()
             assert session.fns["large_readings"].body == document
-            assert session.fns["large_readings"].params == []
+            assert not session.fns["large_readings"].params
             assert session.storage_path.exists()
             assert session.history == history
             assert session.active_id == "readings"

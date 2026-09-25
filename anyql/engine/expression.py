@@ -376,6 +376,10 @@ def _predicate(frames: list[tuple[str, ir.Table]], condition: dict) -> ir.Boolea
     op = condition.get("op")
     value = condition.get("value")
     if op == "like":
+        if not isinstance(column, ir.StringValue):
+            raise PayloadError(
+                f"`like` needs a string column: {column.get_name()!r} is {column.type()}"
+            )
         substring = str(value).strip("%")
         return column.contains(substring)
     if op in REGEX_OPS:

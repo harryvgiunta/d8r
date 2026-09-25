@@ -111,17 +111,25 @@ def capabilities_for(source: "DataSource") -> dict:
         return {
             **CAPABILITIES,
             "backend": "sqlite (Cloudflare D1)",
-            # These SQLite translations call Python UDFs registered only by
-            # the local Ibis backend; Cloudflare D1 has no such functions.
+            # These SQLite translations compile to Python UDFs (`_IBIS_*`) that
+            # only the local Ibis backend registers; Cloudflare D1 has no such
+            # functions. The rest — capitalize included, which compiles to pure
+            # SQL (UPPER/SUBSTRING) — D1 runs natively.
             "functions": {
                 **CAPABILITIES["functions"],
                 "string": [
                     fn for fn in CAPABILITIES["functions"]["string"]
-                    if fn not in {"capitalize", "reverse", "repeat", "lpad", "rpad"}
+                    if fn not in {"reverse", "repeat", "lpad", "rpad"}
                 ],
             },
+            # `~`/`!~` compile to `_IBIS_REGEX_SEARCH`, so the regex operators
+            # go with the regex flag: the palette reads this operator list.
+            "operators": [
+                op for op in CAPABILITIES["operators"] if op not in {"~", "!~"}
+            ],
             "supports": {
                 **CAPABILITIES["supports"],
+                "regex": False,
                 "temp": False,
                 "transactions": False,
             },

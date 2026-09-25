@@ -41,7 +41,7 @@ from anyql.query import (
     REGEX_OPS,
     SUBQUERY_OPS,
     TEMPORAL,
-    capabilities,
+    SchemaContext,
     clause_line,
     dtype_family,
     is_identifier,
@@ -129,9 +129,9 @@ VALUE_SUGGESTIONS = 50
 _CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 
-def operators() -> tuple[str, ...]:
+def operators(schema: SchemaContext) -> tuple[str, ...]:
     """The operators the active backend advertises for `\\where` and `\\case`."""
-    live = tuple(capabilities().operators)
+    live = schema.capabilities.operators
     return live or DEFAULT_OPERATORS
 
 
@@ -226,7 +226,7 @@ def _split(text: str) -> tuple[str, str, str]:
     return word, text[index:gap_end], text[gap_end:]
 
 
-def _command_entries(token: str) -> list[Entry]:
+def _command_entries(token: str, schema: SchemaContext) -> list[Entry]:
     """The language and the app's actions matching the word after the `\\`.
 
     What the backend advertises decides what is offered: `\\savepoint` and
@@ -234,7 +234,7 @@ def _command_entries(token: str) -> list[Entry]:
     without (DuckDB keeps whole transactions only). Typing them anyway is still
     the user's to do — the run refuses them by name.
     """
-    supports = capabilities().supports
+    supports = schema.capabilities.supports
     commands = [
         (match_rank(name, token), index, Entry(label=f"\\{name}", insert=f"\\{name} ", detail=detail))
         for index, (name, detail) in enumerate(COMMANDS)
@@ -304,37 +304,40 @@ def _word(rest: str) -> tuple[str, int]:
     return token, rest.rfind(token)
 
 
-def _column_offers(session: Session, doc: str, token: str) -> list[Entry]:
+def _column_offers(session: Session, doc: str, token: str, schema: SchemaContext) -> list[Entry]:
     """The document's open-table columns as palette rows."""
-    rows = [(0, name, detail, f"{name} ") for name, _, detail in session.column_entries(doc)]
+    rows = [
+        (0, name, detail, f"{name} ")
+        for name, _, detail in session.column_entries(doc, schema=schema)
+    ]
     return _offers(rows, token)
 
 
-def _aggregate_fns() -> list[str]:
+def _aggregate_fns(schema: SchemaContext) -> list[str]:
     """The aggregates the active backend advertises that the language knows."""
-    advertised = set(capabilities().aggregates)
+    advertised = schema.capabilities.aggregates
     return [fn for fn in AGGREGATES if fn in advertised]
 
 
-def _rank_fns() -> list[str]:
+def _rank_fns(schema: SchemaContext) -> list[str]:
     """Rank functions — `<fn>() over ( ... )` with no argument of their own."""
-    advertised = set(capabilities().window_functions)
+    advertised = schema.capabilities.window_functions
     return [fn for fn in ("rank", "dense_rank", "row_number") if fn in advertised]
 
 
-def _temporal_fns(columns: list[tuple[str, str, str]]) -> list[str]:
+def _temporal_fns(columns: list[tuple[str, str, str]], schema: SchemaContext) -> list[str]:
     """Temporal extractions at least one of the open columns can carry."""
     families = {dtype_family(type_) for _, type_, _ in columns}
     return [
         fn
         for fn in TEMPORAL
-        if any(fn in capabilities().functions.get(family, []) for family in families if family)
+        if any(fn in schema.capabilities.functions.get(family, ()) for family in families if family)
     ]
 
 
-def _scalar_fns() -> list[str]:
+def _scalar_fns(schema: SchemaContext) -> list[str]:
     """Known scalar calls the source advertises, including literal-only calls."""
-    advertised = {fn for functions in capabilities().functions.values() for fn in functions}
+    advertised = {fn for functions in schema.capabilities.functions.values() for fn in functions}
     return [fn for fn in SCALAR_FUNCTIONS if fn in advertised]
 
 
@@ -354,28 +357,29 @@ def _accepts_type(kind: ArgumentKind, type_: str) -> bool:
     return type_ == kind
 
 
-def _select_entries(session: Session, doc: str, token: str) -> list[Entry]:
+def _select_entries(session: Session, doc: str, token: str, schema: SchemaContext) -> list[Entry]:
     """`\\select` offers fields first, then the functions that apply to them.
 
     An open call is handled one level up, where its argument's span is known;
     here the token is the whole expression segment being typed.
     """
-    columns = session.column_entries(doc)
+    columns = session.column_entries(doc, schema=schema)
     rows = [(0, name, detail, f"{name} ") for name, _, detail in columns]
-    rows += [(1, fn, "aggregate", f"{fn}(") for fn in _aggregate_fns()]
-    rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns)]
-    rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns()]
-    rows += [(4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns()]
+    rows += [(1, fn, "aggregate", f"{fn}(") for fn in _aggregate_fns(schema)]
+    rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns, schema)]
+    rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns(schema)]
+    rows += [(4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns(schema)]
     return _offers(rows, token)
 
 
 def _call_argument_entries(
     session: Session, doc: str, fn: str, partial: str, argument: int = 0,
+    *, schema: SchemaContext,
 ) -> list[Entry]:
     """Complete the current argument without replacing its enclosing call."""
-    columns = session.column_entries(doc)
+    columns = session.column_entries(doc, schema=schema)
     if fn in SCALAR_FUNCTIONS:
-        if fn not in _scalar_fns():
+        if fn not in _scalar_fns(schema):
             return []
         spec = SCALAR_FUNCTIONS[fn]
         kind = spec.argument_kind(argument)
@@ -390,18 +394,18 @@ def _call_argument_entries(
         ]
         rows += [
             (1, nested, _scalar_detail(nested), f"{nested}(")
-            for nested in _scalar_fns()
+            for nested in _scalar_fns(schema)
             if kind == "any" or SCALAR_FUNCTIONS[nested].result == kind
         ]
         return _offers(rows, partial)
     if argument:
         return []
-    if fn in _aggregate_fns():
+    if fn in _aggregate_fns(schema):
         rows = [(0, name, detail, f"{name})") for name, _, detail in columns]
         if fn == "count":
             rows.append((1, "*", "every row", "*)"))
         return _offers(rows, partial)
-    families = {family for family, fns in capabilities().functions.items() if fn in fns}
+    families = {family for family, fns in schema.capabilities.functions.items() if fn in fns}
     if fn not in TEMPORAL or not families:
         return []
     rows = [
@@ -417,16 +421,18 @@ def _value_text(value: str) -> str:
     return value if looks_numeric(value) else f'"{value}"'
 
 
-def _value_entries(session: Session, doc: str, column: str, token: str) -> list[Entry]:
+def _value_entries(
+    session: Session, doc: str, column: str, token: str, schema: SchemaContext,
+) -> list[Entry]:
     """That column's distinct values, searched by what is being typed."""
     rows = [
         (0, value, f"{column} value", f"{_value_text(value)} ")
-        for value in session.values_for(doc, column)
+        for value in session.values_for(doc, column, schema=schema)
     ]
     return _offers(rows, token.strip('"'))[:VALUE_SUGGESTIONS]
 
 
-def _fn_call_entries(session: Session, token: str) -> list[Entry]:
+def _fn_call_entries(session: Session, token: str, schema: SchemaContext) -> list[Entry]:
     """Saved functions as call rows for a dataset-taking clause.
 
     Each inserts `name()` with the caret between the parens, so accepting
@@ -434,14 +440,14 @@ def _fn_call_entries(session: Session, token: str) -> list[Entry]:
     """
     kept = [
         (rank, index, call, detail)
-        for index, (call, detail) in enumerate(session.fn_call_rows())
+        for index, (call, detail) in enumerate(session.fn_call_rows(schema=schema))
         if (rank := match_rank(call, token)) >= 0
     ]
     kept.sort(key=lambda row: row[0])
     return [Entry(label=call, insert=call, detail=detail, cursor_back=1) for _, _, call, detail in kept]
 
 
-def _fn_view(session: Session, token: str, slash: int) -> View | None:
+def _fn_view(schema: SchemaContext, token: str, slash: int) -> View | None:
     """The `\fn` library view: open an existing function, or create one.
 
     Bare `\fn` offers the library (and a new function). `\fn <name>` filters
@@ -451,7 +457,7 @@ def _fn_view(session: Session, token: str, slash: int) -> View | None:
     stays in the document.
     """
     entries: list[Entry] = []
-    for fn in session.fns.values():
+    for fn in schema.fns:
         rank = match_rank(fn.name, token)
         if rank < 0:
             continue
@@ -488,6 +494,7 @@ def view_for(
     `None` means "no palette": no `\\` before the caret, a command the palette
     has nothing to say about, or nothing left to suggest for what is typed.
     """
+    schema = session.schema
     before = line[:column]
     parameter = _parameter_token(before) if parameters else None
     if parameter is not None:
@@ -508,9 +515,9 @@ def view_for(
         # it opens the library; `\fn <name>` opens (or offers to create) that
         # one function. Accepting erases the whole `\ … ` span and fires the
         # app's action, exactly like `Run`/`Compile`.
-        return _fn_view(session, rest.strip(), slash)
+        return _fn_view(schema, rest.strip(), slash)
     if not gap:
-        entries = _command_entries(word)
+        entries = _command_entries(word, schema)
         return View(start=slash, token=word, entries=entries) if entries else None
 
     command = word.lower()
@@ -544,34 +551,39 @@ def view_for(
             # rest of the clause (`as alias`, `on col`) takes no dataset — so a
             # stray Enter cannot append a second one.
             return None
-        rows = [(0, name, detail, f"{name} ") for name, detail in session.dataset_entries(doc)]
+        rows = [
+            (0, name, detail, f"{name} ")
+            for name, detail in session.dataset_entries(doc, schema=schema)
+        ]
         if command in SET_OP_COMMANDS and not modifier:
             # The modifier leads the argument, and only once.
             rows += [(1, name, detail, f"{name} ") for name, detail in SET_OP_MODIFIERS]
         # Saved functions complete here too — accepted as a `name()` call with
         # the caret inside the parens — after the datasets, in match order.
-        entries = _offers(rows, token) + _fn_call_entries(session, token)
+        entries = _offers(rows, token) + _fn_call_entries(session, token, schema)
     elif command == "select":
         if fn is not None:
-            entries = _call_argument_entries(session, doc, fn, token, argument)
+            entries = _call_argument_entries(session, doc, fn, token, argument, schema=schema)
         else:
-            entries = _select_entries(session, doc, token)
+            entries = _select_entries(session, doc, token, schema)
     elif command in COLUMN_COMMANDS:
-        entries = _column_offers(session, doc, token)
+        entries = _column_offers(session, doc, token, schema)
     elif command == "where":
-        entries = _where_entries(session, doc, rest[:offset].split(), token)
+        entries = _where_entries(session, doc, rest[:offset].split(), token, schema)
     else:
         return None
     return View(start=start, token=token, entries=entries, phase="argument") if entries else None
 
 
-def _where_entries(session: Session, doc: str, head: list[str], token: str) -> list[Entry]:
+def _where_entries(
+    session: Session, doc: str, head: list[str], token: str, schema: SchemaContext,
+) -> list[Entry]:
     """`\\where` offers a column, then an operator, then that column's values.
 
     Operators whose operand is not one of the column's values — a regex pattern,
     a subquery — offer nothing after them: the pattern and the `( … )` are typed.
     """
-    if len(head) >= 2 and head[1].lower() in operators():
+    if len(head) >= 2 and head[1].lower() in operators(schema):
         if head[1].lower() in REGEX_OPS | SUBQUERY_OPS:
             return []
         value_so_far = " ".join(head[2:])
@@ -580,13 +592,13 @@ def _where_entries(session: Session, doc: str, head: list[str], token: str) -> l
             # value (a later one replaces it), so nothing follows a closed one —
             # and a stray Enter cannot append a second value to the clause.
             return []
-        return _value_entries(session, doc, head[0].split(".")[-1], token)
+        return _value_entries(session, doc, head[0].split(".")[-1], token, schema)
     if len(head) == 1:
-        rows = [(0, op, "operator", f"{op} ") for op in operators()]
+        rows = [(0, op, "operator", f"{op} ") for op in operators(schema)]
         return _offers(rows, token)
     if head:
         return []
-    return _column_offers(session, doc, token)
+    return _column_offers(session, doc, token, schema)
 
 
 class CommandPalette(OptionList):
@@ -781,8 +793,7 @@ class CommandPalette(OptionList):
         the command breaks the line first, so it never lands after whatever the
         caret happened to be sitting in.
         """
-        with self.session.target_source(self.source_id):
-            target = clause_line(editor.text, row + 1, name)
+        target = clause_line(editor.text, row + 1, name)
         if target is not None and target != row + 1:
             editor.replace("", (row, view.start), (row, column))
             editor.cursor_location = (target - 1, len(editor.document[target - 1]))

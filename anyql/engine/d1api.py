@@ -51,12 +51,21 @@ _TYPE_MAP: dict[tuple[str, ...], str] = {
     ("DATETIME", "TIMESTAMP"): "timestamp",
     ("BOOLEAN", "BOOL"): "boolean",
 }
+# Prefix rules ordered longest-key-first, so a longer name never loses to a
+# shorter prefix of itself (DATETIME must not match DATE, CHARACTER not CHAR).
+_TYPE_PREFIXES: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((key, dtype) for keys, dtype in _TYPE_MAP.items() for key in keys),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+)
 
 
 def _ibis_type(declared: str, notnull: int) -> str:
     name = (declared or "").strip().upper().split("(")[0].strip()
-    for keys, dtype in _TYPE_MAP.items():
-        if name in keys or any(name.startswith(k) for k in keys):
+    for key, dtype in _TYPE_PREFIXES:
+        if name == key or name.startswith(key):
             null = "!" if notnull else ""
             return f"{null}{dtype}"
     return "!string" if notnull else "string"

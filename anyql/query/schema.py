@@ -1,16 +1,16 @@
-"""Schema seam — ported from an earlier TypeScript implementation.
+"""Immutable schema snapshots at the language layer's backend boundary.
 
-The single edge between the language layer and the live backend.
-`set_schema_state(tables, capabilities)` is called by the data layer whenever
-it (re)delivers schemas and capabilities; before the first load the registry is
-simply empty, so the parser stays pure and degrades quietly instead of
-complaining about columns that don't exist yet. The contract is `docs/AST.md`,
-pinned by `spec/canonical-query.ast.json`.
+Parsing without a snapshot uses ``EMPTY_SCHEMA`` and quietly permits unknown
+columns and tables. Sessions replace their own snapshot when a source changes;
+a parse retains its captured tables, capabilities, and saved functions.
+The wire contract remains ``docs/AST.md`` and ``spec/canonical-query.ast.json``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Literal
 
 from .functions import SCALAR_FUNCTIONS
@@ -23,35 +23,51 @@ TEMPORAL: tuple[str, ...] = ("year", "month", "day", "quarter", "hour", "minute"
 DtypeFamily = Literal["timestamp", "date", "time", "string"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class ColumnDef:
     name: str
     # Backend dtype name (ibis `dtype.name()`): "int64", "float64", "string", ...
     type: str
     doc: str = ""
     # Declared enum-ish domain; used as the sync fallback for value completion.
-    values: list[str] | None = None
+    values: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.values is not None:
+            object.__setattr__(self, "values", tuple(self.values))
 
 
-@dataclass
+@dataclass(frozen=True)
 class TableDef:
     name: str
     doc: str = ""
-    columns: list[ColumnDef] = field(default_factory=list)
+    columns: tuple[ColumnDef, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "columns", tuple(self.columns))
 
 
-@dataclass
+@dataclass(frozen=True)
 class Capabilities:
     """What the connected backend actually supports — the capability filter."""
 
     backend: str
-    aggregates: list[str]
+    aggregates: tuple[str, ...]
     # dtype family -> scalar functions usable on that type (timestamp -> year, ...).
-    functions: dict[str, list[str]]
-    operators: list[str]
+    functions: Mapping[str, tuple[str, ...]]
+    operators: tuple[str, ...]
     # Rank-style window functions usable as `<fn>() over ( … )` in `\\select`.
-    window_functions: list[str] = field(default_factory=list)
-    supports: dict[str, bool] = field(default_factory=dict)
+    window_functions: tuple[str, ...] = ()
+    supports: Mapping[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "aggregates", tuple(self.aggregates))
+        object.__setattr__(self, "functions", MappingProxyType({
+            family: tuple(functions) for family, functions in self.functions.items()
+        }))
+        object.__setattr__(self, "operators", tuple(self.operators))
+        object.__setattr__(self, "window_functions", tuple(self.window_functions))
+        object.__setattr__(self, "supports", MappingProxyType(dict(self.supports)))
 
 
 def dtype_family(type: str) -> DtypeFamily | None:
@@ -67,32 +83,36 @@ def dtype_family(type: str) -> DtypeFamily | None:
     return None
 
 
-# Conservative duckdb defaults per the sidecar contract; replaced on load.
+# Conservative duckdb defaults per the sidecar contract.
 DEFAULT_CAPABILITIES = Capabilities(
     backend="duckdb",
-    aggregates=["sum", "avg", "count", "min", "max"],
+    aggregates=AGGREGATES,
     functions={
-        "timestamp": ["year", "month", "day", "quarter", "hour", "minute", "second"],
-        "date": ["year", "month", "day", "quarter"],
-        "time": ["hour", "minute", "second"],
-        "string": [fn for fn in SCALAR_FUNCTIONS if fn != "string"],
-        "any": ["string"],
+        "timestamp": TEMPORAL,
+        "date": ("year", "month", "day", "quarter"),
+        "time": ("hour", "minute", "second"),
+        "string": tuple(fn for fn in SCALAR_FUNCTIONS if fn != "string"),
+        "any": ("string",),
     },
-    operators=["=", "!=", ">", ">=", "<", "<=", "like"],
-    window_functions=["rank", "dense_rank", "row_number"],
+    operators=("=", "!=", ">", ">=", "<", "<=", "like"),
+    window_functions=("rank", "dense_rank", "row_number"),
     supports={"groupBy": True, "orderBy": True, "limit": True, "distinct": True, "like": True},
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class PoolColumn(ColumnDef):
     """Flat, name-deduplicated pool of every known dataset field."""
 
     # Datasets defining this column, in load order.
-    tables: list[str] = field(default_factory=list)
+    tables: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "tables", tuple(self.tables))
 
 
-@dataclass
+@dataclass(frozen=True)
 class FnDef:
     """A saved table-valued function: a named, parameterized query body.
 
@@ -105,12 +125,15 @@ class FnDef:
     """
 
     name: str
-    params: list[str] = field(default_factory=list)
+    params: tuple[str, ...] = ()
     body: str = ""
     doc: str = ""
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "params", tuple(self.params))
 
-@dataclass
+
+@dataclass(frozen=True)
 class OpenTable:
     """One of the query's open tables: its identifier is the alias when set."""
 
@@ -118,81 +141,76 @@ class OpenTable:
     identifier: str
 
 
-_tables: list[TableDef] = []
-_capabilities_state: Capabilities = DEFAULT_CAPABILITIES
-_pool: list[PoolColumn] = []
+@dataclass(frozen=True)
+class SchemaContext:
+    """One coherent, deeply immutable schema captured for a parse or completion."""
+
+    tables: tuple[TableDef, ...] = ()
+    capabilities: Capabilities = DEFAULT_CAPABILITIES
+    fns: tuple[FnDef, ...] = ()
+    pool: tuple[PoolColumn, ...] = field(init=False)
+    _fns_by_name: Mapping[str, FnDef] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tables", tuple(self.tables))
+        object.__setattr__(self, "fns", tuple(self.fns))
+        object.__setattr__(self, "_fns_by_name", MappingProxyType({fn.name: fn for fn in self.fns}))
+        if not self.capabilities.window_functions:
+            object.__setattr__(self, "capabilities", replace(
+                self.capabilities, window_functions=DEFAULT_CAPABILITIES.window_functions,
+            ))
+        by_name: dict[str, tuple[ColumnDef, list[str]]] = {}
+        for table in self.tables:
+            for column in table.columns:
+                existing = by_name.get(column.name)
+                if existing is None:
+                    by_name[column.name] = (column, [table.name])
+                else:
+                    existing[1].append(table.name)
+        object.__setattr__(self, "pool", tuple(
+            PoolColumn(column.name, column.type, column.doc, column.values, tuple(tables))
+            for column, tables in by_name.values()
+        ))
+
+    def table_by_name(self, name: str) -> TableDef | None:
+        return next((table for table in self.tables if table.name == name), None)
+
+    def column_by_name(self, name: str) -> PoolColumn | None:
+        return next((column for column in self.pool if column.name == name), None)
+
+    def fn_by_name(self, name: str) -> FnDef | None:
+        return self._fns_by_name.get(name)
+
+    def resolve_qualified(
+        self, prefix: str, name: str, open_tables: Sequence[OpenTable],
+    ) -> tuple[ColumnDef | None, str | None]:
+        """Resolve `identifier.column` with a strict alias/prefix match."""
+        match = next((table for table in open_tables if table.identifier == prefix), None)
+        table = self.table_by_name(match.dataset) if match else None
+        if table is None:
+            return None, None
+        column = next((column for column in table.columns if column.name == name), None)
+        return column, table.name
+
+    def resolve_column(self, name: str, open_tables: Sequence[OpenTable]) -> PoolColumn | None:
+        """Resolve a bare column left-to-right; the matched table leads `tables`."""
+        for open_table in open_tables:
+            table = self.table_by_name(open_table.dataset)
+            if table is None:
+                continue
+            column = next((column for column in table.columns if column.name == name), None)
+            if column is None:
+                continue
+            pooled = self.column_by_name(name)
+            tables = pooled.tables if pooled else ()
+            return PoolColumn(
+                column.name, column.type, column.doc, column.values,
+                (open_table.dataset, *(table for table in tables if table != open_table.dataset)),
+            )
+        return None
 
 
-def set_schema_state(next_tables: list[TableDef], next_capabilities: Capabilities | None = None) -> None:
-    """Install the live schema + capabilities (called on every refresh)."""
-    global _tables, _capabilities_state, _pool
-    _tables = list(next_tables)
-    if next_capabilities is not None:
-        _capabilities_state = replace(
-            next_capabilities,
-            window_functions=next_capabilities.window_functions or DEFAULT_CAPABILITIES.window_functions,
-        )
-    by_name: dict[str, PoolColumn] = {}
-    for table in _tables:
-        for col in table.columns:
-            existing = by_name.get(col.name)
-            if existing is not None:
-                existing.tables.append(table.name)
-            else:
-                by_name[col.name] = PoolColumn(col.name, col.type, col.doc, col.values, [table.name])
-    _pool = list(by_name.values())
-
-
-_fns: dict[str, FnDef] = {}
-
-
-def set_fns(next_fns: list[FnDef]) -> None:
-    """Install the live function registry (called on every refresh).
-
-    Independent of `set_schema_state`: functions belong to the session, not to
-    the active source, so switching sources keeps them. An empty list clears
-    them — which is also the pure-parse regime the canonical fixture runs in.
-    """
-    global _fns
-    _fns = {fn.name: fn for fn in next_fns}
-
-
-def fns() -> list[FnDef]:
-    """Every registered function, in definition order."""
-    return list(_fns.values())
-
-
-def fn_by_name(name: str) -> FnDef | None:
-    return _fns.get(name)
-
-
-def schema_tables() -> list[TableDef]:
-    """All currently loaded tables, in load order."""
-    return _tables
-
-
-def column_pool() -> list[PoolColumn]:
-    """The deduplicated cross-dataset column pool."""
-    return _pool
-
-
-def capabilities() -> Capabilities:
-    """The active capability set (duckdb defaults until the backend answers)."""
-    return _capabilities_state
-
-
-def table_by_name(name: str) -> TableDef | None:
-    for table in _tables:
-        if table.name == name:
-            return table
-    return None
-
-
-def column_by_name(name: str) -> PoolColumn | None:
-    for col in _pool:
-        if col.name == name:
-            return col
-    return None
+EMPTY_SCHEMA = SchemaContext()
 
 
 def open_tables_of(from_clause, joins) -> list[OpenTable]:
@@ -208,39 +226,3 @@ def open_tables_of(from_clause, joins) -> list[OpenTable]:
     for join in joins:
         out.append(OpenTable(join.dataset, join.alias or join.dataset))
     return out
-
-
-def resolve_qualified(prefix: str, name: str, open: list[OpenTable]) -> tuple[ColumnDef | None, str | None]:
-    """Resolve a qualified `identifier.column` reference (STRICT prefix match)."""
-    match = next((o for o in open if o.identifier == prefix), None)
-    table = table_by_name(match.dataset) if match else None
-    if table is None:
-        return None, None
-    col = next((c for c in table.columns if c.name == name), None)
-    return col, table.name
-
-
-def resolve_column(name: str, open_tables: list[OpenTable]) -> PoolColumn | None:
-    """Resolve a bare column against open tables left-to-right: first table wins.
-
-    `None` when no open table has it (or the schema is not loaded). The matched
-    open table leads the returned `tables` list, so consumers read `tables[0]`
-    as the table a bare reference resolves to.
-    """
-    for open_table in open_tables:
-        table = table_by_name(open_table.dataset)
-        if table is None:
-            continue
-        col = next((c for c in table.columns if c.name == name), None)
-        if col is None:
-            continue
-        pool_entry = column_by_name(name)
-        tables = list(pool_entry.tables) if pool_entry else []
-        return PoolColumn(
-            col.name,
-            col.type,
-            col.doc,
-            col.values,
-            [open_table.dataset, *[t for t in tables if t != open_table.dataset]],
-        )
-    return None

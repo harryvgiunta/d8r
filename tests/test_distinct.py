@@ -9,11 +9,11 @@ import pytest
 
 from anyql.engine import add_sqlite_source, expression
 from anyql.engine.execute import execute
-from anyql.query import FnDef, clause_line, parse_query, payload_from_ast, set_fns
+from anyql.query import EMPTY_SCHEMA, FnDef, SchemaContext, clause_line, parse_query, payload_from_ast
 
 
-def run(doc: str, con, **kwargs) -> dict:
-    ast = parse_query(doc)
+def run(doc: str, con, *, schema=EMPTY_SCHEMA, **kwargs) -> dict:
+    ast = parse_query(doc, schema=schema)
     assert ast.errors == []
     return execute(con, payload_from_ast(ast), **kwargs)
 
@@ -87,12 +87,12 @@ def test_cte_and_inline_distinct_are_local_to_their_query_block(con):
 
 
 def test_function_body_distinct_survives_argument_expansion(con):
-    set_fns([FnDef(
+    schema = SchemaContext(fns=[FnDef(
         "kinds",
         params=["minimum"],
         body="\\from events\n\\where user_id > @minimum\n\\select event_type\n\\unique",
     )])
-    assert run("\\from kinds(0)\n\\select count(event_type) as n", con)["rows"] == [[4]]
+    assert run("\\from kinds(0)\n\\select count(event_type) as n", con, schema=schema)["rows"] == [[4]]
 
 
 def test_sqlite_tuple_null_and_empty_input_semantics(tmp_path):

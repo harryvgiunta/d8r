@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 
 from .alias import effective_alias
 from .ast import (
@@ -46,10 +47,8 @@ from .schema import (
     AGGREGATES,
     TEMPORAL,
     open_tables_of,
-    schema_tables,
-    table_by_name,
-    fn_by_name,
-    fns as fns_registry,
+    EMPTY_SCHEMA,
+    SchemaContext,
 )
 
 # A column reference: bare (`amount`) or qualified with one dot (`users.score`).
@@ -86,8 +85,13 @@ _OVER_TAIL_RE = re.compile(r"^\s*(.*?)\s+over\s*\(\s*([^()]*)\s*\)\s*$", re.IGNO
 _RANK_RE = re.compile(r"^(rank|dense_rank|row_number)\(\s*\)$", re.IGNORECASE)
 _RANK_NAME_RE = re.compile(r"^(rank|dense_rank|row_number)$", re.IGNORECASE)
 # `over ( [partition by <cols>] [order by <col> [asc|desc]] )` — at least one.
-_PARTITION_RE = re.compile(r"^\s*partition\s+by\s+([\w.,\s]+?)\s*$", re.IGNORECASE | re.ASCII)
-_ORDER_TAIL_RE = re.compile(rf"^\s*order\s+by\s+({_COL})(?:\s+(asc|desc))?\s*$", re.IGNORECASE)
+_PARTITION_START_RE = re.compile(r"partition\s+by\s+", re.IGNORECASE | re.ASCII)
+_ORDER_START_RE = re.compile(r"order\s+by\b", re.IGNORECASE | re.ASCII)
+_WINDOW_COLUMN_RE = re.compile(_COL)
+_WINDOW_ORDER_RE = re.compile(
+    rf"order\s+by\s+({_COL})(?:\s+(asc|desc))?(?=\s|$)", re.IGNORECASE | re.ASCII
+)
+_FRAME_START_RE = re.compile(r"(?<![\w.])(?:rows|range)\s+between\b", re.IGNORECASE | re.ASCII)
 # `rows|range between <bound> and <bound>` — the window frame inside `over (...)`.
 _FRAME_HEAD_RE = re.compile(r"^(rows|range)\s+between\s+(.+?)\s+and\s+(.+)$", re.IGNORECASE | re.ASCII)
 _FRAME_BOUND_RE = re.compile(
@@ -148,6 +152,20 @@ TX_BARE = frozenset({"begin", "commit"})
 
 _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
 
+# At CPython's minimum configurable integer-string limit (640 digits).
+MAX_NUMERIC_CHARS = 640
+MAX_FUNCTION_DEPTH = 16
+MAX_FUNCTION_EXPANSIONS = 256
+
+
+def checked_integer(text: str, label: str) -> int:
+    if len(text) > MAX_NUMERIC_CHARS:
+        raise ValueError(f"{label} is too large (maximum {MAX_NUMERIC_CHARS} characters)")
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(f"{label} must be an integer") from None
+
 
 def split_top(text: str, *, keep_empty: bool = False) -> list[str]:
     """Split on commas at paren depth 0: `\\select a, sum(b) as x, c` → 3 segments.
@@ -193,7 +211,9 @@ def parse_literal(text: str) -> LiteralValue | None:
         return LiteralValue(text[1:-1].replace(quote * 2, quote))
     if _NUMBER_RE.fullmatch(text):
         if not any(char in text.lower() for char in ".e"):
-            return LiteralValue(int(text))
+            return LiteralValue(checked_integer(text, "numeric literal"))
+        if len(text) > MAX_NUMERIC_CHARS:
+            raise ValueError(f"numeric literal is too large (maximum {MAX_NUMERIC_CHARS} characters)")
         value = float(text)
         return LiteralValue(value) if math.isfinite(value) else None
     keyword = text.lower()
@@ -353,6 +373,9 @@ def parse_subquery(body: str, line: int, opts: ParseOpts, outer: list[str] | Non
     return parse_slice(
         commands,
         ParseOpts(
+            schema=opts.schema,
+            expansion_stack=opts.expansion_stack,
+            expansion_budget=opts.expansion_budget,
             fixed_line=line,
             typing_line=opts.typing_line,
             visible_ctes=visible_ctes_of(opts, ()),
@@ -381,7 +404,7 @@ def parse_frame_bounds(text: str) -> FrameBounds | None:
     bounds: list[str] = []
     for raw in (head.group(2), head.group(3)):
         bound = raw.strip().lower()
-        if _FRAME_BOUND_RE.match(bound) is None:
+        if _FRAME_BOUND_RE.match(bound) is None or len(bound.split()[0]) > MAX_NUMERIC_CHARS:
             return None
         # `2  preceding` -> `2 preceding`: one spelling per bound in the AST.
         bounds.append(re.sub(r"\s+", " ", bound))
@@ -476,6 +499,43 @@ def substitute_params(body: str, args: dict[str, str]) -> str | None:
     return "".join(out)
 
 
+def balanced_function_text(text: str) -> bool:
+    """Quoted delimiters are values; only unquoted parentheses affect nesting."""
+    quote: str | None = None
+    depth = 0
+    for char in text:
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return quote is None and depth == 0
+
+
+def expand_function_body(body: str, args: dict[str, str]) -> list[str]:
+    """Bind within existing commands, never re-scan their boundaries after binding."""
+    if not balanced_function_text(body):
+        raise ValueError("unbalanced quotes or parentheses in function body")
+    if any(not balanced_function_text(arg) for arg in args.values()):
+        raise ValueError("unbalanced quotes or parentheses in function argument")
+    commands: list[str] = []
+    for command in split_commands(body):
+        expanded = substitute_params(command, args)
+        if expanded is None:
+            missing = next(name for _, _, name in param_spans(command) if name not in args)
+            raise ValueError(f'unknown parameter "@{missing}"')
+        if not balanced_function_text(expanded):
+            raise ValueError("argument leaves unbalanced quotes or parentheses in function body")
+        commands.append(expanded)
+    return commands
+
+
 def parse_fn_source(
     rest: str,
     line: int,
@@ -493,25 +553,35 @@ def parse_fn_source(
     to the function name, so the body's columns qualify through it the way a
     dataset's would.
 
-    An argument is a value or an inline `( \from … )` subquery, never a
-    command: text containing `\` is refused rather than spliced in.
+    An argument is a balanced value, never a command: text containing `\`
+    is refused rather than spliced in.
     """
     head = re.match(rf"^({_IDENT})\s*\(", rest)
     if head is None:
         return None
     name = head.group(1)
-    fn = fn_by_name(name)
-    known = fns_registry()
+    fn = opts.schema.fn_by_name(name)
+    known = opts.schema.fns
     if fn is None:
         if not known:
             # Pure-parse regime: no registry loaded means no functions to find;
             # the site's own dataset-name error is the honest one here.
             return None
         return (name, None, "", f'unknown function "{name}" — defined: ' + ", ".join(t.name for t in known))
+    if name in opts.expansion_stack:
+        chain = " → ".join((*opts.expansion_stack, name))
+        return (name, None, "", f"recursive function call: {chain}")
+    if len(opts.expansion_stack) >= MAX_FUNCTION_DEPTH:
+        return (name, None, "", f"function expansion exceeds {MAX_FUNCTION_DEPTH} nested calls")
+    if opts.expansion_budget.remaining == 0:
+        return (name, None, "", f"query exceeds {MAX_FUNCTION_EXPANSIONS} function expansions")
+    opts.expansion_budget.remaining -= 1
     paren = take_paren(rest[head.end() - 1 :])
     if paren is None:
         return (name, None, "", f'a function call needs a closing ")" — {name}(...)')
-    args = split_top(paren[0])
+    args = split_top(paren[0], keep_empty=True) if paren[0].strip() else []
+    if any(not arg for arg in args):
+        return (name, None, "", f"{name}() cannot contain an empty argument")
     if len(args) != len(fn.params):
         if not fn.params:
             takes = "takes no arguments"
@@ -535,22 +605,18 @@ def parse_fn_source(
         if not allow_alias:
             return (name, None, "", "a set-operation source cannot be aliased")
         alias = am.group(1)
-    mapping = dict(zip(fn.params, args))
-    text = substitute_params(fn.body, mapping)
-    if text is None:
-        missing = next(s[2] for s in param_spans(fn.body) if s[2] not in mapping)
-        return (
-            name,
-            None,
-            "",
-            f'function "{name}" uses unknown parameter "@{missing}"',
-        )
-    commands = split_commands(text)
+    try:
+        commands = expand_function_body(fn.body, dict(zip(fn.params, args)))
+    except ValueError as exc:
+        return (name, None, "", f'function "{name}": {exc}')
     if not commands:
         return (name, None, "", f'function "{name}" has no query body')
     body_ast = parse_slice(
         commands,
         ParseOpts(
+            schema=opts.schema,
+            expansion_stack=(*opts.expansion_stack, name),
+            expansion_budget=opts.expansion_budget,
             fixed_line=line,
             typing_line=opts.typing_line,
             # A saved body is its own document: it references datasets, never
@@ -563,7 +629,13 @@ def parse_fn_source(
     return (name, body_ast, alias, "")
 
 
-def parse_body(text: str, params: list[str]) -> list[str]:
+def parse_body(
+    text: str,
+    params: Sequence[str],
+    *,
+    schema: SchemaContext = EMPTY_SCHEMA,
+    function_name: str | None = None,
+) -> list[str]:
     """Why a FN body text is not a usable relation, as error messages.
 
     The editor runs this on save so a function that would only fail at a call
@@ -580,14 +652,20 @@ def parse_body(text: str, params: list[str]) -> list[str]:
     for name in dict.fromkeys(used):
         if name not in params:
             messages.append(f'unknown parameter "@{name}" — declare it or remove it')
-    probe = substitute_params(text, {name: "0" for name in used})
-    assert probe is not None  # every @token above is bound to itself
-    commands = split_commands(probe)
+    try:
+        commands = expand_function_body(text, {name: "0" for name in used})
+    except ValueError as exc:
+        return [*messages, str(exc)]
     if not commands:
         messages.append("a function body needs a query (a `\\from` line)")
         return messages
-    ast = parse_slice(commands, ParseOpts(fixed_line=1, typing_line=0, visible_ctes=[], top=False))
-    if ast.from_ is None:
+    ast = parse_slice(commands, ParseOpts(
+        schema=schema,
+        expansion_stack=(function_name,) if function_name else (),
+        expansion_budget=ExpansionBudget(MAX_FUNCTION_EXPANSIONS - int(function_name is not None)),
+        fixed_line=1, typing_line=0, visible_ctes=[], top=False,
+    ))
+    if ast.from_ is None and not ast.errors:
         messages.append("a function body needs a query (a `\\from` line)")
     messages.extend(error.message for error in ast.errors)
     return messages
@@ -608,7 +686,7 @@ def parse_regex_call(fn: str, args: list[str]) -> RegexCall | None:
         if len(args) == 3:
             if not _LIMIT_RE.match(args[2].strip()):
                 return None
-            group = int(args[2])
+            group = checked_integer(args[2].strip(), "regex capture group")
         return RegexCall(fn="regexp_extract", arg=column, pattern=unquote(args[1]), group=group)
     if len(args) != 3 or not unquote(args[1]):
         return None
@@ -681,65 +759,38 @@ def parse_case_arg(rest: str) -> CaseClause | None:
 
 
 def parse_over_frame(tail_raw: str) -> WindowFrame | None:
-    """Parse the inside of `over ( … )`.
-
-    `[partition by <col>…] [order by <col> [asc|desc]] [rows|range between <bound> and <bound>]`
-    — at least one of the first two. Returns `None` when it doesn't parse.
-    """
+    """Consume partition columns, ordering, then frame bounds in grammar order."""
     tail = tail_raw.strip()
-    if not tail:
-        return None
-
     partition_by: list[str] = []
     order: WindowOrder | None = None
     bounds: FrameBounds | None = None
-    work = tail
-
-    frame_at = None
-    for keyword in ("rows", "range"):
-        found = keyword_positions(work, keyword)
-        if found:
-            frame_at = (found[0], keyword)
-            break
-    if frame_at is not None:
-        at, _ = frame_at
-        # A frame follows the ordering, so anything before it is partition/order.
-        bounds = parse_frame_bounds(work[at:])
-        if bounds is None:
+    pos = 0
+    partition = _PARTITION_START_RE.match(tail)
+    if partition is not None:
+        pos = partition.end()
+        while True:
+            column = _WINDOW_COLUMN_RE.match(tail, pos)
+            if column is None:
+                return None
+            partition_by.append(column.group())
+            pos = column.end()
+            separator = _PAREN_SPLIT_RE.match(tail, pos)
+            if separator is None:
+                break
+            pos = separator.end()
+            if pos == len(tail) or _ORDER_START_RE.match(tail, pos) or _FRAME_START_RE.match(tail, pos):
+                break
+    ordering = _WINDOW_ORDER_RE.match(tail, pos)
+    if ordering is not None:
+        direction = ordering.group(2)
+        order = WindowOrder(column=ordering.group(1), direction=direction.lower() if direction else "asc")
+        pos = ordering.end()
+    remainder = tail[pos:].strip()
+    if remainder:
+        bounds = parse_frame_bounds(remainder)
+        if bounds is None or order is None:
             return None
-        work = work[:at].strip()
-
-    order_at = keyword_positions(work, "order")
-    order_text = ""
-    if order_at:
-        if len(order_at) > 1:
-            return None
-        order_text = work[order_at[0] :]
-        work = work[: order_at[0]].strip()
-
-    if work:
-        part = _PARTITION_RE.match(work)
-        if part is None:
-            return None
-        partition_by = [c for c in _PAREN_SPLIT_RE.split(part.group(1)) if c]
-        if not partition_by or not all(_COL_RE.match(c) for c in partition_by):
-            return None
-
-    if order_text:
-        order_match = _ORDER_TAIL_RE.match(order_text)
-        if order_match is None:
-            return None
-        direction = order_match.group(2)
-        order = WindowOrder(
-            column=order_match.group(1),
-            direction=direction.lower() if direction else "asc",
-        )
-
     if not partition_by and order is None:
-        return None
-    # A frame counts rows or values *relative to the ordering*: without one it
-    # would bound nothing, and every engine refuses it — so this parser does too.
-    if bounds is not None and order is None:
         return None
     return WindowFrame(partition_by=partition_by, order=order, frame=bounds)
 
@@ -750,7 +801,7 @@ def over_frame_error(text: str) -> str:
     A spelled frame is a shape of its own — an ordering to count from and two
     bounds — so it gets its own message instead of the partition/order one.
     """
-    if keyword_positions(text, "rows") or keyword_positions(text, "range"):
+    if _FRAME_START_RE.search(text):
         return (
             "over (...) frame needs order by <col> [asc|desc] and bounds of "
             "`<n> preceding`, `current row`, or `<n> following` "
@@ -769,16 +820,12 @@ def block_extent(lines: list[str], header: int) -> int:
     j = header + 1
     while j < len(lines):
         if not lines[j].strip():
-            # A blank line stays part of the block only when it continues.
-            continues = False
-            for k in range(j + 1, len(lines)):
-                if not lines[k].strip():
-                    continue
-                continues = bool(_INDENT_RE.match(lines[k]))
-                break
-            if not continues:
-                break
-            j += 1
+            # Inspect this blank run once, preserving its start if it ends the block.
+            blank_start = j
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j == len(lines) or not _INDENT_RE.match(lines[j]):
+                return blank_start
             continue
         if not _INDENT_RE.match(lines[j]):
             break
@@ -839,7 +886,16 @@ def clause_line(doc: str, line: int, command: str) -> int | None:
 
 
 @dataclass
+class ExpansionBudget:
+    # Shared by every nested slice: branching expansion must also be bounded.
+    remaining: int = MAX_FUNCTION_EXPANSIONS
+
+
+@dataclass
 class ParseOpts:
+    schema: SchemaContext = EMPTY_SCHEMA
+    expansion_stack: tuple[str, ...] = ()
+    expansion_budget: ExpansionBudget = field(default_factory=ExpansionBudget)
     # Line-number offset: body lines report their absolute document line.
     offset: int = 0
     # Absolute 1-based line being typed (errors suppressed there); 0 = none.
@@ -926,6 +982,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             body_ast = parse_slice(
                 body,
                 ParseOpts(
+                    schema=opts.schema,
+                    expansion_stack=opts.expansion_stack,
+                    expansion_budget=opts.expansion_budget,
                     offset=body_start + opts.offset,
                     typing_line=opts.typing_line,
                     visible_ctes=visible_ctes(),
@@ -936,7 +995,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             ast.errors.extend(body_ast.errors)
             body_ast.errors = []
             ast.with_.append(WithClause(line=line, name=name, body=body_ast))
-            if schema_tables() and name not in opts.visible_ctes and table_by_name(name):
+            if opts.schema.tables and name not in opts.visible_ctes and opts.schema.table_by_name(name):
                 # The CTE name shadows nothing, that's fine; only a dataset
                 # collision is worth flagging (the dataset becomes unreachable).
                 err(f'CTE name "{name}" shadows dataset "{name}"')
@@ -977,13 +1036,13 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             # CTE names defined earlier in the document count as known tables.
             if (
                 body is None
-                and schema_tables()
-                and not table_by_name(table)
+                and opts.schema.tables
+                and not opts.schema.table_by_name(table)
                 and table not in visible_ctes()
             ):
                 err(
                     f'unknown table "{table}" — loaded datasets: '
-                    + ", ".join(t.name for t in schema_tables())
+                    + ", ".join(t.name for t in opts.schema.tables)
                 )
             i += 1
             continue
@@ -1126,13 +1185,13 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             # Like `\from`: only complain once the schema has loaded.
             if (
                 body is None
-                and schema_tables()
-                and not table_by_name(table)
+                and opts.schema.tables
+                and not opts.schema.table_by_name(table)
                 and table not in visible_ctes()
             ):
                 err(
                     f'unknown table "{table}" — loaded datasets: '
-                    + ", ".join(t.name for t in schema_tables())
+                    + ", ".join(t.name for t in opts.schema.tables)
                 )
             i += 1
             continue
@@ -1184,13 +1243,13 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             # and a CTE defined earlier is a table for this purpose.
             if (
                 body is None
-                and schema_tables()
-                and not table_by_name(name)
+                and opts.schema.tables
+                and not opts.schema.table_by_name(name)
                 and name not in visible_ctes()
             ):
                 err(
                     f'unknown table "{name}" — loaded datasets: '
-                    + ", ".join(t.name for t in schema_tables())
+                    + ", ".join(t.name for t in opts.schema.tables)
                 )
             i += 1
             continue
@@ -1239,7 +1298,12 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         continue
                     item.window = frame
                     core = over.group(1).strip()
-                item.literal = parse_literal(core)
+                try:
+                    item.literal = parse_literal(core)
+                except ValueError as exc:
+                    err(str(exc))
+                    ast.select.append(item)
+                    continue
                 if item.literal is not None:
                     if item.window:
                         err("a literal cannot carry over (...) — wrap it in a function")
@@ -1270,7 +1334,12 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 if regex:
                     fn = regex.group(1).lower()
                     args = split_top(regex.group(2))
-                    call = parse_regex_call(fn, args)
+                    try:
+                        call = parse_regex_call(fn, args)
+                    except ValueError as exc:
+                        err(str(exc))
+                        ast.select.append(item)
+                        continue
                     if call is None:
                         err(
                             "regexp_extract expects `<column>, <pattern>[, <group>]`"
@@ -1408,7 +1477,10 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 err("limit must be a non-negative integer")
                 i += 1
                 continue
-            ast.limit = int(rest)
+            try:
+                ast.limit = checked_integer(rest, "limit")
+            except ValueError as exc:
+                err(str(exc))
             i += 1
             continue
 
@@ -1497,7 +1569,7 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
     # IDENTIFIER: an aliased table answers only to its alias, so the dataset
     # name of an aliased table behaves as an unknown column. Only validated
     # once the schema loaded (mirrors `\from`), and never on the typed line.
-    if schema_tables():
+    if opts.schema.tables:
         open_idents = [t.identifier for t in open_tables_of(ast.from_, ast.joins)]
         # A lateral body may also read the identifiers outside it.
         known_idents = [*open_idents, *opts.outer_idents]
@@ -1528,6 +1600,8 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
                 check(s.line, s.aggregate.arg)
             if s.temporal:
                 check(s.line, s.temporal.arg)
+            if s.regex:
+                check(s.line, s.regex.arg)
             if s.scalar:
                 check_scalar(s.line, s.scalar)
             if s.window:
@@ -1585,14 +1659,16 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
             term.resolves_to = None  # a real output column, not a select item
 
 
-def parse_query(doc: str) -> QueryAST:
-    """Parse a whole document into its QueryAST (pure function of `doc`)."""
+def parse_query(doc: str, *, schema: SchemaContext = EMPTY_SCHEMA, settled: bool = False) -> QueryAST:
+    """Parse text against one immutable schema; explicit submissions are settled."""
     lines = doc.split("\n")
     last_content_line = 0
     for i, raw in enumerate(lines):
         if raw.strip():
             last_content_line = i + 1
-    return parse_slice(lines, ParseOpts(offset=0, typing_line=last_content_line, visible_ctes=[], top=True))
+    return parse_slice(lines, ParseOpts(
+        schema=schema, typing_line=0 if settled else last_content_line,
+    ))
 
 
 def payload_from_ast(ast: QueryAST) -> dict:

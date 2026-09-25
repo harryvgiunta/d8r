@@ -47,19 +47,14 @@ from anyql.query import (
     Capabilities,
     ColumnDef,
     QueryAST,
+    SchemaContext,
     TableDef,
     FnDef,
-    column_by_name,
-    column_pool,
     is_identifier,
     open_tables_of,
     parse_body,
     parse_query,
     payload_from_ast,
-    resolve_column,
-    set_schema_state,
-    set_fns,
-    table_by_name,
 )
 from anyql.storage import MemoryStore
 
@@ -100,11 +95,11 @@ def capabilities_object(source: DataSource) -> Capabilities:
     caps = capabilities_for(source)
     return Capabilities(
         backend=caps["backend"],
-        aggregates=list(caps["aggregates"]),
-        functions={family: list(fns) for family, fns in caps["functions"].items()},
-        operators=list(caps["operators"]),
-        window_functions=list(caps.get("windowFunctions", [])),
-        supports=dict(caps.get("supports", {})),
+        aggregates=caps["aggregates"],
+        functions=caps["functions"],
+        operators=caps["operators"],
+        window_functions=caps.get("windowFunctions", ()),
+        supports=caps.get("supports", {}),
     )
 
 
@@ -232,9 +227,9 @@ class TxState:
 class Session:
     """The app's state: which source is live, what dialect, what has run.
 
-    Constructing one loads the bundled engine registry and installs its schema
-    into the language layer's registry seam, so a session is always ready to
-    parse a document against real columns — no separate "load" step.
+    Constructing one loads the bundled engine registry and captures its schema,
+    so a session is always ready to parse against real columns without changing
+    the language layer or any other session.
     """
 
     def __init__(
@@ -246,7 +241,7 @@ class Session:
         # The palette's master switch is session-only, owned by Settings.
         self.intellisense: bool = True
         # UI-owned reservation: a background run/context lookup owns the shared
-        # connection and schema seam until its real work finishes. Headless
+        # connection until its real work finishes. Headless
         # callers keep the synchronous run API and need no reservation.
         self.busy: str = ""
         self.ai_config = AIConfig()
@@ -283,7 +278,7 @@ class Session:
 
     def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]]) -> None:
         self._memory.save([
-            {"name": fn.name, "params": fn.params, "body": fn.body, "description": fn.doc}
+            {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc}
             for fn in fns.values()
         ], profiles)
 
@@ -308,7 +303,7 @@ class Session:
         return self.sources[self.active_id]
 
     def set_active(self, source_id: str) -> None:
-        """Point the session at another registered source and re-seam the schema."""
+        """Point the session at another registered source and capture its schema."""
         if source_id not in self.sources:
             raise KeyError(source_id)
         self.active_id = source_id
@@ -319,7 +314,7 @@ class Session:
     def target_source(self, source_id: str | None = None) -> Iterator[None]:
         """Use a source for synchronous editor work, then restore the workspace.
 
-        Never hold this scope across an await: the language registry is shared.
+        Never hold this scope across an await: the session's active source changes.
         """
         if source_id is None or source_id == self.active_id:
             yield
@@ -337,50 +332,55 @@ class Session:
         self.sources[source.id] = source
         if activate:
             self.set_active(source.id)
+        elif source.id == self.active_id:
+            self.refresh_schema()
 
     def refresh_schema(self) -> None:
-        """Install the active source's tables + capabilities into the registry.
-
-        This is the seam the parser's strict regime and the palette both read;
-        it is refreshed on every source change, never cached across sources.
-        The saved functions ride along — the parser reads them from the same
-        module-level seam, so a call resolves against the live schema.
-        """
-        set_schema_state(tables_of(self.source), capabilities_object(self.source))
-        set_fns(list(self.fns.values()))
+        """Replace this session's snapshot; in-flight parses retain the old one."""
+        source = self.source
+        self.schema = SchemaContext(
+            tables=tables_of(source), capabilities=capabilities_object(source),
+            fns=tuple(self.fns.values()),
+        )
 
     # -- palette data -------------------------------------------------------
 
-    def open_tables(self, doc: str):
+    def open_tables(self, doc: str, *, schema: SchemaContext | None = None):
         """The document's open tables (empty when it has no `\\from` yet)."""
-        ast = parse_query(doc)
+        schema = self.schema if schema is None else schema
+        ast = parse_query(doc, schema=schema)
         if ast.from_ is None:
             return []
         return open_tables_of(ast.from_, ast.joins)
 
-    def column_entries(self, doc: str) -> list[tuple[str, str, str]]:
+    def column_entries(
+        self, doc: str, *, schema: SchemaContext | None = None,
+    ) -> list[tuple[str, str, str]]:
         """(column, dtype, detail) rows for the palette, open tables first.
 
         With a `\\from` set the rows are exactly the document's open tables, in
         open order; without one they are the registry's cross-dataset pool.
         This is the data — which rows match what is typed is the palette's rule.
         """
-        open_tables = self.open_tables(doc)
+        schema = self.schema if schema is None else schema
+        open_tables = self.open_tables(doc, schema=schema)
         rows: list[tuple[str, str, str]] = []
         if open_tables:
             for table_name in dict.fromkeys(t.dataset for t in open_tables):
-                table = table_by_name(table_name)
+                table = schema.table_by_name(table_name)
                 if table is None:
                     continue
                 for column in table.columns:
                     rows.append((column.name, column.type, f"{column.type} · {table_name}"))
         else:
             rows = [
-                (col.name, col.type, f"{col.type} · {', '.join(col.tables)}") for col in column_pool()
+                (col.name, col.type, f"{col.type} · {', '.join(col.tables)}") for col in schema.pool
             ]
         return rows
 
-    def dataset_entries(self, doc: str) -> list[tuple[str, str]]:
+    def dataset_entries(
+        self, doc: str, *, schema: SchemaContext | None = None,
+    ) -> list[tuple[str, str]]:
         """(table, detail) rows for the dataset-taking palette clauses.
 
         The document's own `\\with` names lead: a CTE is addressable by name
@@ -389,14 +389,14 @@ class Session:
         source's datasets, in registry order; a temp table this session created
         says so instead of showing a row count that is only as fresh as the run.
         """
-        ctes = [(cte.name, "cte") for cte in parse_query(doc).with_]
-        return [
-            *ctes,
-            *(
-                (name, "temp table" if entry.get("temp") else f"{entry['rows']} rows")
-                for name, entry in self.source.datasets.items()
-            ),
+        schema = self.schema if schema is None else schema
+        source = self.source
+        datasets = [
+            (name, "temp table" if entry.get("temp") else f"{entry['rows']} rows")
+            for name, entry in source.datasets.items()
         ]
+        ctes = [(cte.name, "cte") for cte in parse_query(doc, schema=schema).with_]
+        return [*ctes, *datasets]
 
 
     # -- saved table-valued functions --------------------------------------
@@ -408,7 +408,7 @@ class Session:
         positional signature; the body is validated against the live schema
         exactly as a call would expand it (`parse_body`), so a function that
         could only fail at its call site is refused here. Saving persists first,
-        then re-seams the registry so the parser resolves a call immediately.
+        then replaces the snapshot so the parser resolves a call immediately.
         """
         fn = self.validate_fn(name, params_text, body, doc)
         functions = dict(self.fns)
@@ -418,9 +418,8 @@ class Session:
         self.refresh_schema()
         return fn
 
-    @staticmethod
-    def validate_fn(name: str, params_text: str, body: str, doc: str) -> FnDef:
-        """Build a validated definition without saving or changing the registry."""
+    def validate_fn(self, name: str, params_text: str, body: str, doc: str) -> FnDef:
+        """Validate a candidate snapshot without saving or replacing live definitions."""
         name = name.strip()
         if not is_identifier(name):
             raise ValueError("the function name must be a bare identifier (letters, digits, _)")
@@ -430,10 +429,18 @@ class Session:
         for param in params:
             if not is_identifier(param):
                 raise ValueError(f'parameter "{param}" is not a bare identifier')
-        messages = parse_body(body, params)
+        fn = FnDef(name=name, params=params, body=body, doc=doc.strip())
+        schema = self.schema
+        functions = dict(self.fns)
+        functions[name] = fn
+        candidate = SchemaContext(
+            tables=schema.tables, capabilities=schema.capabilities,
+            fns=tuple(functions.values()),
+        )
+        messages = parse_body(body, fn.params, schema=candidate, function_name=name)
         if messages:
             raise ValueError(messages[0])
-        return FnDef(name=name, params=params, body=body, doc=doc.strip())
+        return fn
 
     def delete_fn(self, name: str) -> None:
         """Persist deletion before removing the function from the live registry."""
@@ -445,12 +452,13 @@ class Session:
         del self.fns[name]
         self.refresh_schema()
 
-    def fn_call_rows(self) -> list[tuple[str, str]]:
+    def fn_call_rows(self, *, schema: SchemaContext | None = None) -> list[tuple[str, str]]:
         """(call, detail) rows for the dataset-taking palette clauses.
 
         `name()` is what a row inserts — the caret lands between the parens —
         and the detail is the signature the library shows.
         """
+        schema = self.schema if schema is None else schema
         return [
             (
                 f"{fn.name}()",
@@ -462,7 +470,7 @@ class Session:
                 )
                 + (f" · {fn.doc}" if fn.doc else ""),
             )
-            for fn in self.fns.values()
+            for fn in schema.fns
         ]
 
     def fn_preview(self, name: str, args_text: str = "") -> RunOutcome:
@@ -476,7 +484,9 @@ class Session:
         doc = f"\\from {name}({args_text.strip()})\n\\select *"
         return self.run(doc, record=False)
 
-    def values_for(self, doc: str, column: str) -> list[str]:
+    def values_for(
+        self, doc: str, column: str, *, schema: SchemaContext | None = None,
+    ) -> list[str]:
         """A column's distinct values, for the `\\where` value search.
 
         Cached per (source, dataset, column) and fetched up to
@@ -484,25 +494,31 @@ class Session:
         value fetch is best-effort, so a failure (a live D1 hiccup, a column with
         no value source) means no suggestions rather than an error to dismiss.
         """
-        dataset = self.dataset_of(doc, column)
+        schema = self.schema if schema is None else schema
+        source = self.source
+        source_id = self.active_id
+        dataset = self.dataset_of(doc, column, schema=schema)
         if dataset is None:
             return []
-        key = (self.active_id, dataset, column)
+        key = (source_id, dataset, column)
         if key not in self._values:
             try:
                 self._values[key] = column_values(
-                    self.source, dataset, column, limit=VALUE_POOL_LIMIT
+                    source, dataset, column, limit=VALUE_POOL_LIMIT
                 )
             except (PayloadError, D1Error, OSError, ValueError, KeyError):
                 self._values[key] = []
         return self._values[key]
 
-    def dataset_of(self, doc: str, column: str) -> str | None:
+    def dataset_of(
+        self, doc: str, column: str, *, schema: SchemaContext | None = None,
+    ) -> str | None:
         """The dataset a column reference resolves to, if any."""
-        resolved = resolve_column(column, self.open_tables(doc))
+        schema = self.schema if schema is None else schema
+        resolved = schema.resolve_column(column, self.open_tables(doc, schema=schema))
         if resolved is not None and resolved.tables:
             return resolved.tables[0]
-        pooled = column_by_name(column)
+        pooled = schema.column_by_name(column)
         if pooled is not None and pooled.tables:
             return pooled.tables[0]
         return None
@@ -713,15 +729,16 @@ class Session:
         statements alone runs them and answers with their status; the rows a
         query produced are the rows it asked for, capped for the pane.
         """
-        ast = parse_query(doc)
-        if ast.errors:
-            first = ast.errors[0]
-            message = f"line {first.line}: {first.message}"
-            return RunOutcome(status=f"not executed · {message}", error=message)
-        payload = payload_from_ast(ast)
-        queried = has_query(ast)
-        steps: list[str] = []
         try:
+            schema = self.schema
+            ast = parse_query(doc, schema=schema, settled=True)
+            if ast.errors:
+                first = ast.errors[0]
+                message = f"line {first.line}: {first.message}"
+                return RunOutcome(status=f"not executed · {message}", error=message)
+            payload = payload_from_ast(ast)
+            queried = has_query(ast)
+            steps: list[str] = []
             dialect = dialect_for(self.source, self.dialect)
             for step in ast.tx:
                 steps.append(self.apply_tx(step.kind, step.name))
@@ -822,14 +839,15 @@ class Session:
         a document may carry — transactions, `\\temp`, `\\drop` — are not SQL to
         render, so they are named in the message instead.
         """
-        ast = parse_query(doc)
-        if ast.errors:
-            first = ast.errors[0]
-            return None, f"line {first.line}: {first.message}"
-        payload = payload_from_ast(ast)
-        if not has_query(ast):
-            return None, "nothing to compile — this document carries statements only"
         try:
+            schema = self.schema
+            ast = parse_query(doc, schema=schema, settled=True)
+            if ast.errors:
+                first = ast.errors[0]
+                return None, f"line {first.line}: {first.message}"
+            payload = payload_from_ast(ast)
+            if not has_query(ast):
+                return None, "nothing to compile — this document carries statements only"
             dialect = dialect_for(self.source, self.dialect)
             sql = compile_sql(build(self.source.con, payload, tables=self.tables()), dialect)
         except (PayloadError, D1Error) as exc:

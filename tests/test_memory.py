@@ -23,7 +23,7 @@ def test_functions_execute_after_restart_and_deletion_is_durable(sources):
     original.remember_d1("account", DATABASE, "Production")
 
     restored = Session(sources)
-    assert restored.fns["pair"].params == ["first", "second"]
+    assert tuple(restored.fns["pair"].params) == ("first", "second")
     assert restored.fns["pair"].body == BODY
     assert restored.fns["pair"].doc == "ordered arguments"
     result = restored.run("\\from pair('hello', 42)\n\\select *")
@@ -200,3 +200,39 @@ def test_platform_data_directory(platform, variable, relative, tmp_path, monkeyp
     if variable:
         monkeypatch.setenv(variable, str(tmp_path / relative))
     assert storage.data_directory() == tmp_path / relative / "anyql"
+
+
+def test_stale_lock_is_taken_over_and_fresh_lock_stays_busy(tmp_path, monkeypatch):
+    """A crashed save's lock must not wedge saves forever; a live one must."""
+    import os
+    import time
+
+    store = storage.MemoryStore(tmp_path)
+    lock = store.path.with_suffix(".lock")
+
+    lock.touch()
+    with pytest.raises(ValueError, match="busy"):
+        store.save([], [])
+    assert lock.exists()
+
+    old = time.time() - 2 * storage._STALE_SECONDS
+    os.utime(lock, (old, old))
+    store.save([{"name": "pair", "params": [], "body": "\\from events", "description": ""}], [])
+    assert not lock.exists()
+    assert [fn["name"] for fn in store.document["functions"]] == ["pair"]
+
+
+def test_orphan_temp_files_are_swept_and_fresh_ones_survive(tmp_path):
+    """Load removes debris older than the grace period, never a save in flight."""
+    import os
+    import time
+
+    old = tmp_path / ".memory-crashed.tmp"
+    fresh = tmp_path / ".memory-running.tmp"
+    old.write_bytes(b"{}")
+    fresh.write_bytes(b"{}")
+    stale = time.time() - 2 * storage._STALE_SECONDS
+    os.utime(old, (stale, stale))
+    storage.MemoryStore(tmp_path)
+    assert not old.exists()
+    assert fresh.exists()

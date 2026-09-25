@@ -1,15 +1,21 @@
 # anyQL AST contract
 
-The document is a sequence of `\command` lines. `parse_query(doc)` — in
-**`anyql/query/parser.py`** — is a **pure function of the document text**: the
-AST is always recomputed from the text, so nothing about the editor (undo/redo,
-caret moves, palette inserts) can leave the AST and the document out of step.
+The document is a sequence of `\command` lines. `parse_query(doc, schema=...)` —
+in **`anyql/query/parser.py`** — is a **pure function of the document text and
+an immutable schema context**. The default context is empty. The AST is always
+recomputed from the text; editor state never changes parsing implicitly.
 The AST types and their `to_json()` wire shape live in **`anyql/query/ast.py`**;
-the derived output-name rules in **`anyql/query/alias.py`**; the schema-registry
-seam the parser validates against in **`anyql/query/schema.py`**. The TUI
+the derived output-name rules in **`anyql/query/alias.py`**; the immutable
+`SchemaContext` in **`anyql/query/schema.py`**. The TUI
 (`anyql/tui/`) is a consumer of all of it — `Session.run` calls `parse_query`
 then `payload_from_ast`, and `anyql/tui/palette.py` reads the same AST to decide
 what `\` offers.
+
+`Session.refresh_schema()` replaces that session's context with a complete
+snapshot of tables, capabilities, column pool, and function definitions. Parsing
+and completion capture one snapshot, including nested queries; there is no
+process-global registry. Records and their nested collections are immutable,
+so an old snapshot remains coherent after source switches or function edits.
 
 The canonical contract is the pair:
 
@@ -111,6 +117,11 @@ Quoted numbers remain text: `'1'` is a string, not the integer `1`. Double the
 delimiter inside a string to include it (`'it''s'` → `it's`); commas and clause
 keywords inside quotes remain part of that value. Backslashes are literal,
 not escape sequences.
+
+Unquoted numeric literals, limits, regex capture-group indices, and numeric
+window bounds accept at most 640 characters per numeric token. Oversized
+conversions become parser errors, never Python conversion exceptions; values
+are never truncated or clamped. Quoted digit strings are not numeric tokens.
 
 ```anyql
 \from events
@@ -253,6 +264,8 @@ alias is `__count`; an explicit `as` alias overrides it, including for windows.
   `partition by` / `order by` must be present; anything else is
   `over (...) needs partition by <cols> and/or order by <col> [asc|desc]`.
   Parsing is case-insensitive and tolerant of spacing (`OVER (PARTITION BY …)`).
+  `rows`, `range`, and `order` remain valid bare or qualified column names:
+  partition columns are consumed before ordering and optional frame bounds.
 - A windowed aggregate is a per-row partition total
   (`sum(amount) over (partition by customer_id)`); a rank call **requires** the
   frame and its `order by` (`rank() over (order by placed_at desc)`), and it
@@ -462,22 +475,30 @@ with its argument:
 
 - A call is **`name(arg, …)`** at any table position `\from`/`\open`/`\join`/a set
   operation already accept. The arguments are **positional only** — bound to the
-  signature in order — and each is a value or an inline `( \from … )` subquery,
-  never a command (text with a `\` is refused, not spliced in). A repeated
+  signature in order — and each is a value with balanced quote-aware parentheses.
+  Arguments containing `\` are refused, not spliced in. A repeated
   clause addresses the call's columns through its **alias, which defaults to the
   function name**, exactly as a dataset's would (`hot.user_id`, or `h.user_id`
   under `as h`).
-- Expansion is **textual, at parse time** (`substitute_params`): every `@name` in
-  the body is replaced by its argument, and the result is parsed as the relation
-  at that site — the same machinery as an inline subquery, on the call's line. So
+- Expansion is **textual, at parse time** (`substitute_params`): command
+  boundaries are identified in the saved body before arguments are substituted
+  within each command. The expanded commands are parsed as a relation at the
+  call site, on the call's line. Unbalanced templates or substituted commands
+  are rejected; quoted parentheses, apostrophes, and commas remain values. So
   the engine sees **literals** and **ibis never learns a function existed**: a
   call composes wherever a sub-query does (CTE body, nested subquery, set-op
   operand), and a plain `( … )` table-position limitation applies to it unchanged.
 - It is **not** a SQL `CREATE FUNCTION` and survives no round-trip as a named
   callable: `\fn` is a TUI-layer construct. The function is `FnDef(name, params,
-  body, doc)` in the session's registry; `set_fns` seams it to the parser on every
-  `refresh_schema`, and `parse_body` validates a body on save against the live
-  schema so it can only fail where it is written.
+  body, doc)` in the session's immutable schema context. `parse_body` validates
+  a candidate body against a context containing its replacement definition,
+  before either disk or live definitions change.
+- Active function-call stacks reject direct and indirect recursion. Expansion
+  is limited to 16 nested calls and 256 total calls per parse, including calls
+  through inline queries, CTEs, joins, and set operations. Independent sibling
+  calls are valid. Stored bad definitions remain editable after restart; their
+  calls return parser errors instead of recursing indefinitely. Loading memory
+  still performs no schema-dependent body validation.
 - Errors name the mistake at the call site: `unknown function "x" — defined: …`,
   `x() takes N argument(s) — got M`/`got none`, `a function call needs a closing
   ")" — x(...)`, and `an argument to x() cannot contain \ …`. With an **empty**
@@ -620,13 +641,15 @@ statements alone carries no query and answers with their status.
   `\from nope`, `\where amount =`, `\select sum(` and `\case f = when ` all
   report no error there. Trailing blank lines do not move the typing line; a
   settled line before it still reports.
+  Explicit Run and Compile use `parse_query(..., settled=True)` so the last
+  line is validated too; an invalid final limit cannot become an unlimited run.
 - Validation splits by registry state. `unknown table "nope" — loaded
   datasets: events, users`, `unknown column "events.user_id" — "events" is not
   an open table: e` (qualified prefixes), and the CTE-shadows-dataset check fire
-  **only once the schema registry is non-empty** — the parser stays quiet while
+  **only when the supplied schema context has tables** — the parser stays quiet while
   it legitimately knows nothing. Duplicate table identifiers, duplicate CTE
   names, nested CTEs, and all grammar errors fire regardless of the registry.
-- A qualified reference is checked in `\select` (including aggregate/temporal
+- A qualified reference is checked in `\select` (including aggregate/temporal/regex
   arguments, recursively nested scalar arguments, and window `partition by`/`order by`), `\where`, `\group`,
   `\order`, `\case` conditions, and **both** operands of a `\join`'s `on` — a
   qualified `on` side names whichever relation it points at, so its prefix must

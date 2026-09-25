@@ -253,6 +253,42 @@ def test_live_source_registers_without_leaking_the_token():
     assert SECRET not in json.dumps(rendered)
 
 
+@pytest.mark.parametrize("declared,notnull,expected", [
+    # DATETIME must not lose to the DATE prefix; TIMESTAMP must not lose to it
+    # either — the prefix rules run longest-key-first.
+    ("DATETIME", 0, "timestamp"),
+    ("DATETIME", 1, "!timestamp"),
+    ("TIMESTAMP", 0, "timestamp"),
+    ("DATE", 0, "date"),
+    ("VARCHAR(50)", 0, "string"),
+    ("CHARACTER", 0, "string"),
+    ("NUMERIC(10,2)", 0, "float64"),
+    ("BOOLEAN", 0, "boolean"),
+    ("INTEGER", 1, "!int64"),
+    ("WEIRD_TYPE", 0, "string"),
+])
+def test_declared_types_map_longest_prefix_first(declared, notnull, expected):
+    from anyql.engine.d1api import _ibis_type
+
+    assert _ibis_type(declared, notnull) == expected
+
+
+def test_live_capabilities_refuse_udf_backed_functions_and_regex():
+    """Cloudflare D1 has no `_IBIS_*` Python UDFs, so the capabilities the
+    palette reads must not offer what cannot run there — and must not
+    over-refuse either: `capitalize` compiles to pure SQL and stays."""
+    source, _ = live_source()
+    caps = capabilities_for(source)
+    assert caps["backend"] == "sqlite (Cloudflare D1)"
+    assert "~" not in caps["operators"] and "!~" not in caps["operators"]
+    assert caps["supports"]["regex"] is False
+    offered = caps["functions"]["string"]
+    for fn in ("reverse", "repeat", "lpad", "rpad", "regexp_extract", "regexp_replace"):
+        assert fn not in offered
+    for fn in ("capitalize", "lower", "upper", "replace", "find", "substr"):
+        assert fn in offered
+
+
 def test_live_probe_counts_tables():
     source, _ = live_source()
     assert source.kind == "d1-live"

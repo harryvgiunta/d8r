@@ -17,8 +17,9 @@ the user explicitly accepts with Apply.
 
 Three layers, one direction:
 
-- **Language** (`anyql/query/`) — `parse_query(doc)` is a pure function of the
-  document text; `payload_from_ast` maps the AST to the engine payload.
+- **Language** (`anyql/query/`) — `parse_query(doc, schema=...)` is a pure
+  function of document text and an immutable schema context; `payload_from_ast`
+  maps the AST to the engine payload.
 - **Engine** (`anyql/engine/`) — in-process [ibis](https://ibis-project.org)
   over DuckDB: payload → expression (`build`) → SQL (`compile_sql`) → rows
   (`execute`). No SQL is hand-written anywhere.
@@ -66,7 +67,8 @@ AI Apply and ordinary draft edits never auto-save. D1 Add remembers identifiers;
 Test and Cancel do not. A saved connection always requires a fresh token.
 The default directory is `%LOCALAPPDATA%/anyql` on Windows, Application Support
 on macOS, or XDG data home on Linux; `ANYQL_DATA_DIR` overrides it. Atomic
-replacement and stale-session detection protect saved work. Invalid/unreadable
+replacement and stale-session detection protect saved work; a lock or temp file
+left by a crashed save clears itself after a minute. Invalid/unreadable
 memory is preserved, surfaced to the UI, and blocks saves until recovery and
 restart. Tests isolate this directory per test. No credentials, AI settings,
 chat, query history, active-source choice, documents, or temp tables persist.
@@ -87,8 +89,8 @@ sample rows, history, and submitted drafts may be sent to the configured provide
 
 ## Architecture rules
 
-- **Pure core, thin edges.** `parse_query(doc)` is a pure function of document
-  text; the AST carries no state (see `docs/AST.md`). The engine is pure
+- **Pure core, thin edges.** `parse_query(doc, schema=...)` is a pure function
+  of text and an immutable context; the AST carries no state (see `docs/AST.md`). The engine is pure
   payload → ibis; the TUI is a consumer of both and re-implements no rule of
   either.
 - **Data flows one way:** document text → AST → payload → ibis expression →
@@ -98,11 +100,11 @@ sample rows, history, and submitted drafts may be sent to the configured provide
   importing the app loads none — `tests/test_tui.py::test_the_tui_reaches_no_http_server`
   enforces exactly that, structurally and at import time. Network edges are the
   live-D1 client inside the engine and the AI-provider client in `anyql/ai/`.
-- **Schema state lives at one seam.** `anyql/query/schema.py` is the registry
-  the parser's validation and the palette both read; `Session.refresh_schema()`
-  installs the active source's tables + capabilities through
-  `set_schema_state(...)`, and re-installs them on every source change (never
-  cached across sources).
+- **Schema state lives at one seam.** `anyql/query/schema.py` defines the immutable
+  `SchemaContext` the parser's validation and palette both read.
+  `Session.refresh_schema()` replaces its session-owned snapshot of tables,
+  capabilities, column pool, and functions on source/schema/function changes.
+  Each parse/completion captures one context; no process-global registry exists.
 - **Capability-driven completion.** What `\` offers filters against
   `capabilities_for(source)` — aggregates, operators, window functions, dtype
   families. A backend that advertises differently changes what the IDE offers.
@@ -292,14 +294,18 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   `.venv/`, `__pycache__/`, and `.pytest_cache/` are gitignored; only synthetic
   Parquet and SQLite fixtures belong in the repository.
 - **Parser validation has two regimes.** Unknown-table, qualified-prefix, and
-  CTE-shadows-dataset errors fire **only when the schema registry is non-empty**
-  (`set_schema_state`). Duplicate table identifiers, duplicate CTE names, nested
-  CTEs, and every grammar error fire regardless. A harness for the canonical
-  fixture therefore needs an *empty* registry; the strict-prefix cases need a
-  loaded one — `tests/test_query.py` has both fixtures.
+  CTE-shadows-dataset errors fire **only when the supplied context has tables**.
+  Duplicate table identifiers, duplicate CTE names, nested CTEs, and every
+  grammar error fire regardless. The canonical fixture uses the default empty
+  context; strict-prefix cases pass a loaded `SchemaContext` explicitly.
 - **The last non-empty line is the typing line**: half-typed commands there are
   normal and are *not* errors — that line may still be growing. Everything
-  before it reports.
+  before it reports. Explicit Run/Compile pass `settled=True` to validate every line.
+- **Parser work is bounded.** Numeric tokens are limited to 640 characters.
+  Function expansion rejects active-stack cycles and limits each parse to 16
+  nested calls and 256 total calls. Save validates the candidate definition
+  before persisting; legacy cyclic definitions remain editable but cannot crash
+  parsing. Command boundaries are fixed before substituting balanced arguments.
 - **The palette's keys belong to `EditorPane`, not to the `TextArea`** — a
   TextArea's own key handler cannot be suppressed from a subclass, so the
   bindings are claimed one level up and stay scoped to the pane. That is what

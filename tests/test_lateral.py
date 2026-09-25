@@ -19,14 +19,14 @@ from anyql.query import (
     TableDef,
     parse_query,
     payload_from_ast,
-    set_schema_state,
+    SchemaContext,
 )
 
 
 @pytest.fixture
 def loaded():
     """The strict regime needs a registry: `users`/`events` as the parser sees them."""
-    set_schema_state(
+    return SchemaContext(
         [
             TableDef("events", "events", [ColumnDef("user_id", "int64"), ColumnDef("amount", "float64")]),
             TableDef("users", "users", [ColumnDef("user_id", "int64"), ColumnDef("region", "string")]),
@@ -117,7 +117,7 @@ def test_outer_names_belong_to_the_immediate_body_only(loaded, con):
         "\\join lateral (\\from events e \\where e.user_id = u.user_id) as recent\n"
         "\\limit 2"
     )
-    assert parse_query(outer_doc).errors == []
+    assert parse_query(outer_doc, schema=loaded).errors == []
 
     # A subquery nested inside the body does not: the engine correlates through
     # the immediate body's `\\where` alone, so one level deeper the same text is
@@ -128,9 +128,9 @@ def test_outer_names_belong_to_the_immediate_body_only(loaded, con):
         "\\join lateral (\\from (\\from events e \\where e.user_id = u.user_id) as i) as recent\n"
         "\\limit 2"
     )
-    assert parse_query(nested_doc).errors == []
+    assert parse_query(nested_doc, schema=loaded).errors == []
     with pytest.raises(expression.PayloadError, match="cannot compare numeric column"):
-        expression.build(con, payload_from_ast(parse_query(nested_doc)))
+        expression.build(con, payload_from_ast(parse_query(nested_doc, schema=loaded)))
 
 
 # --- the rows it builds ------------------------------------------------------

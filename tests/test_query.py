@@ -29,7 +29,7 @@ from anyql.query import (  # noqa: E402  (repo root added to sys.path above)
     clause_line,
     parse_query,
     payload_from_ast,
-    set_schema_state,
+    SchemaContext,
     split_top,
     unquote,
 )
@@ -58,7 +58,7 @@ TABLES = [
 
 @pytest.fixture
 def loaded():
-    set_schema_state(TABLES)
+    return SchemaContext(TABLES)
 
 
 def messages(ast) -> list[str]:
@@ -116,32 +116,31 @@ def test_empty_registry_accepts_any_dataset_and_qualified_ref():
 
 
 def test_loaded_registry_flags_unknown_table(loaded):
-    ast = parse_query("\\from nope\n\\limit 2")
+    ast = parse_query("\\from nope\n\\limit 2", schema=loaded)
     assert messages(ast) == ['unknown table "nope" — loaded datasets: events, users']
     assert ast.errors[0].line == 1
 
-    joined = parse_query("\\from events\n\\join nope on user_id\n\\limit 2")
+    joined = parse_query("\\from events\n\\join nope on user_id\n\\limit 2", schema=loaded)
     assert messages(joined) == ['unknown table "nope" — loaded datasets: events, users']
     assert joined.errors[0].line == 2
 
 
 def test_loaded_registry_flags_unknown_qualified_column(loaded):
-    ast = parse_query("\\from events as e\n\\select e.user_id\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\select e.user_id\n\\limit 2", schema=loaded)
     assert ast.errors == []
 
     # Aliasing is strict: the dataset name of an aliased table is unknown.
-    ast = parse_query("\\from events as e\n\\select events.user_id\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\select events.user_id\n\\limit 2", schema=loaded)
     assert messages(ast) == [
         'unknown column "events.user_id" — "events" is not an open table: e'
     ]
 
-    ast = parse_query("\\from events as e\n\\select u.score\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\select u.score\n\\limit 2", schema=loaded)
     assert messages(ast) == ['unknown column "u.score" — "u" is not an open table: e']
 
 
-def test_qualified_ref_without_from_lists_the_placeholder():
-    set_schema_state(TABLES)
-    ast = parse_query("\\select u.score\n\\limit 2")
+def test_qualified_ref_without_from_lists_the_placeholder(loaded):
+    ast = parse_query("\\select u.score\n\\limit 2", schema=loaded)
     assert messages(ast) == ['unknown column "u.score" — "u" is not an open table: (no \\from)']
 
 
@@ -153,7 +152,8 @@ def test_qualified_refs_are_checked_in_every_clause(loaded):
         "\\group e.user_id\n"
         "\\order e.user_id\n"
         "\\case c = when y.col > 1 then 2\n"
-        "\\limit 2"
+        "\\limit 2",
+        schema=loaded,
     )
     assert messages(ast) == [
         'unknown column "u.amount" — "u" is not an open table: e',
@@ -164,7 +164,7 @@ def test_qualified_refs_are_checked_in_every_clause(loaded):
 
 
 def test_window_partition_and_order_refs_are_checked(loaded):
-    ast = parse_query("\\from events as e\n\\select sum(amount) over (partition by z.a order by z.b)\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\select sum(amount) over (partition by z.a order by z.b)\n\\limit 2", schema=loaded)
     assert messages(ast) == [
         'unknown column "z.a" — "z" is not an open table: e',
         'unknown column "z.b" — "z" is not an open table: e',
@@ -176,16 +176,16 @@ def test_window_partition_and_order_refs_are_checked(loaded):
 
 def test_last_non_empty_line_is_the_typing_line(loaded):
     # Half-typed commands on the very last content line are normal, not errors.
-    assert parse_query("\\from nope").errors == []
-    assert parse_query("\\with a").errors == []
-    assert parse_query("\\where amount =").errors == []
-    assert parse_query("\\limit x").errors == []
-    assert parse_query("\\case f = when ").errors == []
-    assert parse_query("\\select sum(").errors == []
+    assert parse_query("\\from nope", schema=loaded).errors == []
+    assert parse_query("\\with a", schema=loaded).errors == []
+    assert parse_query("\\where amount =", schema=loaded).errors == []
+    assert parse_query("\\limit x", schema=loaded).errors == []
+    assert parse_query("\\case f = when ", schema=loaded).errors == []
+    assert parse_query("\\select sum(", schema=loaded).errors == []
     # Trailing blank lines don't move the typing line off the last command.
-    assert parse_query("\\from nope\n\n").errors == []
+    assert parse_query("\\from nope\n\n", schema=loaded).errors == []
     # A settled line before the typing line still reports.
-    assert messages(parse_query("\\from nope\n\\limit 2")) == [
+    assert messages(parse_query("\\from nope\n\\limit 2", schema=loaded)) == [
         'unknown table "nope" — loaded datasets: events, users'
     ]
 
@@ -214,46 +214,45 @@ def test_with_body_parses_as_a_full_query_with_absolute_lines():
 
 
 def test_main_from_and_join_may_reference_earlier_ctes(loaded):
-    ast = parse_query("\\with recent\n  \\from events\n\\from recent\n\\select user_id")
+    ast = parse_query("\\with recent\n  \\from events\n\\from recent\n\\select user_id", schema=loaded)
     assert ast.errors == []
     assert ast.from_.table == "recent"
 
-    ast = parse_query("\\with recent\n  \\from events\n\\from users\n\\join recent on user_id\n\\select score")
+    ast = parse_query("\\with recent\n  \\from events\n\\from users\n\\join recent on user_id\n\\select score", schema=loaded)
     assert ast.errors == []
 
 
 def test_forward_reference_to_a_later_cte_is_unknown_table(loaded):
-    ast = parse_query("\\from recent\n\\with recent\n  \\from events")
+    ast = parse_query("\\from recent\n\\with recent\n  \\from events", schema=loaded)
     assert has_error(ast, 'unknown table "recent"')
     assert [e.line for e in ast.errors] == [1]
 
 
 def test_nested_cte_in_a_body_is_rejected(loaded):
-    ast = parse_query("\\with a\n  \\from events\n  \\with b\n    \\from users")
+    ast = parse_query("\\with a\n  \\from events\n  \\with b\n    \\from users", schema=loaded)
     assert has_error(ast, "nested CTEs are not supported")
     assert [e.line for e in ast.errors] == [3]
 
 
 def test_duplicate_cte_name_is_rejected(loaded):
-    ast = parse_query("\\with a\n  \\from events\n\\with a\n  \\from users")
+    ast = parse_query("\\with a\n  \\from events\n\\with a\n  \\from users", schema=loaded)
     assert messages(ast) == ['duplicate CTE name "a"']
     assert [e.line for e in ast.errors] == [3]
 
 
 def test_cte_name_shadowing_a_dataset_is_flagged(loaded):
-    ast = parse_query("\\with events\n  \\from users")
+    ast = parse_query("\\with events\n  \\from users", schema=loaded)
     assert messages(ast) == ['CTE name "events" shadows dataset "events"']
     assert [e.line for e in ast.errors] == [1]
     # Nothing to shadow before the registry loads.
-    set_schema_state([])
     assert parse_query("\\with events\n  \\from users").errors == []
 
 
 def test_qualified_refs_resolve_inside_a_cte_body(loaded):
-    ast = parse_query("\\with a\n  \\from events as e\n  \\select e.user_id")
+    ast = parse_query("\\with a\n  \\from events as e\n  \\select e.user_id", schema=loaded)
     assert ast.errors == []
 
-    ast = parse_query("\\with a\n  \\from events as e\n  \\select events.user_id\n\\limit 2")
+    ast = parse_query("\\with a\n  \\from events as e\n  \\select events.user_id\n\\limit 2", schema=loaded)
     assert messages(ast) == [
         'unknown column "events.user_id" — "events" is not an open table: e'
     ]
@@ -261,24 +260,24 @@ def test_qualified_refs_resolve_inside_a_cte_body(loaded):
 
 
 def test_cte_body_sees_earlier_ctes(loaded):
-    ast = parse_query("\\with a\n  \\from events\n\\with b\n  \\from a\n  \\select user_id")
+    ast = parse_query("\\with a\n  \\from events\n\\with b\n  \\from a\n  \\select user_id", schema=loaded)
     assert ast.errors == []
     assert ast.with_[1].body.from_.table == "a"
 
 
 def test_with_expects_a_bare_name_and_a_body(loaded):
-    ast = parse_query("\\with 1bad\n  \\from events\n\\limit 2")
+    ast = parse_query("\\with 1bad\n  \\from events\n\\limit 2", schema=loaded)
     assert messages(ast) == ["\\with expects a bare CTE name"]
-    ast = parse_query("\\with a\n\\limit 2")
+    ast = parse_query("\\with a\n\\limit 2", schema=loaded)
     assert messages(ast) == ["\\with a expects an indented body"]
 
     # A blank-only indented block is still no body.
-    ast = parse_query("\\with a\n   \n\\limit 2")
+    ast = parse_query("\\with a\n   \n\\limit 2", schema=loaded)
     assert messages(ast) == ["\\with a expects an indented body"]
 
 
 def test_body_errors_bubble_to_the_document_with_absolute_lines(loaded):
-    ast = parse_query("\\with a\n  \\from events\n  \\select bogus!\n\\limit 2")
+    ast = parse_query("\\with a\n  \\from events\n  \\select bogus!\n\\limit 2", schema=loaded)
     assert messages(ast) == ['cannot parse expression "bogus!"']
     assert [e.line for e in ast.errors] == [3]
     assert ast.with_[0].body.errors == []
@@ -287,13 +286,13 @@ def test_body_errors_bubble_to_the_document_with_absolute_lines(loaded):
 
 def test_blank_line_stays_in_the_block_only_when_it_continues(loaded):
     # A blank line followed by an indented line is part of the body ...
-    ast = parse_query("\\with a\n  \\from events\n\n  \\select user_id\n\\limit 2")
+    ast = parse_query("\\with a\n  \\from events\n\n  \\select user_id\n\\limit 2", schema=loaded)
     assert ast.with_[0].body.select[0].line == 4
     assert ast.limit == 2
     assert ast.errors == []
 
     # ... followed by a flush line it ends the block.
-    ast = parse_query("\\with a\n  \\from events\n\n\\limit 2")
+    ast = parse_query("\\with a\n  \\from events\n\n\\limit 2", schema=loaded)
     assert ast.with_[0].body.select == []
     assert ast.with_[0].body.limit is None
     assert ast.limit == 2
@@ -350,16 +349,16 @@ def test_clause_line_reads_the_block_a_line_belongs_to():
 
 
 def test_duplicate_table_identifier_is_rejected(loaded):
-    ast = parse_query("\\from events as x\n\\join users as x on user_id\n\\limit 2")
+    ast = parse_query("\\from events as x\n\\join users as x on user_id\n\\limit 2", schema=loaded)
     assert messages(ast) == ['duplicate table identifier "x"']
     assert [e.line for e in ast.errors] == [2]
 
     # An unaliased dataset colliding with an explicit alias counts too.
-    ast = parse_query("\\from events\n\\join users as events on user_id\n\\limit 2")
+    ast = parse_query("\\from events\n\\join users as events on user_id\n\\limit 2", schema=loaded)
     assert messages(ast) == ['duplicate table identifier "events"']
 
     # Same rule on the typing line: suppressed.
-    assert parse_query("\\from events as x\n\\join users as x on user_id").errors == []
+    assert parse_query("\\from events as x\n\\join users as x on user_id", schema=loaded).errors == []
 
 
 # --- select expressions ------------------------------------------------------
@@ -778,12 +777,12 @@ def test_join_rejects_a_malformed_clause():
 
 
 def test_join_qualified_on_names_any_open_table_at_its_clause(loaded):
-    ast = parse_query("\\from events as e\n\\join users as u on e.user_id = id\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\join users as u on e.user_id = id\n\\limit 2", schema=loaded)
     assert ast.errors == []
 
     # Either side may name this clause's own table: `a.k = b.k` and `b.k = a.k`
     # are the same equality, so the own alias resolves wherever it is written.
-    ast = parse_query("\\from events as e\n\\join users as u on u.user_id = e.user_id\n\\limit 2")
+    ast = parse_query("\\from events as e\n\\join users as u on u.user_id = e.user_id\n\\limit 2", schema=loaded)
     assert ast.errors == []
 
     # A third clause sees both earlier identifiers.
@@ -791,7 +790,8 @@ def test_join_qualified_on_names_any_open_table_at_its_clause(loaded):
         "\\from events as e\n"
         "\\join users as u on user_id = id\n"
         "\\join users as r on u.user_id = id\n"
-        "\\limit 2"
+        "\\limit 2",
+        schema=loaded,
     )
     assert ast.errors == []
 
@@ -801,7 +801,8 @@ def test_join_qualified_on_names_any_open_table_at_its_clause(loaded):
         "\\from events as e\n"
         "\\join users as u on user_id = id\n"
         "\\join users as r on z.user_id = id\n"
-        "\\limit 2"
+        "\\limit 2",
+        schema=loaded,
     )
     assert messages(ast) == ['unknown column "z.user_id" — "z" is not an open table: e, u, r']
 
@@ -865,16 +866,16 @@ def test_set_op_unknown_table_only_once_the_registry_loaded():
     ast = parse_query("\\from events\n\\union nope\n\\limit 2")
     assert ast.errors == []  # registry empty: the parser knows nothing yet
 
-    set_schema_state(TABLES)
-    ast = parse_query("\\from events\n\\union nope\n\\limit 2")
+    schema = SchemaContext(TABLES)
+    ast = parse_query("\\from events\n\\union nope\n\\limit 2", schema=schema)
     assert messages(ast) == ['unknown table "nope" — loaded datasets: events, users']
 
     # A CTE defined earlier is a table here, exactly as for `\from`/`\join`.
-    ast = parse_query("\\with recent\n  \\from events\n\\from events\n\\union recent\n\\limit 2")
+    ast = parse_query("\\with recent\n  \\from events\n\\from events\n\\union recent\n\\limit 2", schema=schema)
     assert ast.errors == []
 
     # A forward reference is not: the CTE does not exist yet at that line.
-    ast = parse_query("\\from events\n\\union recent\n\\with recent\n  \\from events\n\\limit 2")
+    ast = parse_query("\\from events\n\\union recent\n\\with recent\n  \\from events\n\\limit 2", schema=schema)
     assert messages(ast) == ['unknown table "recent" — loaded datasets: events, users']
 
 

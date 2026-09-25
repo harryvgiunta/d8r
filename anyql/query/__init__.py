@@ -1,4 +1,4 @@
-"""The anyQL language layer: AST, parser, alias rules, and the schema registry."""
+"""The anyQL language layer: AST, parser, alias rules, and schema snapshots."""
 
 from .alias import auto_alias, effective_alias
 from .ast import (
@@ -52,27 +52,18 @@ from .parser import (
 from .schema import (
     AGGREGATES,
     DEFAULT_CAPABILITIES,
+    EMPTY_SCHEMA,
     TEMPORAL,
     Capabilities,
     ColumnDef,
     DtypeFamily,
     OpenTable,
     PoolColumn,
+    SchemaContext,
     TableDef,
     FnDef,
-    capabilities,
-    column_by_name,
-    column_pool,
     dtype_family,
     open_tables_of,
-    resolve_column,
-    resolve_qualified,
-    schema_tables,
-    set_schema_state,
-    set_fns,
-    table_by_name,
-    fn_by_name,
-    fns,
 )
 
 __all__ = [
@@ -89,6 +80,7 @@ __all__ = [
     "Direction",
     "DropClause",
     "DtypeFamily",
+    "EMPTY_SCHEMA",
     "FrameBounds",
     "FrameKind",
     "FromClause",
@@ -105,6 +97,7 @@ __all__ = [
     "RegexCall",
     "RegexFn",
     "ScalarCall",
+    "SchemaContext",
     "SelectItem",
     "SetOpClause",
     "SetOpKind",
@@ -122,10 +115,7 @@ __all__ = [
     "WithClause",
     "auto_alias",
     "block_extent",
-    "capabilities",
     "clause_line",
-    "column_by_name",
-    "column_pool",
     "dtype_family",
     "effective_alias",
     "is_identifier",
@@ -134,15 +124,7 @@ __all__ = [
     "parse_body",
     "parse_query",
     "payload_from_ast",
-    "resolve_column",
-    "resolve_qualified",
-    "schema_tables",
-    "set_schema_state",
-    "set_fns",
     "split_top",
     "substitute_params",
-    "table_by_name",
-    "fn_by_name",
-    "fns",
     "unquote",
 ]

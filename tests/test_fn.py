@@ -10,8 +10,7 @@ document. No terminal and no network: the `Session` seams its own schema.
 
 from __future__ import annotations
 
-from anyql.query import parse_body
-from anyql.query import schema as query_schema
+from anyql.query import parse_body, parse_query
 from anyql.tui.palette import view_for
 from anyql.tui.session import Session
 
@@ -63,7 +62,7 @@ def test_the_library_is_an_ordered_in_memory_registry():
 
     ns.save_fn("hot", "min_amount, region", HOT_BODY + "\n\\where region = @region", "now with region")
     assert list(ns.fns) == ["hot", "all_events"]  # replaced keeps its slot
-    assert ns.fns["hot"].params == ["min_amount", "region"]
+    assert tuple(ns.fns["hot"].params) == ("min_amount", "region")
     assert ns.fns["hot"].doc == "now with region"
 
     ns.delete_fn("hot")
@@ -72,13 +71,13 @@ def test_the_library_is_an_ordered_in_memory_registry():
     assert list(ns.fns) == ["all_events"]
 
 
-def test_the_seam_carries_the_functions_to_the_parser():
-    """`refresh_schema` re-installs the registry, so a saved name resolves at once."""
+def test_saved_functions_resolve_until_deleted():
     ns = Session()
     ns.save_fn("hot", "min_amount", HOT_BODY, "")
-    assert "hot" in {fn.name for fn in query_schema.fns()}
+    document = "\\from hot(0)\n\\select *"
+    assert parse_query(document, schema=ns.schema).errors == []
     ns.delete_fn("hot")
-    assert "hot" not in {fn.name for fn in query_schema.fns()}
+    assert parse_query(document, schema=ns.schema).errors
 
 
 # -- the call, executed -----------------------------------------------------
