@@ -602,9 +602,9 @@ def _apply_set_ops(
     the operand is projected to exactly those columns (in that order), so extra
     operand columns are dropped and a column the operand lacks is the user-level
     error below. `distinct` is SQL's default for all three — `\\union all`
-    keeps duplicates. A schema conflict ibis still refuses (a column that exists
-    on both sides with different types) surfaces as a `PayloadError` too, so no
-    set-operation mistake reaches the UI as an internal error.
+    keeps duplicates. Nullability-only differences widen to nullable without
+    changing values; genuinely different types still surface as a `PayloadError`,
+    so no set-operation mistake reaches the UI as an internal error.
     """
     if set_ops is None:
         return expr
@@ -636,6 +636,22 @@ def _apply_set_ops(
         if operand != target:
             right = right.select(target)
         try:
+            # Ibis requires exact schema equality, including nullability. Widen
+            # only that flag; never coerce different value types or fill NULLs.
+            left_casts, right_casts = {}, {}
+            right_schema = right.schema()
+            for name, left_type in expr.schema().items():
+                right_type = right_schema[name]
+                if left_type == right_type or left_type.copy(nullable=right_type.nullable) != right_type:
+                    continue
+                if left_type.nullable:
+                    right_casts[name] = right[name].cast(left_type)
+                else:
+                    left_casts[name] = expr[name].cast(right_type)
+            if left_casts:
+                expr = expr.mutate(left_casts)
+            if right_casts:
+                right = right.mutate(right_casts)
             expr = getattr(expr, method)(right, distinct=distinct)
         except IbisError as exc:
             raise PayloadError(f'\\{op} "{label}": {" ".join(str(exc).split())}') from exc

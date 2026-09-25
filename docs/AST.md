@@ -364,7 +364,11 @@ must be a boolean, never `null`, `0`, or a string.
   projected to exactly those columns, in that order, so extra operand columns
   are dropped and one the operand lacks is the engine's
   `` \union "x" is missing <col> — it projects: … ``. A column present on both
-  sides with different types is refused the same way, as a `PayloadError`.
+  sides with genuinely different value types is refused as a `PayloadError`.
+  Nullability alone is compatible: `!string` (non-nullable text) and `string`
+  (nullable text), for example, are widened to the nullable type through Ibis
+  before the operation. Values, NULLs, and duplicate semantics are unchanged;
+  no implicit conversion between different value types is performed.
 - Set operations apply after the projection (`\select`, `\case`, window items)
   and **before** row-level `\distinct`, then `\order`/`\limit`: ordering and
   limiting apply to the merged, optionally deduplicated result. A block is

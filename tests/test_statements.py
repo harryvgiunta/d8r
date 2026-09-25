@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import ibis
 import pytest
@@ -72,7 +73,7 @@ def live_source() -> DataSource:
         dialect="sqlite",
         dir=Path("probe"),
         con=con,
-        d1=object(),  # the gate refuses before anything reaches for a client
+        d1=SimpleNamespace(account_id="synthetic", database_uuid="11111111-2222-3333-4444-555555555555"),
     )
     source.datasets = {"t": {"table": con.table("t"), "doc": "", "rows": 2}}
     return source
@@ -281,7 +282,7 @@ def test_a_rolled_back_drop_puts_the_temp_table_back(session):
     assert session.run("\\from kept\n\\select user_id\n\\limit 2").ok
 
 
-def test_savepoints_are_the_engines_that_have_them(session, snapshot):
+def test_savepoints_are_the_engines_that_have_them(session, snapshot, tmp_path):
     # DuckDB keeps whole transactions only, and says so.
     session.run("\\begin\n")
     assert session.run("\\savepoint s1\n").error == (
@@ -290,7 +291,7 @@ def test_savepoints_are_the_engines_that_have_them(session, snapshot):
     )
 
     # A SQLite snapshot has them: back to a savepoint keeps the earlier table.
-    snap = Session({"snap": snapshot})
+    snap = Session({"snap": snapshot}, data_dir=tmp_path / "sqlite-workspace")
     assert snap.run("\\begin\n").ok
     assert snap.run("\\savepoint before\n").status == 'savepoint "before" set'
     assert snap.run("\\from t\n\\select a\n\\temp second\n").ok

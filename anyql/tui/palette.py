@@ -644,7 +644,7 @@ class CommandPalette(OptionList):
 
     # -- opening / closing --------------------------------------------------
 
-    def sync(self) -> None:
+    def sync(self, *, respect_dismissal: bool = False) -> None:
         """Follow the editor's caret: offer what belongs there, or close.
 
         The offers are on wherever the caret lands somewhere the language has
@@ -659,7 +659,7 @@ class CommandPalette(OptionList):
         it is off, and `ctrl+comma` is the way back to Settings.
         """
         editor = self.editor
-        if self.session.busy:
+        if self.session.busy or (respect_dismissal and self._dismissed):
             self.close()
             return
         if editor is None:

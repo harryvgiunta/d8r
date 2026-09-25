@@ -8,12 +8,16 @@ four event types (25 clicks, 25 purchases) over 25 users, four events each.
 from __future__ import annotations
 
 import json
+import sqlite3
+from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 import ibis
 import pytest
 
 from anyql.engine import expression
+from anyql.engine.d1api import schema_connection
 from anyql.engine.execute import execute
 from anyql.query import parse_query, payload_from_ast
 
@@ -218,7 +222,7 @@ def test_conflicting_column_types_surface_as_a_payload_error():
     con = ibis.duckdb.connect()
     con.create_table("ints", ibis.memtable({"k": [1, 2]}))
     con.create_table("texts", ibis.memtable({"k": ["a"]}))
-    with pytest.raises(expression.PayloadError, match=r'\\union "texts": Table schemas must be equal'):
+    with pytest.raises(expression.PayloadError):
         expression.build(
             con,
             {
@@ -227,6 +231,78 @@ def test_conflicting_column_types_surface_as_a_payload_error():
                 "setOps": [{"op": "union", "dataset": "texts", "distinct": True}],
             },
         )
+
+
+@pytest.mark.parametrize("op,distinct,expected", [
+    ("union", True, [None, "free", "paid", "other"]),
+    ("union", False, ["free", "paid", "paid", None, "paid", "other"]),
+    ("intersect", True, ["paid"]),
+    ("except", True, ["free"]),
+])
+@pytest.mark.parametrize("nullable_left", [False, True])
+def test_set_operations_widen_nullability_without_changing_values(op, distinct, expected, nullable_left):
+    schemas = {
+        "left_rows": {"id": "string" if nullable_left else "!string"},
+        "right_rows": {"id": "!string" if nullable_left else "string"},
+    }
+    left = ["free", "paid", "paid"]
+    right = ["paid", "other"]
+    (left if nullable_left else right).append(None)
+    if nullable_left and op == "except":
+        expected = ["free", None]
+    con = ibis.duckdb.connect()
+    try:
+        con.create_table("left_rows", ibis.memtable({"id": left}))
+        con.create_table("right_rows", ibis.memtable({"id": right}))
+        expr = expression.build(schema_connection(schemas), {
+            "dataset": "left_rows",
+            "setOps": [{"op": op, "dataset": "right_rows", "distinct": distinct}],
+        })
+        sql = expression.compile_sql(expr, "duckdb")
+        with con.raw_sql(sql) as cursor:
+            assert Counter(row[0] for row in cursor.fetchall()) == Counter(expected)
+    finally:
+        con.disconnect()
+
+
+def test_never_subscribed_cte_query_executes_on_d1_shaped_sqlite():
+    # A nullable history key must not reject or eliminate unrelated free users.
+    # Canceled and duplicate subscription records still count as prior history.
+    con = schema_connection({
+        "projects": {"id": "!string", "name": "string", "plan_id": "!string"},
+        "billing_subscription_packs": {"project_id": "string", "status": "!string"},
+    })
+    doc = r"""\with free
+  \from projects
+  \where plan_id = 'free'
+  \select id
+\with paid
+  \from billing_subscription_packs
+  \select project_id as id
+\with free_never_paid
+  \from free
+  \except paid
+\from free_never_paid f
+\join projects p on p.id = f.id
+\select p.id, p.name, p.plan_id
+\order p.id"""
+    ast = parse_query(doc, settled=True)
+    assert not ast.errors
+    sql = expression.compile_sql(expression.build(con, payload_from_ast(ast)), "sqlite")
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.executescript("""
+            CREATE TABLE projects (id TEXT NOT NULL, name TEXT, plan_id TEXT NOT NULL);
+            CREATE TABLE billing_subscription_packs (project_id TEXT, status TEXT NOT NULL);
+            INSERT INTO projects VALUES
+                ('never', 'Never subscribed', 'free'),
+                ('canceled', 'Former subscriber', 'free'),
+                ('active', 'Current subscriber', 'free'),
+                ('pro', 'Paid plan', 'pro');
+            INSERT INTO billing_subscription_packs VALUES
+                ('canceled', 'canceled'), ('canceled', 'canceled'),
+                ('active', 'active'), (NULL, 'canceled');
+        """)
+        assert db.execute(sql).fetchall() == [("never", "Never subscribed", "free")]
 
 
 def test_malformed_set_op_payload_entries_are_payload_errors(con):

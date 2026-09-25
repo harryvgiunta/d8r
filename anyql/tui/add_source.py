@@ -1,6 +1,6 @@
 """Connect to live Cloudflare D1, or open an explicitly selected SQLite snapshot.
 
-Only Add remembers a token-free live profile and transfers the source to the
+Only Add remembers a live profile including its API token and transfers the source to the
 app. Test owns its connection until Add, a field change, or cancellation.
 """
 
@@ -23,7 +23,7 @@ class AddSourceModal(ModalScreen):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, session, **kwargs) -> None:
+    def __init__(self, session, *, profile: dict[str, str] | None = None, snapshot_path: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self._built: tuple[tuple[str, ...], DataSource] | None = None
@@ -33,10 +33,15 @@ class AddSourceModal(ModalScreen):
         self._busy = False
         self._observed_fields: tuple[str, ...] = ()
         self._profiles = list(session.d1_profiles)
+        self._initial_profile = dict(profile) if profile is not None else None
+        self._snapshot_path = snapshot_path
+        self._reconnect_fields: tuple[str, ...] | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="add-source"):
-            yield Label("Add a data source · Cloudflare D1", id="add-source-title")
+            yield Label("Reconnect local SQLite snapshot" if self._snapshot_path else
+                        "Connect saved data source · Cloudflare D1" if self._initial_profile is not None else
+                        "Add a data source · Cloudflare D1", id="add-source-title")
             yield Static(
                 "Live connects to your hosted database through Cloudflare's official API. "
                 "A local SQLite snapshot is offline and does not sync with Cloudflare.",
@@ -50,8 +55,8 @@ class AddSourceModal(ModalScreen):
                 "My Profile → API Tokens → Create Token → Custom token: choose "
                 "Account → D1 → Read and include only the intended account. "
                 "Use this scoped read-only token, not a Global API key.\n"
-                "Add remembers only the Account ID, resolved database UUID and display name. "
-                "Enter a fresh token each session; Test and Cancel save nothing.",
+                "Add saves the Account ID, resolved database UUID, display name and API token. "
+                "Connection backups contain plaintext secrets; keep them private. Test and Cancel save nothing.",
                 id="d1-setup-help",
                 markup=False,
             )
@@ -59,7 +64,7 @@ class AddSourceModal(ModalScreen):
             yield Select(
                 [(f"{profile['display']} · {profile['database']}", index)
                  for index, profile in enumerate(self._profiles)],
-                prompt="New connection (token is never saved)",
+                prompt="New connection",
                 id="d1-profile",
             )
             yield Label("Account ID", classes="field-label")
@@ -67,20 +72,31 @@ class AddSourceModal(ModalScreen):
             yield Label("Database UUID or name", classes="field-label")
             yield Input(placeholder="UUID recommended; not a Worker binding", id="database")
             yield Label("API token · Account / D1 / Read", classes="field-label")
-            yield Input(placeholder="sent to Cloudflare only, never stored", password=True, id="api-token")
+            yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="api-token")
             yield Label("Local snapshot · optional, overrides the live fields", classes="field-label")
-            yield Input(placeholder="existing .sqlite path — skips the network", id="snapshot-path")
+            yield Input(self._snapshot_path or "", placeholder="existing .sqlite path — skips the network", id="snapshot-path")
             yield Label("Display name", classes="field-label")
             yield Input(placeholder="optional label for the datasource list", id="display-name")
             yield Static("", id="add-source-message", markup=False)
             with Horizontal(id="add-source-buttons"):
                 yield Button("Test connection", id="test")
-                yield Button("Add", variant="primary", id="add")
+                yield Button("Connect" if self._initial_profile is not None or self._snapshot_path else "Add", variant="primary", id="add")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
         self._observed_fields = self._fields()
         self.query_one("#account-id", Input).focus()
+        if self._initial_profile is not None:
+            with self.prevent(Select.Changed, Input.Changed):
+                self.query_one("#d1-profile", Select).value = self._profiles.index(self._initial_profile)
+                self._fill_profile(self._initial_profile)
+            self._reconnect_fields = self._fields()
+            if self._initial_profile.get("api_token"):
+                self.call_after_refresh(self.action_add)
+            else:
+                self.query_one("#api-token", Input).focus()
+        elif self._snapshot_path:
+            self.query_one("#snapshot-path", Input).focus()
 
     def _fields(self) -> tuple[str, ...]:
         return tuple(self.query_one(f"#{name}", Input).value.strip() for name in (
@@ -143,12 +159,18 @@ class AddSourceModal(ModalScreen):
             return
         self._invalidate()
         profile = self._profiles[event.value] if isinstance(event.value, int) else {}
+        self._fill_profile(profile)
+
+    def _fill_profile(self, profile: dict[str, str]) -> None:
         for name, key in (("account-id", "account_id"), ("database", "database"), ("display-name", "display")):
             self.query_one(f"#{name}", Input).value = profile.get(key, "")
-        self.query_one("#api-token", Input).value = ""
+        self.query_one("#api-token", Input).value = profile.get("api_token", "")
         self.query_one("#snapshot-path", Input).value = ""
         self._observed_fields = self._fields()
-        self._message("Enter a fresh API token for this connection." if profile else "")
+        self._message(
+            "Saved API token loaded. Test or Add to connect." if profile.get("api_token")
+            else "Enter an API token for this saved connection." if profile else ""
+        )
 
     def _build(self, fields: tuple[str, ...]) -> DataSource:
         account_id, database, api_token, path, display = fields
@@ -192,7 +214,9 @@ class AddSourceModal(ModalScreen):
                     profile = (source.d1.account_id, source.d1.database_uuid, source.display)
                     if fields[2] and any(fields[2] in value for value in profile):
                         raise ValueError("The Account ID, database and display name must not contain the API token.")
-                    self.session.remember_d1(source.d1.account_id, source.d1.database_uuid, source.display)
+                    # Selecting an unchanged saved profile reconnects, not re-saves.
+                    if fields != self._reconnect_fields:
+                        self.session.remember_d1(source.d1.account_id, source.d1.database_uuid, source.display, api_token=fields[2])
                 self._built = None  # ownership passes to the app's dismissal callback
                 self._connection_form_closed = True
                 self.dismiss(source)

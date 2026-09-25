@@ -503,7 +503,7 @@ def load(
 
 
 # ---------------------------------------------------------------------------
-# Cloudflare D1 sources — connected at runtime; credentials never persisted.
+# Cloudflare D1 sources — connected at runtime; persistence belongs to storage.
 #
 # A D1 database *is* SQLite: Cloudflare runs a real SQLite engine and its own
 # D1 console introspects it through `sqlite_schema` / `pragma_*`. Two shapes:
@@ -517,8 +517,8 @@ def load(
 #     source; the SQL is then run back through the API (`anyql.engine.execute`).
 #
 # A snapshot is the user's own file (outside `anyql/engine/data/`, never
-# regenerated); live credentials are request-scoped, held only in the
-# in-memory source, never persisted and never handed back to the UI.
+# regenerated). Live clients hold credentials in memory for requests; explicit
+# Add in the TUI saves the profile and token through the local storage layer.
 # ---------------------------------------------------------------------------
 
 

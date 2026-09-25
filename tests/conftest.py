@@ -55,7 +55,7 @@ ALIAS_REVENUE_PAYLOAD = {
 
 @pytest.fixture(autouse=True)
 def _isolated_memory(tmp_path, monkeypatch):
-    """No test reads or writes the user's durable anyQL memory."""
+    """No test reads or writes the user's durable memory, settings, or credentials."""
     monkeypatch.setenv("ANYQL_DATA_DIR", str(tmp_path / "anyql-data"))
 
 

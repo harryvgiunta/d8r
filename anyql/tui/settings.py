@@ -38,16 +38,13 @@ MENUS: dict[str, str] = {
     "keys": "Keybindings",
 }
 
-HINT = "↑↓ navigate · enter select · tab switch panel · esc back / close"
-
-
 @dataclass(frozen=True)
 class Row:
     """One menu row: what it reads as, and what selecting it does."""
 
     label: str
     detail: str = ""
-    # pane | intellisense | source | dialect | ai | add-source; empty for reference.
+    # pane | intellisense | default-rows | source | dialect | ai | add-source.
     action: str = ""
     value: str = ""
 
@@ -119,7 +116,7 @@ class SettingsScreen(ModalScreen[None]):
                     yield Static("", id="settings-heading")
                     yield Static("", id="settings-description", markup=False)
                     yield OptionList(id="settings-menu")
-            yield Static(HINT, id="settings-hint")
+            yield Static("", id="settings-hint")
 
     def on_mount(self) -> None:
         self.query_one("#settings-sidebar", OptionList).focus()
@@ -143,14 +140,28 @@ class SettingsScreen(ModalScreen[None]):
             menu.highlighted = min(max(highlight, 0), len(self.rows) - 1)
         self.query_one("#settings-heading", Static).update(MENUS[self.menu])
         descriptions = {
-            "general": "Control editor completion. Changes apply immediately to this session.",
+            "general": "Control editor completion and default query rows. Row changes require Save in the editor.",
             "menus": "Show or hide workspace panes without changing your document.",
             "sources": "Connect a new Cloudflare D1 database or select an existing source. Selecting a source refreshes its schema and completion.",
             "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
-            "ai": "Configure your OpenAI-compatible provider. Settings and API keys stay in memory for this session only.",
+            "ai": "Select any value to edit your OpenAI-compatible provider. Changes are saved only when you choose Save in the editor.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
-        self.query_one("#settings-description", Static).update(descriptions[self.menu])
+        self.query_one("#settings-description", Static).update(
+            f"{descriptions[self.menu]}\nSettings: {self.session.settings_path}\n"
+            "Settings and connection backups contain plaintext API keys and D1 tokens. Keep them private."
+        )
+        action = {
+            "general": "enter / click toggle or edit",
+            "menus": "enter / click toggle",
+            "sources": "enter / click select or add",
+            "dialects": "enter / click select",
+            "ai": "enter / click edit",
+            "keys": "read-only reference",
+        }[self.menu]
+        self.query_one("#settings-hint", Static).update(
+            f"↑↓ navigate · {action} · tab switch panel · esc back / close"
+        )
 
     def _row_source(self) -> list[Row]:
         if self.menu == "menus":
@@ -168,26 +179,34 @@ class SettingsScreen(ModalScreen[None]):
         if self.menu == "sources":
             return [Row("Add Cloudflare D1", "new live connection or local snapshot", "add-source")] + [
                 Row(
-                    source.display,
-                    "active" if source_id == self.session.active_id else f"{len(source.datasets)} tables",
+                    label,
+                    "active" if source_id == self.session.active_id else
+                    f"{len(self.session.sources[source_id].datasets)} tables" if source_id in self.session.sources else
+                    "select to reconnect",
                     "source",
                     source_id,
                 )
-                for source_id, source in self.session.sources.items()
+                for label, source_id in self.session.source_options()
             ]
         if self.menu == "dialects":
             return [Row(spec["label"], self._dialect_detail(spec["name"]), "dialect", spec["name"]) for spec in DIALECTS]
         if self.menu == "ai":
             config = self.session.ai_config
             return [
-                Row("Configure provider", "edit URL, model and masked API key", "ai"),
-                Row("Endpoint", config.base_url or "not configured"),
-                Row("Model", config.model or "not configured"),
-                Row("API key", "configured" if config.api_key else "not set"),
-                Row("Maximum attempts", str(config.max_attempts)),
-                Row("Request timeout", f"{config.timeout:g} seconds"),
+                Row("Endpoint", config.base_url or "not configured", "ai", "ai-base-url"),
+                Row("Model", config.model or "not configured", "ai", "ai-model"),
+                Row("API key", "configured" if config.api_key else "not set", "ai", "ai-api-key"),
+                Row("AI turns/tool rounds", str(config.max_tool_rounds), "ai", "ai-tool-rounds"),
+                Row("Tool calls per round", str(config.max_tool_calls), "ai", "ai-tool-calls"),
+                Row("Sample records per read", str(config.sample_rows), "ai", "ai-sample-rows"),
+                Row("Maximum attempts", str(config.max_attempts), "ai", "ai-attempts"),
+                Row("Request timeout", f"{config.timeout:g} seconds", "ai", "ai-timeout"),
             ]
-        return [Row("Intellisense", "on" if self.session.intellisense else "off", "intellisense")]
+        return [
+            Row("Intellisense", "on" if self.session.intellisense else "off", "intellisense"),
+            Row("Default rows returned", str(self.session.default_rows) if self.session.default_rows else
+                "0 · no default limit", "default-rows"),
+        ]
 
     def _dialect_detail(self, name: str) -> str:
         """What a dialect row says about itself, honestly."""
@@ -228,17 +247,32 @@ class SettingsScreen(ModalScreen[None]):
         if row.action == "pane":
             self.ide.toggle_pane(row.value)
         elif row.action == "intellisense":
-            self.session.intellisense = not self.session.intellisense
+            self.ide.update_settings(intellisense=not self.session.intellisense)
+        elif row.action == "default-rows":
+            def rows_saved(_) -> None:
+                self._draw(event.option_index)
+                self.action_details()
+
+            self.app.push_screen(DefaultRowsScreen(self.ide), rows_saved)
+            return
         elif row.action == "ai":
-            self.app.push_screen(AIProviderScreen(self.ide), lambda _: self._draw(event.option_index))
-        elif row.action == "add-source":
-            if self.ide.refuse_busy("Add data source"):
+            self.app.push_screen(
+                AIProviderScreen(self.ide, focus_field=row.value),
+                lambda _: self._draw(event.option_index),
+            )
+            return
+        elif row.action == "add-source" or (row.action == "source" and
+                                            self.session.saved_source_profile(row.value) is not None):
+            if self.ide.refuse_busy("Connect data source"):
                 return
             def source_added(source) -> None:
                 self.ide._source_added(source)
                 self._draw(event.option_index)
 
-            self.app.push_screen(AddSourceModal(self.session), source_added)
+            if row.action == "add-source":
+                self.app.push_screen(AddSourceModal(self.session), source_added)
+            else:
+                self.ide.reconnect_source(row.value, source_added)
             return
         elif row.action == "source":
             self.ide.select_source(row.value)
@@ -254,8 +288,69 @@ class SettingsScreen(ModalScreen[None]):
             self.action_sidebar()
 
 
+class DefaultRowsScreen(ModalScreen[None]):
+    """Default query limit, persisted only on explicit Save."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    DefaultRowsScreen { align: center middle; background: $background; }
+    #rows-settings { width: 76; max-width: 100%; height: auto; max-height: 100%; padding: 1 2; border: round $accent; }
+    #rows-settings Static { height: auto; margin-top: 1; }
+    #rows-settings-buttons { height: auto; margin-top: 1; }
+    #rows-settings-buttons Button { margin-right: 1; min-width: 10; }
+    #rows-settings-error { color: $error; }
+    """
+
+    def __init__(self, ide: "AnyqlApp", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.ide = ide
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="rows-settings"):
+            yield Static("Default rows returned")
+            yield Static(
+                "Applies to ordinary Run and Compile when the query has no explicit \\limit. "
+                "An explicit \\limit always wins, including \\limit 0. "
+                "Your document is not edited, and temporary-table writes are not capped. "
+                "AI sample reads keep their own limits.", markup=False,
+            )
+            yield Static("Whole number from 0 to 1,000,000; 0 means no default limit.")
+            yield Input(str(self.ide.session.default_rows), type="integer", id="default-rows")
+            yield Static("", id="rows-settings-error", markup=False)
+            with Horizontal(id="rows-settings-buttons"):
+                yield Button("Save", id="rows-settings-save", variant="primary")
+                yield Button("Cancel", id="rows-settings-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#default-rows", Input).focus()
+
+    @on(Button.Pressed, "#rows-settings-save")
+    def _save_rows(self) -> None:
+        field = self.query_one("#default-rows", Input)
+        try:
+            value = int(field.value)
+            if not 0 <= value <= 1_000_000:
+                raise ValueError
+        except ValueError:
+            self.query_one("#rows-settings-error", Static).update(
+                "Enter a whole number from 0 to 1,000,000 (0 means no default limit)."
+            )
+            field.focus()
+            return
+        try:
+            self.ide.session.update_settings(default_rows=value)
+        except ValueError as exc:
+            self.query_one("#rows-settings-error", Static).update(str(exc))
+            return
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#rows-settings-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AIProviderScreen(ModalScreen[None]):
-    """OpenAI-compatible chat settings, deliberately never persisted."""
+    """OpenAI-compatible chat settings, persisted only on explicit Save."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     DEFAULT_CSS = """
@@ -267,23 +362,41 @@ class AIProviderScreen(ModalScreen[None]):
     #ai-settings-error { color: $error; }
     """
 
-    def __init__(self, ide: "AnyqlApp", **kwargs) -> None:
+    def __init__(self, ide: "AnyqlApp", *, focus_field: str = "ai-base-url", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
+        self.focus_field = focus_field
 
     def compose(self) -> ComposeResult:
         config = self.ide.session.ai_config
         with VerticalScroll(id="ai-settings"):
             yield Static("AI provider · OpenAI chat completions")
-            yield Static("Settings, keys and chats last only for this session. Sending a message shares the document and requested schema, samples and history with this provider. Use HTTPS for remote providers.", markup=False)
+            yield Static(
+                f"Save writes provider settings and the API key to {self.ide.session.settings_path}. "
+                "Settings and connection backups contain plaintext secrets; keep them private. "
+                "Completed chats and drafts are saved locally. Sending a message shares the document and requested schema, "
+                "samples and history with this provider. Use HTTPS for remote providers.", markup=False,
+            )
             yield Static("Base URL (including /v1), or full /chat/completions URL")
             yield Input(config.base_url, placeholder="https://yolo-auto.com/v1", id="ai-base-url")
             yield Static("Model")
             yield Input(config.model, placeholder="yolo", id="ai-model")
             yield Static("API key (leave blank for an unauthenticated local provider)")
             yield Input(config.api_key, password=True, id="ai-api-key")
+            yield Static("AI turns/tool rounds (1–50)")
+            yield Input(str(config.max_tool_rounds), type="integer", id="ai-tool-rounds")
+            yield Static("Rounds count model context batches, not chat messages. After the round budget, "
+                         "one final answer is requested with tools disabled.", markup=False)
+            yield Static("Tool calls per round (1–16)")
+            yield Input(str(config.max_tool_calls), type="integer", id="ai-tool-calls")
+            yield Static("Schema, sample, history and validation reads count as tool calls; "
+                         "several calls may share a round.", markup=False)
+            yield Static("Sample records per read (1–100)")
+            yield Input(str(config.sample_rows), type="integer", id="ai-sample-rows")
             yield Static("Maximum attempts (1–5; transient failures only)")
             yield Input(str(config.max_attempts), type="integer", id="ai-attempts")
+            yield Static("1 initial attempt + remaining attempts as shared retries per message, "
+                         "independent of the round budget.", markup=False)
             yield Static("Request timeout in seconds (including streaming)")
             yield Input(str(config.timeout), type="number", id="ai-timeout")
             yield Static("", id="ai-settings-error", markup=False)
@@ -293,7 +406,7 @@ class AIProviderScreen(ModalScreen[None]):
                 yield Button("Cancel", id="ai-settings-cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#ai-base-url", Input).focus()
+        self.query_one(f"#{self.focus_field}", Input).focus()
 
     @on(Button.Pressed, "#ai-settings-save")
     def _save_ai(self) -> None:
@@ -304,12 +417,22 @@ class AIProviderScreen(ModalScreen[None]):
                 api_key=self.query_one("#ai-api-key", Input).value.strip(),
                 max_attempts=int(self.query_one("#ai-attempts", Input).value),
                 timeout=float(self.query_one("#ai-timeout", Input).value),
+                max_tool_rounds=int(self.query_one("#ai-tool-rounds", Input).value),
+                max_tool_calls=int(self.query_one("#ai-tool-calls", Input).value),
+                sample_rows=int(self.query_one("#ai-sample-rows", Input).value),
             )
-            config.validate()
         except ValueError:
-            self.query_one("#ai-settings-error", Static).update("Enter a valid HTTP(S) URL without credentials/query/fragment, a model, 1–5 attempts, and a positive timeout up to 300 seconds.")
+            self.query_one("#ai-settings-error", Static).update(
+                "Enter whole numbers for attempts, tool rounds, tool calls and sample records, "
+                "and a number for the timeout."
+            )
             return
-        self.ide.session.ai_config = config
+        try:
+            config.validate()
+            self.ide.session.update_settings(ai=config)
+        except ValueError as exc:
+            self.query_one("#ai-settings-error", Static).update(str(exc))
+            return
         self.dismiss(None)
 
     @on(Button.Pressed, "#ai-settings-import")
@@ -322,7 +445,7 @@ class AIProviderScreen(ModalScreen[None]):
         self.query_one("#ai-base-url", Input).value = config.base_url
         self.query_one("#ai-model", Input).value = config.model
         self.query_one("#ai-api-key", Input).value = config.api_key
-        self.query_one("#ai-settings-error", Static).update("Imported into this form only; Save applies it in memory.")
+        self.query_one("#ai-settings-error", Static).update("Imported into this form only; Save persists these settings and the API key.")
 
     @on(Button.Pressed, "#ai-settings-cancel")
     def action_cancel(self) -> None:

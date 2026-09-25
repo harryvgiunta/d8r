@@ -18,8 +18,6 @@ MAX_EVENT_BYTES = 262_144
 MAX_CONTENT_BYTES = 262_144
 MAX_ARGUMENT_BYTES = 65_536
 MAX_TOOL_RESULT_BYTES = 262_144
-MAX_TOOL_CALLS = 16
-MAX_TOOL_ROUNDS = 6
 MAX_RETRY_DELAY = 30.0
 
 
@@ -30,6 +28,9 @@ class AIConfig:
     api_key: str = field(default="", repr=False)
     max_attempts: int = 3
     timeout: float = 60.0
+    max_tool_rounds: int = 10
+    max_tool_calls: int = 16
+    sample_rows: int = 5
 
     def validate(self) -> None:
         """Reject invalid settings without including their values in errors."""
@@ -68,6 +69,17 @@ class AIConfig:
             or any(not 33 <= ord(c) <= 126 for c in self.api_key)
         ):
             raise ValueError("The AI API key must contain only printable non-space ASCII characters.")
+        self.validate_limits()
+
+    def validate_limits(self) -> None:
+        """Validate execution limits even before a provider is configured."""
+        for value, maximum, label in (
+            (self.max_tool_rounds, 50, "tool rounds"),
+            (self.max_tool_calls, 16, "tool calls per round"),
+            (self.sample_rows, 100, "sample records per read"),
+        ):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError(f"AI {label} must be an integer between 1 and {maximum}.")
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 5:
             raise ValueError("AI attempts must be an integer between 1 and 5.")
         if (
@@ -199,6 +211,7 @@ class _ToolCall:
 
 @dataclass
 class _Response:
+    max_tool_calls: int
     started: bool = False
     content: list[str] = field(default_factory=list)
     content_size: int = 0
@@ -241,7 +254,7 @@ class _Response:
             if not isinstance(fragment, dict):
                 raise AIError("The AI provider returned an invalid tool call.")
             index = fragment.get("index")
-            if type(index) is not int or not 0 <= index < MAX_TOOL_CALLS:
+            if type(index) is not int or not 0 <= index < self.max_tool_calls:
                 raise AIError("The AI provider exceeded the tool-call limit or returned an invalid index.")
             if index not in self.calls:
                 self.calls[index] = _ToolCall()
@@ -284,6 +297,13 @@ class _Response:
             raise AIError("The AI provider returned an empty answer.")
         return message, requests
 
+    def diagnostic(self) -> str:
+        """Unfinished model output, never treated as a completed tool request."""
+        parts = ["Incomplete assistant response (not applicable):", "".join(self.content)]
+        for call in self.calls.values():
+            parts.append(f"Unfinished tool {call.id} ({call.name}):\n{''.join(call.arguments)}")
+        return "\n".join(parts)
+
 
 def _retry_after(value: str | None) -> float:
     if not value:
@@ -323,7 +343,12 @@ async def run_turn(
     of its history to discard the whole turn on cancellation or failure.
 
     ``max_attempts - 1`` is a shared retry budget, not a budget reset per tool
-    round. Up to six successful tool rounds may precede the final answer.
+    round. After ``max_tool_rounds`` context rounds, the final request disables tools.
+    Tool-budget guidance is merged into the initial system message on a copy;
+    it never enters ``messages`` or creates a second system message.
+    Diagnostic events expose request stages and model/tool output, not HTTP
+    bodies, headers, or hidden model reasoning. Consumers must redact and bound
+    them before display or retention.
     """
     try:
         config.validate()
@@ -336,17 +361,49 @@ async def run_turn(
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
     retries = rounds = 0
+    request_number = 0
     async with create_client(config) as client:
         while True:
-            state = _Response()
+            state = _Response(max_tool_calls=config.max_tool_calls)
             payload = {"model": config.model.strip(), "messages": messages, "stream": True}
             if tools:
                 payload["tools"] = tools
+                remaining = config.max_tool_rounds - rounds
+                if remaining:
+                    guidance = (
+                        f"You have {remaining} context-tool rounds remaining for this turn. "
+                        f"Request at most {config.max_tool_calls} tool calls per round. "
+                        "Reuse context already collected and batch independent context calls "
+                        "in one response. Request only information needed to answer; provide "
+                        "the final answer as soon as you have enough context."
+                    )
+                else:
+                    payload["tool_choice"] = "none"
+                    guidance = (
+                        "You have 0 context-tool rounds remaining. Tools are disabled; do not "
+                        "request any more tools. Provide your final answer using the context "
+                        "already collected. If that context is insufficient or the requested "
+                        "operation is unsupported, explain the concrete missing information "
+                        "or unsupported operation instead. Never pretend success or invent "
+                        "a query that is not supported by the collected context."
+                    )
+                # Strict chat templates accept only one initial system message.
+                # Copy it so retries, tool rounds and later turns never accumulate guidance.
+                if messages and messages[0]["role"] == "system":
+                    system = {**messages[0], "content": guidance + "\n\n" + messages[0]["content"]}
+                    payload["messages"] = [system, *messages[1:]]
+                else:
+                    payload["messages"] = [{"role": "system", "content": guidance}, *messages]
             failure: _Retryable | None = None
+            request_number += 1
+            yield AIEvent("diagnostic", f"Request {request_number}: {rounds}/{config.max_tool_rounds} tool rounds used; "
+                          f"tools {'disabled' if rounds >= config.max_tool_rounds or not tools else 'available'}. "
+                          f"Limit: {config.max_tool_calls} calls per round.")
             try:
                 async with asyncio.timeout(config.timeout):
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
                         status = response.status_code
+                        yield AIEvent("diagnostic", f"Request {request_number}: HTTP {status}.")
                         if status in {408, 429} or 500 <= status <= 599:
                             raise _Retryable(
                                 f"The AI provider is temporarily unavailable (HTTP {status}).",
@@ -373,9 +430,14 @@ async def run_turn(
                         message, requests = state.complete()
             except _Retryable as exc:
                 failure = exc
+            except AIError:
+                if state.started:
+                    yield AIEvent("diagnostic", state.diagnostic())
+                raise
             except (httpx.TransportError, TimeoutError) as exc:
                 reason = "The AI request timed out." if isinstance(exc, (httpx.TimeoutException, TimeoutError)) else "The AI connection failed."
                 if state.started:
+                    yield AIEvent("diagnostic", state.diagnostic())
                     raise AIError(reason + " The partial answer was discarded; retry manually.") from None
                 failure = _Retryable(reason)
             except httpx.HTTPError:
@@ -388,21 +450,28 @@ async def run_turn(
                 yield AIEvent("status", f"Retrying AI request in {delay:g}s ({retries + 1}/{config.max_attempts}).")
                 await asyncio.sleep(delay)
                 continue
+            yield AIEvent("diagnostic", "Completed assistant response:\n" + (message.get("content") or "[Tool calls only]"))
+            for tool_call, (name, arguments) in zip(message.get("tool_calls", []), requests):
+                yield AIEvent("diagnostic", f"Requested tool {tool_call['id']} ({name}):\n"
+                              + json.dumps(arguments, ensure_ascii=False, indent=2))
             if not requests:
                 messages.append(message)
                 return
-            if rounds >= MAX_TOOL_ROUNDS:
-                raise AIError("The AI reached the context-tool round limit; no final answer is available.")
+            if rounds >= config.max_tool_rounds:
+                raise AIError("The AI requested context tools after they were disabled; no final answer is available.")
             yield AIEvent("status", "Reading requested AI context…")
             results = []
             for tool_call, (name, arguments) in zip(message["tool_calls"], requests):
+                yield AIEvent("diagnostic", f"Executing tool {tool_call['id']} ({name}).")
                 try:
                     async with asyncio.timeout(config.timeout):
                         result = await call_tool(name, arguments)
-                except Exception:
+                except Exception as exc:
+                    yield AIEvent("diagnostic", f"Tool {tool_call['id']} ({name}) failed: {type(exc).__name__}; details withheld.")
                     raise AIError("An AI context tool failed; no final answer is available.") from None
                 if not isinstance(result, str) or _size(result) > MAX_TOOL_RESULT_BYTES:
                     raise AIError("An AI context tool returned an invalid or oversized result.")
+                yield AIEvent("diagnostic", f"Tool result {tool_call['id']} ({name}):\n{result}")
                 results.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
             messages.extend([message, *results])
             rounds += 1

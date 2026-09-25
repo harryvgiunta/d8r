@@ -10,9 +10,9 @@ the API — which runs it on the actual D1 engine and answers with the rows.
 This module owns the HTTPS round-trip and schema introspection. User queries
 come from `anyql.engine.expression`; discovery issues read-only SQLite SQL.
 
-Credentials are request-scoped and never persisted: the API token lives only in
-the in-memory source that "Add data source" builds, is used per query, and is
-never returned to the UI or written anywhere.
+The client holds the token in memory and uses it per request; it never persists
+or renders credentials. Explicit Add in the TUI saves credentials through the
+local storage layer, independently of this transport.
 """
 
 from __future__ import annotations

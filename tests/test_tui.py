@@ -535,6 +535,7 @@ def test_preview_cap_bounds_the_results_buffer(snapshot):
 
     async def scenario(app, pilot):
         assert PREVIEW_ROW_CAP == 10000
+        app.session.update_settings(default_rows=0)
 
         # The demo's own 100 rows: nothing to cap, and the count agrees.
         app.editor.load_text("\\from events")
@@ -1341,6 +1342,66 @@ def test_settings_switches_the_source_and_the_one_dialect():
     run_app(scenario)
 
 
+def test_settings_restore_hidden_panes_source_and_custom_dialect():
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert not app.session.settings_path.exists()
+            for name in app.PANES:
+                app.toggle_pane(name)
+            app.query_one("#source-select", Select).value = "postgres"
+            await pilot.pause()
+            app.query_one("#dialect-select", Select).value = "mysql"
+            await pilot.pause()
+            await pilot.press("ctrl+comma")
+            await pick(pilot, app, "Intellisense")
+            saved = app.session.settings_path.read_bytes()
+
+        restored = AnyqlApp()
+        async with restored.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert restored.session.active_id == "postgres"
+            assert restored.session.dialect == "mysql"
+            assert restored.query_one("#source-select", Select).value == "postgres"
+            assert restored.query_one("#dialect-select", Select).value == "mysql"
+            assert all(not restored.pane_visible(name) for name in restored.PANES)
+            assert not restored.query_one("#result-tabs", TabbedContent).display
+            assert not restored.session.intellisense
+            assert restored.session.settings_path.read_bytes() == saved
+    asyncio.run(scenario())
+
+
+def test_failed_settings_save_keeps_previous_workspace_and_controls():
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            # Another process saves after this app loaded its settings snapshot.
+            Session().update_settings(dialect="mysql")
+            saved = app.session.settings_path.read_bytes()
+            previous_status = text_of(app, "#status")
+            app.action_toggle_schema()
+            assert app.pane_visible("schema")
+            message = text_of(app, "#status")
+            assert message != previous_status
+            app.query_one("#source-select", Select).value = "postgres"
+            await pilot.pause()
+            assert app.session.active_id == "demo"
+            assert app.query_one("#source-select", Select).value == "demo"
+            app.query_one("#dialect-select", Select).value = "postgres"
+            await pilot.pause()
+            assert app.session.dialect == "duckdb"
+            assert app.query_one("#dialect-select", Select).value == "duckdb"
+            await pilot.press("ctrl+comma")
+            await pick(pilot, app, "Intellisense")
+            assert app.session.intellisense
+            assert app.screen.rows[0].detail == "on"
+            assert text_of(app, "#status") == message
+            assert app.session.settings_path.read_bytes() == saved
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # The server is gone
 # ---------------------------------------------------------------------------
@@ -1394,7 +1455,7 @@ def test_the_tui_reaches_no_http_server():
 # ---------------------------------------------------------------------------
 
 
-def test_the_palette_offers_the_statement_commands(snapshot):
+def test_the_palette_offers_the_statement_commands(snapshot, tmp_path):
     """Every command is in the palette, and only `\\drop` has a list to offer."""
     session = Session()
     labels = view_for(session, "\\", "\\", 1).labels
@@ -1413,8 +1474,8 @@ def test_the_palette_offers_the_statement_commands(snapshot):
     assert drop.labels == ["few"]
     assert drop.entries[0].detail == "temp table"
 
-    # A second session re-points the shared schema seam, so it goes last.
-    snap = Session({"snap": add_sqlite_source("snap", snapshot("snap", 3), "Snap")})
+    # Compare an independent SQLite workspace without restoring the DuckDB target.
+    snap = Session({"snap": add_sqlite_source("snap", snapshot("snap", 3), "Snap")}, data_dir=tmp_path / "sqlite-workspace")
     snap_labels = view_for(snap, "\\", "\\", 1).labels
     assert "\\savepoint" in snap_labels and "\\release" in snap_labels
 
@@ -1545,6 +1606,7 @@ def test_fn_library_authors_and_previews_then_the_document_calls_it():
     """`\\fn` opens the library; a saved function previews and runs from the document."""
 
     async def scenario(app, pilot):
+        app.session.update_settings(default_rows=0)
         await type_document(pilot, "\\fn")
         assert app.palette.view.labels == ["New function…"]  # empty library, one offer
         await pilot.press("enter")
@@ -1637,6 +1699,7 @@ def test_a_saved_function_completes_as_a_call_from_the_document():
     """In `\\from`, a saved function is offered as `name()` with the caret inside."""
 
     async def scenario(app, pilot):
+        app.session.update_settings(default_rows=0)
         app.session.save_fn("hot", "min_amount", FN_BODY, "")
         app.editor.load_text("")
         await pilot.pause()
@@ -1799,6 +1862,7 @@ def test_fn_parameters_accept_bare_prefix_and_nested_tokens_then_preview():
     """Parameter accepts keep punctuation intact and produce an executable body."""
 
     async def scenario(app, pilot):
+        app.session.update_settings(default_rows=0)
         app.action_fn()
         await pilot.pause()
         screen = app.screen
@@ -1982,3 +2046,203 @@ def test_cancel_pending_d1_connection_never_registers_or_remembers(monkeypatch):
             release.set()
 
     run_app(scenario)
+
+
+def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
+    from tests.test_d1_sources import LIVE_ARGS, SECRET, live_source
+
+    connected = []
+
+    def build_source(self, *args):
+        connected.append(args)
+        return live_source()[0]
+
+    monkeypatch.setattr(Session, "build_live_source", build_source)
+
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.press("ctrl+o")
+            modal = app.screen
+            modal.query_one("#account-id", Input).value = LIVE_ARGS["account_id"]
+            modal.query_one("#database", Input).value = LIVE_ARGS["database"]
+            modal.query_one("#api-token", Input).value = SECRET
+            await pilot.pause()
+            modal.action_test()
+            await app.workers.wait_for_complete()
+            assert not app.session.storage_path.exists()
+            assert not app.session.settings_path.exists()
+            modal.action_add()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, AddSourceModal)
+            assert app.session.active_id == "orders-db"
+            assert SECRET not in text_of(app, "#status")
+            saved = app.session.storage_path.read_bytes()
+
+        restored = AnyqlApp()
+        async with restored.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert "orders-db" not in restored.session.sources
+            assert len(connected) == 1
+            await pilot.press("ctrl+o")
+            modal = restored.screen
+            modal.query_one("#d1-profile", Select).value = 0
+            await pilot.pause()
+            token = modal.query_one("#api-token", Input)
+            assert token.value == SECRET
+            assert token.password
+            assert SECRET not in str(modal.query_one("#add-source-message", Static).content)
+            assert len(connected) == 1
+            await pilot.press("escape")
+            assert restored.session.storage_path.read_bytes() == saved
+            # The restored target is already selected; reconnect is an explicit action.
+            await pilot.click("#reconnect-source")
+            await restored.workers.wait_for_complete()
+            await pilot.pause()
+            assert restored.session.active_id == "orders-db"
+            assert restored.query_one("#source-select", Select).value == "orders-db"
+            assert len(connected) == 2
+            assert restored.session.storage_path.read_bytes() == saved
+            assert len(restored.session.source_options()) == len(restored.session.sources)
+            assert {table.name for table in restored.session.schema.tables} == {"orders", "customers"}
+    asyncio.run(scenario())
+
+
+@pytest.fixture
+def saved_d1_session():
+    from tests.test_d1_sources import SECRET
+
+    session = Session()
+    session.remember_d1("acct-1", "11111111-2222-3333-4444-555555555555", "Saved D1", SECRET)
+    return Session()
+
+
+def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(monkeypatch, saved_d1_session):
+    from anyql.engine import D1Error
+    from tests.test_d1_sources import SECRET
+
+    calls = []
+
+    def reject(*args):
+        calls.append(args)
+        raise D1Error("Access denied for " + SECRET)
+
+    monkeypatch.setattr(saved_d1_session, "build_live_source", reject)
+    before = saved_d1_session.storage_path.read_bytes()
+
+    async def scenario():
+        app = AnyqlApp(saved_d1_session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            assert not calls
+            await pilot.click("#source-select")
+            await pilot.press("end", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, AddSourceModal)
+            assert "Access denied" in str(app.screen.query_one("#add-source-message", Static).content)
+            assert SECRET not in str(app.screen.query_one("#add-source-message", Static).content)
+            assert app.session.active_id == "demo"
+            assert app.query_one("#source-select", Select).value == "demo"
+            assert app.session.storage_path.read_bytes() == before
+            assert not app.session.settings_path.exists()
+            await pilot.press("escape")
+            await pilot.click("#source-select")
+            await pilot.press("end", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert len(calls) == 2  # The saved choice remains available to retry.
+            await pilot.press("escape")
+    asyncio.run(scenario())
+
+
+def test_saved_dropdown_without_token_prompts_before_connecting(monkeypatch, saved_d1_session):
+    from tests.test_d1_sources import SECRET, live_source
+
+    session = saved_d1_session
+    profile = session.d1_profiles[0]
+    session.remember_d1(profile["account_id"], profile["database"], profile["display"], "")
+    calls = []
+
+    def connect(*args):
+        calls.append(args)
+        return live_source()[0]
+
+    monkeypatch.setattr(session, "build_live_source", connect)
+
+    async def scenario():
+        app = AnyqlApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.click("#source-select")
+            await pilot.press("end", "enter")
+            await pilot.pause()
+            modal = app.screen
+            assert isinstance(modal, AddSourceModal)
+            assert not calls and session.active_id == "demo"
+            token = modal.query_one("#api-token", Input)
+            assert token.password and token.has_focus
+            token.value = SECRET
+            await pilot.pause()
+            modal.action_add()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert session.active_id == "orders-db"
+            assert len(calls) == 1
+            assert Session().d1_profiles[0]["api_token"] == SECRET
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("surface", ["settings", "function"])
+def test_saved_sources_reconnect_in_secondary_pickers(monkeypatch, saved_d1_session, surface):
+    from tests.test_d1_sources import live_source
+
+    connected = []
+
+    def connect(*args):
+        source, _ = live_source()
+        connected.append(source)
+        return source
+
+    monkeypatch.setattr(saved_d1_session, "build_live_source", connect)
+
+    async def scenario():
+        app = AnyqlApp(saved_d1_session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            original = app.editor.text
+            assert not connected
+            if surface == "settings":
+                app.action_settings()
+                await pilot.pause()
+                await pick(pilot, app, "sources")
+                menu = app.screen.query_one("#settings-menu", OptionList)
+                menu.highlighted = menu.option_count - 1
+                menu.focus()
+                await pilot.press("enter")
+            else:
+                app.action_fn()
+                await pilot.pause()
+                screen = app.screen
+                body = screen.query_one("#fn-body", TextArea)
+                body.load_text("\\from orders\n\\select id")
+                await pilot.click("#fn-source")
+                await pilot.press("end", "enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert len(connected) == 1
+            assert "orders-db" in app.session.sources
+            assert len(app.session.source_options()) == len(app.session.sources)
+            assert app.editor.text == original
+            if surface == "settings":
+                assert isinstance(app.screen, SettingsScreen)
+                assert app.session.active_id == "orders-db"
+                assert any(row.value == "orders-db" for row in app.screen.rows)
+            else:
+                assert app.screen is screen
+                assert screen.source_id == "orders-db"
+                assert screen.query_one("#fn-source", Select).value == "orders-db"
+                assert body.text == "\\from orders\n\\select id"
+                assert app.session.active_id == "demo"
+                assert app.query_one("#source-select", Select).value == "demo"
+                assert not app.session.settings_path.exists()
+            assert not app.session.history
+    asyncio.run(scenario())

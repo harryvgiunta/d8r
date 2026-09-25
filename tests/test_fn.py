@@ -20,6 +20,7 @@ HOT_BODY = "\\from events\n\\where amount > @min_amount\n\\select user_id, amoun
 def session_with_functions() -> Session:
     """A session holding one threshold function and one no-argument function."""
     ns = Session()
+    ns.update_settings(default_rows=0)  # These tests measure full function results.
     ns.save_fn("hot", "min_amount", HOT_BODY, "events above a threshold")
     ns.save_fn("all_events", "", "\\from events\n\\select user_id", "every event")
     return ns

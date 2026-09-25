@@ -9,6 +9,8 @@ it never re-implements a rule of the language or the engine.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from uuid import uuid4
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -28,14 +30,14 @@ from textual.widgets import (
 )
 
 from anyql.ai.context import AIProposal
-from anyql.engine import DIALECTS, DIALECT_BY_NAME, capabilities_for
+from anyql.engine import DIALECTS, DIALECT_BY_NAME, DataSource, capabilities_for
 from anyql.query import ColumnDef
 
 from .add_source import AddSourceModal
 from .ai import AIPanel, AITarget
 from .palette import CommandPalette, EditorPane
 from .results import ResultsTable
-from .session import RunOutcome, Session
+from .session import RunOutcome, Session, default_dialect
 from .settings import SettingsScreen
 from .fn import FnScreen
 
@@ -130,8 +132,15 @@ class AnyqlApp(App):
         super().__init__(**kwargs)
         self.theme = "textual-dark"
         self.session = session if session is not None else Session()
-        self.history_documents: list[str] = []
-        self._document_identity = 0
+        self._document_identity = self.session.workspace.get("document_id") or str(uuid4())
+        document = self.session.workspace.get("document")
+        self._initial_document = WELCOME_DOCUMENT if document is None else document
+        self._workspace_editor: TextArea | None = None
+        self._workspace_timer = None
+        self._workspace_status: Static | None = None
+        self._workspace_ready = False
+        self._workspace_snapshot: dict = {}
+        self._autosave_error = ""
         self.run_busy = False
         self._run_task: asyncio.Task[RunOutcome] | None = None
         self._closing = False
@@ -158,6 +167,7 @@ class AnyqlApp(App):
                 id="dialect-select",
             )
             yield Static("", id="backend-pill")
+            yield Button("Reconnect", id="reconnect-source", compact=True)
         with Horizontal(id="body"):
             with Vertical(id="schema-pane"):
                 yield Static("Schema", classes="pane-title")
@@ -167,7 +177,7 @@ class AnyqlApp(App):
                     with Horizontal(id="document-actions"):
                         yield Static("Document", classes="pane-title")
                         yield Button("To function", id="query-to-fn", compact=True)
-                    yield TextArea(WELCOME_DOCUMENT, show_line_numbers=True, id="editor")
+                    yield TextArea(self._initial_document, show_line_numbers=True, id="editor")
                     yield CommandPalette(self.session, id="palette", markup=False)
                 with TabbedContent(id="result-tabs"):
                     with TabPane("Results", id="tab-results"):
@@ -190,22 +200,84 @@ class AnyqlApp(App):
             yield Static("", id="status", markup=False)
 
     def on_mount(self) -> None:
+        for name, visible in self.session.pane_visibility.items():
+            if self.pane_visible(name) != visible:
+                self.set_pane(name, visible)
         self._refresh_header()
         self._refresh_tree()
         self.query_one("#history-table", DataTable).add_columns(
             "time", "source", "dialect", "rows", "ms", "document"
         )
+        self._refresh_history()
+        self._workspace_editor = self.editor
+        self._workspace_status = self.query_one("#status", Static)
+        self.editor.move_cursor(tuple(self.session.workspace.get("cursor", [0, 0])))
+        self._workspace_ready = True
+        self.ai_panel.target_changed()
         self._set_status(f"ready · {self.session.active_id} · {self.session.dialect}")
         if self.session.memory_error:
             self._set_status(self.session.memory_error)
             self.notify(self.session.memory_error, title="Saved data could not be loaded", severity="error", timeout=15)
         self.editor.focus()
+        self._queue_workspace_save()
+        if self.session.workspace.get("active_view") == "function":
+            self.call_after_refresh(self.action_fn)
 
     def on_unmount(self) -> None:
         self._closing = True
+        self._flush_workspace()
         if self.run_busy and self._run_task is None:
             self.run_busy = False
             self.session.busy = ""
+
+    def exit(self, *args, **kwargs) -> None:
+        """Flush live widget values even if their change messages are still queued."""
+        for screen in self.screen_stack:
+            if isinstance(screen, FnScreen):
+                screen.flush_draft()
+        self._flush_workspace()
+        super().exit(*args, **kwargs)
+
+    def save_workspace(self, **changes) -> bool:
+        """Report autosave failures without discarding the in-memory document."""
+        try:
+            self.session.save_workspace(**changes)
+        except ValueError as exc:
+            message = str(exc)
+            if not self._closing and self._workspace_status is not None and self._workspace_status.is_mounted:
+                self._workspace_status.update(message)
+                if message != self._autosave_error:
+                    self.notify(message, title="Workspace could not be saved", severity="error", timeout=15)
+            self._autosave_error = message
+            return False
+        self._autosave_error = ""
+        return True
+
+    def _capture_workspace(self) -> None:
+        if self._workspace_editor is not None:
+            self._workspace_snapshot = {
+                "document": self._workspace_editor.text,
+                "document_id": self._document_identity,
+                "cursor": list(self._workspace_editor.cursor_location),
+                "source": self.session.source_key(),
+                "dialect": self.session.dialect,
+            }
+
+    def _queue_workspace_save(self) -> None:
+        if not self._workspace_ready or self._closing:
+            return
+        self._capture_workspace()
+        if self._workspace_timer is not None:
+            self._workspace_timer.stop()
+        self._workspace_timer = self.set_timer(0.2, self._flush_workspace)
+
+    def _flush_workspace(self) -> None:
+        if self._workspace_timer is not None:
+            self._workspace_timer.stop()
+            self._workspace_timer = None
+        self._capture_workspace()
+        if self._workspace_snapshot:
+            self.save_workspace(**self._workspace_snapshot)
 
     # -- widgets ------------------------------------------------------------
 
@@ -225,7 +297,7 @@ class AnyqlApp(App):
 
     def _ai_target(self) -> AITarget:
         return AITarget(
-            (self.session.active_id, self._document_identity),
+            (self.session.source_key(), self._document_identity),
             self.session.active_id, self.editor.text,
         )
 
@@ -236,10 +308,16 @@ class AnyqlApp(App):
 
     @on(TextArea.Changed, "#editor")
     def _ai_document_changed(self) -> None:
-        self.ai_panel.target_changed()
+        if self._workspace_ready:
+            self.ai_panel.target_changed()
+            self._queue_workspace_save()
+
+    @on(TextArea.SelectionChanged, "#editor")
+    def _document_caret_changed(self) -> None:
+        self._queue_workspace_save()
 
     def _source_options(self) -> list[tuple[Content, str]]:
-        return [(Content(source.display), source.id) for source in self.session.sources.values()]
+        return [(Content(label), source_id) for label, source_id in self.session.source_options()]
 
     def _dialect_options(self) -> list[tuple[Content, str]]:
         """Every advertised compile target; unavailable ones say so."""
@@ -250,8 +328,9 @@ class AnyqlApp(App):
         return options
 
     def _refresh_header(self) -> None:
-        backend = capabilities_for(self.session.source)["backend"]
+        backend = capabilities_for(self.session.source)["backend"] if self.session.source_connected() else "disconnected"
         self.query_one("#backend-pill", Static).update(backend)
+        self.query_one("#reconnect-source", Button).display = not self.session.source_connected()
 
     def _sync_dialect_select(self) -> None:
         select = self.query_one("#dialect-select", Select)
@@ -288,7 +367,6 @@ class AnyqlApp(App):
     def _refresh_history(self) -> None:
         table = self.query_one("#history-table", DataTable)
         table.clear()
-        self.history_documents = []
         for entry in self.session.history:
             table.add_row(
                 entry.at,
@@ -298,12 +376,21 @@ class AnyqlApp(App):
                 f"{entry.ms:.1f}",
                 Text(entry.title),
             )
-            self.history_documents.append(entry.doc)
 
     # -- status -------------------------------------------------------------
 
     def _set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
+
+    def update_settings(self, **changes) -> bool:
+        """Persist before changing the workspace, reporting safe storage errors."""
+        try:
+            self.session.update_settings(**changes)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            self.notify(str(exc), title="Settings could not be saved", severity="error")
+            return False
+        return True
 
     def _set_sql(self, sql: str) -> None:
         self.query_one("#sql-text", TextArea).load_text(sql)
@@ -353,10 +440,14 @@ class AnyqlApp(App):
         shown = any(self.pane_visible(name) for name in self.TAB_PANES)
         self.query_one("#work-bench").set_class(not shown, "no-tabs")
 
-    def toggle_pane(self, name: str) -> bool:
-        """Flip one pane; returns it as it now stands."""
-        self.set_pane(name, not self.pane_visible(name))
-        return self.pane_visible(name)
+    def toggle_pane(self, name: str) -> bool | None:
+        """Persist and flip one pane; return None if saving failed."""
+        visible = not self.pane_visible(name)
+        panes = {**self.session.pane_visibility, name: visible}
+        if not self.update_settings(panes=panes):
+            return None
+        self.set_pane(name, visible)
+        return visible
 
     def _modal_open(self) -> bool:
         """True while a modal screen owns the keyboard."""
@@ -429,6 +520,8 @@ class AnyqlApp(App):
         # Rollback or a partially successful document may also change tables.
         self._refresh_tree()
         self._set_status(outcome.status)
+        if self.session.workspace_error:
+            self.notify(self.session.workspace_error, title="History could not be saved", severity="error", timeout=15)
         self._show_tab("tab-results")
 
     def action_compile(self) -> None:
@@ -453,7 +546,27 @@ class AnyqlApp(App):
         if self.refuse_busy("Add data source"):
             return
         self.palette.close()
-        self.push_screen(AddSourceModal(self.session), self._source_added)
+        snapshot_path = self.session.saved_snapshot_path(self.session.active_id) if not self.session.source_connected() else None
+        self.push_screen(AddSourceModal(self.session, snapshot_path=snapshot_path), self._source_added)
+
+    @on(Button.Pressed, "#reconnect-source")
+    def _reconnect_active_source(self) -> None:
+        if not self._modal_open() and not self.session.source_connected():
+            self.reconnect_source(self.session.active_id, self._source_added)
+
+    def reconnect_source(self, source_id: str, connected: Callable[[DataSource | None], None]) -> None:
+        """Reconnect only after an explicit action, never while restoring a draft."""
+        self._sync_source_select()
+        profile = self.session.saved_source_profile(source_id)
+        snapshot_path = self.session.saved_snapshot_path(source_id)
+        if self.refuse_busy("Connect data source"):
+            return
+        self.palette.close()
+        if profile is None and snapshot_path is None:
+            self._set_status("This source is disconnected. Add its connection details to reconnect.")
+            self.push_screen(AddSourceModal(self.session), connected)
+            return
+        self.push_screen(AddSourceModal(self.session, profile=profile, snapshot_path=snapshot_path), connected)
 
     def action_toggle_results(self) -> None:
         """`\\results` — show or hide the results pane."""
@@ -476,7 +589,8 @@ class AnyqlApp(App):
             return
         self.palette.close()
         visible = self.toggle_pane(name)
-        self._set_status(f"{self.PANE_TITLES[name].lower()} {'shown' if visible else 'hidden'}")
+        if visible is not None:
+            self._set_status(f"{self.PANE_TITLES[name].lower()} {'shown' if visible else 'hidden'}")
 
     def action_settings(self) -> None:
         """`\\settings` — open the full-screen settings menu."""
@@ -491,7 +605,7 @@ class AnyqlApp(App):
 
     def action_query_to_fn(self) -> None:
         """Open a new function draft without saving or rewriting the document."""
-        self._open_fn(new_body=self.editor.text)
+        self._open_fn(new_body=self.editor.text, restore_draft=False)
 
     @on(Button.Pressed, "#query-to-fn")
     def _query_to_fn_clicked(self) -> None:
@@ -518,14 +632,23 @@ class AnyqlApp(App):
         self.palette.close()
         self.ai_panel.open()
 
-    def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "") -> None:
+    def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "", *, restore_draft: bool = True) -> None:
         """Open a saved function or a new draft with optional name and body."""
         if self._modal_open():
             return
         if self.refuse_busy("Function library"):
             return
         self.palette.close()
-        self.push_screen(FnScreen(self, focus=focus, new_name=new_name, new_body=new_body))
+        self._flush_workspace()
+        self.push_screen(
+            FnScreen(self, focus=focus, new_name=new_name, new_body=new_body, restore_draft=restore_draft),
+            self._function_closed,
+        )
+
+    def _function_closed(self, result: None) -> None:
+        """Offer newly saved functions at the existing caret, respecting dismissal."""
+        self.editor.focus()
+        self.palette.sync(respect_dismissal=True)
 
     def _render_results(self, outcome: RunOutcome) -> None:
         table = self.query_one("#results-table", ResultsTable)
@@ -533,50 +656,61 @@ class AnyqlApp(App):
         self.query_one("#results-status", Static).update(outcome.status)
 
 
-    def _source_added(self, source) -> None:
-        """Register a source the modal built, then re-point the whole app at it."""
+    def _source_added(self, source, *, activate: bool = True) -> None:
+        """Register a built source; function targets need not switch the workspace."""
         if source is None:
             return
-        self.session.register(source)
-        self.ai_panel.target_changed()
-        self.query_one("#source-select", Select).set_options(self._source_options())
+        self.session.register(source, activate=False)
+        with self.prevent(Select.Changed):
+            self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
-        self._sync_dialect_select()
         self._refresh_header()
         self._refresh_tree()
-        self._set_status(f"{source.id} added · {len(source.datasets)} tables")
+        self._sync_dialect_select()
+        self.ai_panel.target_changed()
+        self._queue_workspace_save()
+        if activate and self.select_source(source.id):
+            self._set_status(f"{source.id} added · {len(source.datasets)} tables")
 
     # -- messages -----------------------------------------------------------
 
 
     @on(Select.Changed, "#source-select")
     def _source_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, str):
+        if (self._workspace_ready and isinstance(event.value, str)
+                and event.value == event.select.value and event.value != self.session.active_id):
             self.select_source(event.value)
 
-    def select_source(self, source_id: str) -> None:
+    def select_source(self, source_id: str) -> bool:
         """Point the session — and everything rendered from it — at a source.
 
         One path for the header's select and the Settings menu's Data source
         rows, so both leave the header, the tree, the dialect and the pill in
         the same state.
         """
-        if source_id not in self.session.sources or source_id == self.session.active_id:
-            return
+        if not self.session.source_connected(source_id):
+            self.reconnect_source(source_id, self._source_added)
+            return False
+        if source_id == self.session.active_id:
+            return True
         if self.refuse_busy("Change data source"):
             self._sync_source_select()
-            return
-        self.session.set_active(source_id)
+            return False
+        if not self.update_settings(source=source_id, dialect=default_dialect(self.session.sources[source_id])):
+            self._sync_source_select()
+            return False
         self.ai_panel.target_changed()
         self._sync_source_select()
         self._refresh_header()
         self._refresh_tree()
         self._sync_dialect_select()
         self._set_status(f"{self.session.active_id} active · schema reloaded for the parser and the palette")
+        self._queue_workspace_save()
+        return True
 
     @on(Select.Changed, "#dialect-select")
     def _dialect_changed(self, event: Select.Changed) -> None:
-        if isinstance(event.value, str):
+        if isinstance(event.value, str) and event.value == event.select.value:
             self.select_dialect(event.value)
 
     def select_dialect(self, name: str) -> None:
@@ -590,8 +724,11 @@ class AnyqlApp(App):
         if self.refuse_busy("Change dialect"):
             self._sync_dialect_select()
             return
-        self.session.dialect = name
+        if not self.update_settings(dialect=name):
+            self._sync_dialect_select()
+            return
         self._sync_dialect_select()
+        self._queue_workspace_save()
         spec = DIALECT_BY_NAME.get(name)
         if spec is not None and not spec["compiles"]:
             self._set_status(f"{name} is known but does not compile in this build")
@@ -635,17 +772,28 @@ class AnyqlApp(App):
 
     @on(DataTable.RowSelected, "#history-table")
     def _history_selected(self, event: DataTable.RowSelected) -> None:
-        """Selecting a history row loads that document back into the editor."""
-        if 0 <= event.cursor_row < len(self.history_documents):
-            self._load_document(self.history_documents[event.cursor_row])
+        """Restore the recorded document and target without executing or connecting."""
+        if 0 <= event.cursor_row < len(self.session.history):
+            if self.refuse_busy("Load history"):
+                return
+            entry = self.session.history[event.cursor_row]
+            self.session.restore_source(entry.target or entry.source, entry.dialect)
+            with self.prevent(Select.Changed):
+                self.query_one("#source-select", Select).set_options(self._source_options())
+            self._sync_source_select()
+            self._sync_dialect_select()
+            self._refresh_header()
+            self._refresh_tree()
+            self._load_document(entry.doc)
 
     def _load_document(self, document: str) -> None:
-        self._document_identity += 1
+        self._document_identity = str(uuid4())
         self.editor.load_text(document)
         self.palette.close()
         self.editor.focus()
         self.ai_panel.target_changed()
         self._set_status("document loaded from history")
+        self._queue_workspace_save()
 
 
     @on(CommandPalette.ActionPerformed)
@@ -668,7 +816,7 @@ class AnyqlApp(App):
             self._open_fn(focus=event.action[len("fn-open:") :])
             return
         if event.action.startswith("fn-new:"):
-            self._open_fn(new_name=event.action[len("fn-new:") :])
+            self._open_fn(new_name=event.action[len("fn-new:") :], restore_draft=False)
             return
         action = actions.get(event.action)
         if action is not None:

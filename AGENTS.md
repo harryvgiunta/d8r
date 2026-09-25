@@ -34,8 +34,8 @@ Three layers, one direction:
 | Real database connections | DuckDB in-process over the Parquet under `anyql/engine/data/` |
 | An HTTP server or a browser UI | **The TUI is the app.** `uv run anyql`; nothing listens on a port |
 | Authentication | No login, no users, no session identity |
-| Credentials handling | Only the user-authorized D1 and AI-provider keys below; never persist, log, or echo them |
-| Persistence | Only custom functions and token-free D1 profiles persist under the user-authorized exception below; other state stays in memory |
+| Credentials handling | Only the user-authorized D1 and AI-provider keys below; save locally as authorized, never log or echo them unmasked |
+| Persistence | Only custom functions, D1 profiles/tokens, app/AI settings, and the user-authorized workspace/history state below persist; runtime database/results state stays in memory |
 | Hand-written SQL generation | Compose ibis expressions; render with `ibis.to_sql(expr, dialect=…)` |
 
 If a task seems to require one of these, it is out of scope. Build the *UI
@@ -48,36 +48,69 @@ exactly as narrowly as it is implemented today and nothing else may lean on it:
 (`anyql/engine/d1api.py`) using credentials the *user* pastes into the
 add-source modal, and `kind="d1"` opens a local `.sqlite` snapshot of a D1
 database through ibis's SQLite backend, entirely in-process. There is still no
-login/user/session concept or persisted secret.
+login/user/session concept. Credentials persist only through the local storage exception below.
 The live path keeps the architecture intact: payloads build against *unbound*
 ibis tables carrying the D1 database's real schemas and compile to SQLite SQL
 exactly like every other source; only the execution seam differs — the compiled
 SQLite SQL is POSTed to D1's `/query`|`/raw` endpoints instead of run on a local
-connection (`execute_remote` in `anyql/engine/execute.py`). **The token is
-request-scoped: it lives only in the in-memory source, is used per query, and is
-never persisted, logged, or echoed back into the UI** (the modal's API-token
-input is `password=True` and the built source never renders it).
+connection (`execute_remote` in `anyql/engine/execute.py`). The client uses the
+token per request; explicit **Add** saves it locally for reuse. Tokens are never
+logged or rendered unmasked (the modal's API-token input is `password=True`,
+and the built source never renders it). Startup never connects automatically.
 
-**User-authorized exception — local memory.** `anyql/storage.py` stores custom
-functions (name, ordered parameters, body, description) and token-free D1
-profiles (account ID, resolved database UUID, display label) in user-local
-`memory.json`. `Session` loads it at startup without network or schema-dependent
-body validation. Function Save/Run preview and Delete persist immediately;
-AI Apply and ordinary draft edits never auto-save. D1 Add remembers identifiers;
-Test and Cancel do not. A saved connection always requires a fresh token.
-The default directory is `%LOCALAPPDATA%/anyql` on Windows, Application Support
-on macOS, or XDG data home on Linux; `ANYQL_DATA_DIR` overrides it. Atomic
-replacement and stale-session detection protect saved work; a lock or temp file
-left by a crashed save clears itself after a minute. Invalid/unreadable
-memory is preserved, surfaced to the UI, and blocks saves until recovery and
-restart. Tests isolate this directory per test. No credentials, AI settings,
-chat, query history, active-source choice, documents, or temp tables persist.
+**User-authorized exception — local configuration.** `anyql/storage.py` stores
+custom functions (name, ordered parameters, body, description) and D1 profiles
+(account ID, resolved database UUID, display label, API token) in `memory.json`.
+`settings.json` stores Intellisense, pane visibility, selected source/dialect,
+default returned rows, and AI provider URL/model/API key/tool-round/call/sample
+limits/attempts/timeout. Configuration files are editable JSON under
+`~/.anyql` on every platform; `ANYQL_DATA_DIR` overrides that home, and explicit
+`Session(data_dir=...)` wins. Settings displays the resolved settings path.
+These files and backups contain plaintext secrets: protect them. New directories
+and files use owner-only POSIX modes; Windows relies on filesystem ACLs.
+`Session` loads configuration without network or schema-dependent function-body validation.
+Function Save/Run preview and Delete persist definitions immediately; AI Apply
+and ordinary edits autosave drafts only. D1 Add saves credentials; Test and Cancel do not.
+Saved profiles fill the masked token; legacy token-free profiles still load.
+Toggle preferences save on change; AI provider and default-row forms require explicit Save.
+Import only fills the form. Unavailable workspace targets restore as disconnected,
+never silently redirected to another source. No automatic directory migration:
+copy existing files or point ANYQL_DATA_DIR at their directory. Atomic replacement
+and stale-session detection protect all local files; a lock or
+temp file left by a crashed save clears itself after a minute. Invalid/unreadable
+files remain untouched, surface a safe UI error, and block saves to that file
+until recovery and restart. External file edits require restart. Tests isolate
+the home per test. Runtime result buffers, transactions, and temporary tables never persist.
+
+**User-authorized exception — durable workspace and history.** `workspace.json`
+autosaves the document/caret/stable identity, selected source/dialect, last
+workspace/function view, unsaved function draft and target, successful query
+history, and per-target completed AI conversations/composer drafts. Source
+references include local snapshot paths; credentials remain in their existing
+settings/memory files. Chats can contain schema, sampled data and sensitive drafts;
+workspace files and backups are plaintext. Debounced edits flush latest widget
+contents at exit. Session-owned writes merge under an RLock and reuse atomic
+storage/stale-writer protection. A failed autosave retains drafts/results in memory
+and reports the error; it never relabels an already executed query as failed.
+Startup restores unavailable sources as disconnected placeholders without any
+network, snapshot opening, query execution, AI request, Apply, or function-definition
+Save. Completed tool exchanges are validated before replay; partial replies,
+diagnostics and applicable proposals are not restored. New chat clears only its
+target. Returning from the function editor refreshes current IntelliSense without
+overriding the user's disabled/dismissed state.
+
+**Default returned rows.** `Session.default_rows` is 50 initially, configurable
+in General settings from 0 to 1,000,000; 0 disables the default. Ordinary Run and
+Compile apply it to the top-level payload only when no explicit `\limit` exists.
+Explicit limits (including 0) win; `\temp` materialization is never implicitly
+capped. Text and AST are unchanged, and AI sample reads retain their own limits.
 
 **User-authorized exception — AI inference.** `anyql/ai/client.py` calls a
 user-configured OpenAI-compatible Chat Completions provider using the existing
-`httpx` dependency. Settings owns URL/model/masked key configuration in memory;
-the optional yolo import reads the environment or `~/.omp/agent/.env` without
-modifying it. No OMP dependency, HTTP server, or persisted chat/credentials.
+`httpx` dependency. Settings owns URL/model/masked key configuration, persisted
+only on Save; the optional yolo import reads the environment or `~/.omp/agent/.env`
+without modifying it. No OMP dependency or HTTP server; chats persist only under
+the durable workspace exception above.
 `anyql/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
 history, function definitions, and parser validation; it grants no shell/file or
 arbitrary query-execution tool. `\AI` opens an in-layout chat; the function form's
@@ -126,7 +159,7 @@ sample rows, history, and submitted drafts may be sent to the configured provide
   deterministic data* and executes on the same in-process DuckDB as the demo;
   nothing more. `capabilities_for` labels each one honestly
   (`"<dialect> (mock)"`).
-- **Cloudflare D1 sources, added at runtime** (connections never persisted or bundled; token-free profiles remembered):
+- **Cloudflare D1 sources, added at runtime** (live connections are never bundled or restored automatically; profiles and API tokens are saved locally):
   `add_sqlite_source` (`kind="d1"`, a local `.sqlite` snapshot, opened
   in-process; `sqlite_*`/`_cf_*` objects are skipped, the same filter D1's own
   console applies) and `add_d1_live_source` (`kind="d1-live"`, real schemas
@@ -312,8 +345,8 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   keeps `enter` selecting rows in the results table.
 - **The results table is a preview buffer**: `Session.run` keeps the first
   `PREVIEW_ROW_CAP = 10000` rows and leaves the rest unread, while the status
-  line reports `showing N of M (preview capped)`. The engine still runs the
-  document exactly as written — the cap is not a query rewrite.
+  line reports `showing N of M (preview capped)`. This buffer cap is independent
+  of the user-configured default query limit; it never rewrites a query.
 - **Results and SQL are tabs, not containers.** `\results`/`\sql` drive
   `TabbedContent.hide_tab`/`show_tab` (public API in textual 8.2.7; hiding the
   active tab makes Textual activate the next shown one), `\schema` sets

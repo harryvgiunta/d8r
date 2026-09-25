@@ -1,4 +1,4 @@
-"""Durable functions and token-free D1 profiles, including failed-write safety."""
+"""Durable functions, credentials, and settings, including failed-write safety."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ def test_functions_execute_after_restart_and_deletion_is_durable(sources):
 
     after_delete = Session(sources)
     assert list(after_delete.fns) == ["events_copy"]
+    after_delete.update_settings(default_rows=0)
     assert after_delete.d1_profiles == original.d1_profiles
     missing = after_delete.run("\\from pair('hello', 42)\n\\select *")
     assert missing.error
@@ -61,7 +62,7 @@ def test_restoring_does_not_discard_functions_for_an_inactive_schema(sources):
 def test_failed_replace_preserves_file_registry_and_profiles(sources, monkeypatch, operation):
     session = Session(sources)
     saved = session.save_fn("pair", "first, second", BODY, "original")
-    session.remember_d1("account", DATABASE, "Original")
+    session.remember_d1("account", DATABASE, "Original", "original-token")
     before = session.storage_path.read_bytes()
     profiles = [dict(item) for item in session.d1_profiles]
 
@@ -75,7 +76,7 @@ def test_failed_replace_preserves_file_registry_and_profiles(sources, monkeypatc
         elif operation == "delete":
             session.delete_fn("pair")
         else:
-            session.remember_d1("account", DATABASE, "Changed")
+            session.remember_d1("account", DATABASE, "Changed", "rotated-token")
     assert str(session.storage_path) in str(failure.value)
     assert session.storage_path.read_bytes() == before
     assert session.fns["pair"] == saved
@@ -126,24 +127,23 @@ def test_unreadable_memory_is_not_replaced(sources, tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(Path, "read_bytes", denied)
         session = Session(sources, data_dir=tmp_path)
-        assert "access denied" in session.memory_error
         with pytest.raises(ValueError, match="restart"):
             session.save_fn("pair", "first, second", BODY, "")
     assert path.read_bytes() == contents
 
 
-def test_d1_profiles_upsert_without_persisting_credentials(sources, monkeypatch):
-    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "cloudflare-secret")
+def test_d1_credentials_rotate_and_restore_without_connecting(sources, monkeypatch):
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "environment-token")
     session = Session(sources)
-    session.ai_config = AIConfig(api_key="ai-secret")
-    session.remember_d1("account", DATABASE, "Old label")
-    session.remember_d1("account", DATABASE, "Production")
-    expected = [{"account_id": "account", "database": DATABASE, "display": "Production"}]
-    stored = json.loads(session.storage_path.read_text(encoding="utf-8"))
-    assert stored == {"version": 1, "functions": [], "d1_profiles": expected}
+    session.remember_d1("account", DATABASE, "Old label", "old-token")
+    assert Session(sources).d1_profiles[0]["api_token"] == "old-token"
+    session.remember_d1("account", DATABASE, "Production", "rotated-token")
     restored = Session(sources)
-    assert restored.d1_profiles == expected
-    assert restored.ai_config.api_key == ""
+    assert restored.d1_profiles == [{
+        "account_id": "account", "database": DATABASE,
+        "display": "Production", "api_token": "rotated-token",
+    }]
+    assert "old-token" not in session.storage_path.read_text(encoding="utf-8")
     assert all(source.kind != "d1-live" for source in restored.sources.values())
 
 
@@ -154,7 +154,10 @@ def test_profiles_require_resolved_uuid_and_preserve_previous_memory(sources):
     with pytest.raises(ValueError, match="UUID"):
         session.remember_d1("account", "database-name", "Unresolved")
     assert session.storage_path.read_bytes() == before
-    assert session.d1_profiles == [{"account_id": "account", "database": DATABASE, "display": "Production"}]
+    assert session.d1_profiles == [{
+        "account_id": "account", "database": DATABASE,
+        "display": "Production", "api_token": "",
+    }]
 
 
 def test_stale_session_cannot_overwrite_newer_functions_or_profiles(sources):
@@ -183,56 +186,237 @@ def test_explicit_directory_overrides_environment_without_startup_writes(sources
     session = Session(sources, data_dir=path)
     assert not path.exists()
     session.save_fn("pair", "first, second", BODY, "")
+    session.update_settings(intellisense=False)
     assert Session(sources).fns == {}
     restored = Session(sources, data_dir=path)
     assert "pair" in restored.fns
+    assert restored.intellisense is False
+    assert Session(sources).intellisense is True
 
 
-@pytest.mark.parametrize("platform,variable,relative", [
-    ("win32", "LOCALAPPDATA", "windows"),
-    ("darwin", None, "Library/Application Support"),
-    ("linux", "XDG_DATA_HOME", "xdg"),
-])
-def test_platform_data_directory(platform, variable, relative, tmp_path, monkeypatch):
+def test_default_directory_ignores_legacy_platform_locations(tmp_path, monkeypatch):
     monkeypatch.delenv("ANYQL_DATA_DIR")
-    monkeypatch.setattr(storage.sys, "platform", platform)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    if variable:
-        monkeypatch.setenv(variable, str(tmp_path / relative))
-    assert storage.data_directory() == tmp_path / relative / "anyql"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "legacy-windows"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "legacy-xdg"))
+    assert storage.data_directory() == tmp_path / ".anyql"
+    assert not (tmp_path / ".anyql").exists()
 
 
-def test_stale_lock_is_taken_over_and_fresh_lock_stays_busy(tmp_path, monkeypatch):
+def test_data_directory_environment_expands_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("ANYQL_DATA_DIR", "~/custom-anyql")
+    assert storage.data_directory() == tmp_path / "custom-anyql"
+
+
+@pytest.mark.parametrize("kind", ["memory", "settings"])
+def test_stale_lock_is_taken_over_and_fresh_lock_stays_busy(tmp_path, kind):
     """A crashed save's lock must not wedge saves forever; a live one must."""
     import os
     import time
 
-    store = storage.MemoryStore(tmp_path)
+    store = storage.MemoryStore(tmp_path) if kind == "memory" else storage.SettingsStore(tmp_path)
+    if kind == "memory":
+        def save():
+            store.save([{"name": "pair", "params": [], "body": "\\from events", "description": ""}], [])
+    else:
+        def save():
+            store.save({"intellisense": False})
     lock = store.path.with_suffix(".lock")
 
     lock.touch()
     with pytest.raises(ValueError, match="busy"):
-        store.save([], [])
+        save()
     assert lock.exists()
 
     old = time.time() - 2 * storage._STALE_SECONDS
     os.utime(lock, (old, old))
-    store.save([{"name": "pair", "params": [], "body": "\\from events", "description": ""}], [])
+    save()
     assert not lock.exists()
-    assert [fn["name"] for fn in store.document["functions"]] == ["pair"]
+    restored = type(store)(tmp_path)
+    if kind == "memory":
+        assert [fn["name"] for fn in restored.document["functions"]] == ["pair"]
+    else:
+        assert restored.document["intellisense"] is False
 
 
-def test_orphan_temp_files_are_swept_and_fresh_ones_survive(tmp_path):
+@pytest.mark.parametrize("kind", ["memory", "settings"])
+def test_orphan_temp_files_are_swept_and_fresh_ones_survive(tmp_path, kind):
     """Load removes debris older than the grace period, never a save in flight."""
     import os
     import time
 
-    old = tmp_path / ".memory-crashed.tmp"
-    fresh = tmp_path / ".memory-running.tmp"
+    old = tmp_path / f".{kind}-crashed.tmp"
+    fresh = tmp_path / f".{kind}-running.tmp"
     old.write_bytes(b"{}")
     fresh.write_bytes(b"{}")
     stale = time.time() - 2 * storage._STALE_SECONDS
     os.utime(old, (stale, stale))
-    storage.MemoryStore(tmp_path)
+    (storage.MemoryStore if kind == "memory" else storage.SettingsStore)(tmp_path)
     assert not old.exists()
     assert fresh.exists()
+
+
+def test_legacy_memory_profiles_load_without_rewriting(sources, tmp_path):
+    path = tmp_path / "memory.json"
+    contents = json.dumps({
+        "version": 1, "functions": [], "d1_profiles": [
+            {"account_id": "account", "database": DATABASE, "display": "Legacy"},
+        ],
+    }).encode("utf-8")
+    path.write_bytes(contents)
+    session = Session(sources, data_dir=tmp_path)
+    assert session.memory_error == ""
+    assert session.d1_profiles[0]["api_token"] == ""
+    assert path.read_bytes() == contents
+    session.remember_d1("account", DATABASE, "Configured", "new-token")
+    assert Session(sources, data_dir=tmp_path).d1_profiles[0]["api_token"] == "new-token"
+
+
+def test_settings_and_ai_credentials_survive_restart(sources):
+    session = Session(sources)
+    config = AIConfig("https://provider.example/v1", "test-model", "first-key", 2, 45.0,
+                      max_tool_rounds=12, max_tool_calls=3, sample_rows=20)
+    session.update_settings(intellisense=False, panes={"history": False}, source="mysql", ai=config)
+    restored = Session(sources)
+    assert restored.intellisense is False
+    assert restored.pane_visibility["history"] is False
+    assert restored.pane_visibility["results"] is True
+    assert restored.active_id == "mysql"
+    assert restored.ai_config == config
+    rotated = AIConfig("https://provider.example/v1", "other-model", "rotated-key", 4, 20.0,
+                       max_tool_rounds=1, max_tool_calls=1, sample_rows=1)
+    restored.update_settings(ai=rotated, dialect="duckdb")
+    restarted = Session(sources)
+    assert restarted.ai_config == rotated
+    assert restarted.dialect == "duckdb"
+    assert "first-key" not in restarted.settings_path.read_text(encoding="utf-8")
+
+
+def test_legacy_ai_settings_fill_limits_without_rewriting(sources, tmp_path):
+    path = tmp_path / "settings.json"
+    contents = json.dumps({"ai": {
+        "base_url": "https://provider.example/v1", "model": "test-model",
+        "api_key": "existing-key", "max_attempts": 2, "timeout": 45.0,
+    }}).encode("utf-8")
+    path.write_bytes(contents)
+    session = Session(sources, data_dir=tmp_path)
+    assert not session.memory_error
+    assert session.ai_config.max_tool_rounds == 10
+    assert session.ai_config.max_tool_calls == 16
+    assert session.ai_config.sample_rows == 5
+    assert session.ai_config.max_attempts == 2
+    assert path.read_bytes() == contents
+
+
+@pytest.mark.parametrize("contents", [
+    b'{"secret-content":"secret-value","secret-content":"duplicate"}',
+    b'{"ai":{"api_key":"secret-value"},',
+    b'{"ai":{"base_url":"https://secret-value@example.com","model":"m"}}',
+    b'{"ai":{"max_attempts":true}}',
+    b'{"ai":{"max_tool_rounds":0}}',
+    b'{"ai":{"max_tool_calls":17}}',
+    b'{"ai":{"sample_rows":101}}',
+    b'{"panes":{"secret-content":false}}',
+    b'{"dialect":"secret-value"}',
+    b'{"source":null}',
+])
+def test_invalid_settings_block_saves_without_echoing_secrets(sources, tmp_path, contents):
+    path = tmp_path / "settings.json"
+    path.write_bytes(contents)
+    session = Session(sources, data_dir=tmp_path)
+    assert session.memory_error
+    assert "secret-value" not in session.memory_error
+    assert "secret-content" not in session.memory_error
+    with pytest.raises(ValueError) as failure:
+        session.update_settings(intellisense=False)
+    assert "secret-value" not in str(failure.value)
+    assert "secret-content" not in str(failure.value)
+    assert session.intellisense is True
+    assert path.read_bytes() == contents
+
+
+def test_duplicate_memory_keys_do_not_expose_secret_text(tmp_path):
+    contents = b'{"secret-key":0,"secret-key":1}'
+    path = tmp_path / "memory.json"
+    path.write_bytes(contents)
+    store = storage.MemoryStore(tmp_path)
+    assert store.error
+    assert "secret-key" not in store.error
+    with pytest.raises(ValueError):
+        store.save([], [])
+    assert path.read_bytes() == contents
+
+
+def test_sparse_manually_edited_settings_are_used_without_rewriting(sources, tmp_path):
+    path = tmp_path / "settings.json"
+    contents = b'{"intellisense":false,"panes":{"sql":false}}\n'
+    path.write_bytes(contents)
+    session = Session(sources, data_dir=tmp_path)
+    assert session.memory_error == ""
+    assert session.intellisense is False
+    assert session.pane_visibility["sql"] is False
+    assert session.pane_visibility["results"] is True
+    assert path.read_bytes() == contents
+    session.update_settings(panes={"history": False})
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.pane_visibility["sql"] is False
+    assert restored.pane_visibility["history"] is False
+
+
+def test_external_settings_edits_are_not_overwritten(sources):
+    session = Session(sources)
+    session.update_settings(intellisense=False)
+    contents = b'{"intellisense":true,"panes":{"history":false}}\n'
+    session.settings_path.write_bytes(contents)
+    with pytest.raises(ValueError, match="changed outside this session"):
+        session.update_settings(panes={"sql": False})
+    assert session.intellisense is False
+    assert session.pane_visibility["sql"] is True
+    assert session.settings_path.read_bytes() == contents
+    restored = Session(sources)
+    assert restored.intellisense is True
+    assert restored.pane_visibility["history"] is False
+
+
+def test_failed_settings_write_preserves_applied_state_and_credentials(sources, monkeypatch):
+    session = Session(sources)
+    original = AIConfig("https://provider.example/v1", "model", "original-secret")
+    session.update_settings(ai=original, intellisense=False)
+    before = session.settings_path.read_bytes()
+
+    def deny_replace(source, destination):
+        raise PermissionError("secret-from-filesystem")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage.os, "replace", deny_replace)
+        with pytest.raises(ValueError) as failure:
+            session.update_settings(
+                ai=AIConfig("https://other.example/v1", "other", "rotated-secret"),
+                intellisense=True, panes={"sql": False}, source="mysql",
+            )
+        assert "secret" not in str(failure.value)
+    assert session.ai_config == original
+    assert session.intellisense is False
+    assert session.pane_visibility["sql"] is True
+    assert session.active_id == "demo"
+    assert session.settings_path.read_bytes() == before
+    assert Session(sources).ai_config == original
+    session.update_settings(intellisense=True)
+    assert Session(sources).intellisense is True
+
+
+@pytest.mark.skipif(storage.os.name != "posix", reason="Windows permissions use filesystem ACLs")
+def test_new_secret_files_and_directory_are_owner_only(tmp_path):
+    directory = tmp_path / "private"
+    memory = storage.MemoryStore(directory)
+    settings = storage.SettingsStore(directory)
+    memory.save([], [{
+        "account_id": "account", "database": DATABASE, "display": "Private", "api_token": "token",
+    }])
+    settings.save({"ai": {"base_url": "https://provider.example", "model": "m", "api_key": "key"}})
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert memory.path.stat().st_mode & 0o777 == 0o600
+    assert settings.path.stat().st_mode & 0o777 == 0o600

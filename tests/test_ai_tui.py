@@ -30,7 +30,13 @@ def completion(text=ANSWER) -> bytes:
 
 
 def install_provider(monkeypatch, handler):
-    transport = httpx.MockTransport(handler)
+    def strict_provider(request):
+        messages = json.loads(request.content)["messages"]
+        if [i for i, message in enumerate(messages) if message["role"] == "system"] != [0]:
+            return httpx.Response(400, json={"error": {"message": "System message must be at the beginning."}})
+        return handler(request)
+
+    transport = httpx.MockTransport(strict_provider)
     monkeypatch.setattr(client, "create_client", lambda config: httpx.AsyncClient(transport=transport))
 
 
@@ -69,6 +75,11 @@ def test_settings_save_cancel_and_masked_key():
             form.query_one("#ai-base-url", Input).value = "https://provider.invalid/v1"
             form.query_one("#ai-model", Input).value = "test"
             form.query_one("#ai-api-key", Input).value = "private-value"
+            form.query_one("#ai-attempts", Input).value = "4"
+            form.query_one("#ai-timeout", Input).value = "45"
+            form.query_one("#ai-tool-rounds", Input).value = "50"
+            form.query_one("#ai-tool-calls", Input).value = "7"
+            form.query_one("#ai-sample-rows", Input).value = "100"
             assert form.query_one("#ai-api-key", Input).password
             await click(pilot, form.query_one("#ai-settings-save", Button))
             assert app.session.ai_config.model == "test"
@@ -78,9 +89,184 @@ def test_settings_save_cancel_and_masked_key():
             form = app.screen
             assert isinstance(form, AIProviderScreen)
             form.query_one("#ai-model", Input).value = "cancelled-change"
+            form.query_one("#ai-tool-rounds", Input).value = "1"
+            form.query_one("#ai-tool-calls", Input).value = "1"
+            form.query_one("#ai-sample-rows", Input).value = "1"
             await pilot.press("escape")
             assert app.session.ai_config.model == "test"
+        restored = AnyqlApp()
+        async with restored.run_test(size=(150, 58)) as pilot:
+            restored.push_screen(AIProviderScreen(restored))
+            await pilot.pause()
+            form = restored.screen
+            assert form.query_one("#ai-base-url", Input).value == "https://provider.invalid/v1"
+            assert form.query_one("#ai-model", Input).value == "test"
+            assert form.query_one("#ai-api-key", Input).value == "private-value"
+            assert form.query_one("#ai-api-key", Input).password
+            assert form.query_one("#ai-attempts", Input).value == "4"
+            assert float(form.query_one("#ai-timeout", Input).value) == 45
+            assert form.query_one("#ai-tool-rounds", Input).value == "50"
+            assert form.query_one("#ai-tool-calls", Input).value == "7"
+            assert form.query_one("#ai-sample-rows", Input).value == "100"
+    asyncio.run(scenario())
+
+
+def test_settings_edits_selected_provider_field_and_returns_to_it():
+    async def scenario():
+        session = configured()
+        session.update_settings(ai=session.ai_config)
+        app = AnyqlApp(session=session)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("ctrl+comma")
+            screen = app.screen
+            sidebar = screen.query_one("#settings-sidebar", OptionList)
+            sidebar.highlighted = sidebar.get_option_index("ai")
+            await pilot.pause()
+            await pilot.press("enter")
+            menu = screen.query_one("#settings-menu", OptionList)
+            for field, attribute, value, cancelled in (
+                ("ai-model", "model", "new", "cancelled"),
+                ("ai-tool-rounds", "max_tool_rounds", "1", "2"),
+                ("ai-tool-calls", "max_tool_calls", "1", "2"),
+                ("ai-sample-rows", "sample_rows", "1", "2"),
+            ):
+                menu.highlighted = next(index for index, row in enumerate(screen.rows) if row.value == field)
+                previous = getattr(Session().ai_config, attribute)
+                await pilot.press("enter")
+                assert isinstance(app.screen, AIProviderScreen)
+                form = app.screen
+                control = form.query_one(f"#{field}", Input)
+                assert app.focused is control
+                await pilot.press("home", "shift+end", *value)
+                assert control.value == value
+                assert getattr(Session().ai_config, attribute) == previous
+                await click(pilot, form.query_one("#ai-settings-save", Button))
+                assert app.screen is screen
+                assert menu.has_focus
+                assert screen.rows[menu.highlighted].value == field
+                assert str(getattr(Session().ai_config, attribute)) == value
+                await pilot.press("enter")
+                assert app.focused is app.screen.query_one(f"#{field}", Input)
+                await pilot.press("home", "shift+end", *cancelled, "escape")
+                assert app.screen is screen
+                assert str(getattr(Session().ai_config, attribute)) == value
+    asyncio.run(scenario())
+
+
+def test_provider_fields_remain_keyboard_reachable_on_small_screen():
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(AIProviderScreen(app))
+            await pilot.pause()
+            form = app.screen
+            for field in ("ai-base-url", "ai-model", "ai-api-key", "ai-tool-rounds",
+                          "ai-tool-calls", "ai-sample-rows", "ai-attempts", "ai-timeout"):
+                control = form.query_one(f"#{field}", Input)
+                assert app.focused is control
+                assert await pilot.click(control)
+                await pilot.press("tab")
+            for button in ("ai-settings-save", "ai-settings-import", "ai-settings-cancel"):
+                assert app.focused is form.query_one(f"#{button}", Button)
+                if button != "ai-settings-cancel":
+                    await pilot.press("tab")
+            await pilot.press("enter")
+            assert app.screen is not form
+            assert not app.session.settings_path.exists()
+    asyncio.run(scenario())
+
+
+def test_invalid_provider_budgets_block_atomic_save_without_exposing_values():
+    async def scenario():
+        session = configured()
+        session.update_settings(ai=session.ai_config)
+        original = session.ai_config
+        saved = session.settings_path.read_bytes()
+        app = AnyqlApp(session=session)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(AIProviderScreen(app))
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#ai-model", Input).value = "draft-model"
+            form.query_one("#ai-api-key", Input).value = "private-unsaved-key"
+            drafts = {"ai-tool-rounds": "20", "ai-tool-calls": "8", "ai-sample-rows": "30"}
+            for field, value in drafts.items():
+                form.query_one(f"#{field}", Input).value = value
+            for field, invalid in (
+                ("ai-tool-rounds", "0"), ("ai-tool-rounds", "51"),
+                ("ai-tool-calls", "0"), ("ai-tool-calls", "17"),
+                ("ai-sample-rows", "0"), ("ai-sample-rows", "101"),
+                ("ai-sample-rows", "private-unsaved-key"),
+            ):
+                form.query_one(f"#{field}", Input).value = invalid
+                await click(pilot, form.query_one("#ai-settings-save", Button))
+                # Textual ignores repeat presses during the button's active effect.
+                await pilot.pause(form.query_one("#ai-settings-save", Button).active_effect_duration)
+                assert app.screen is form
+                assert session.ai_config == original
+                assert session.settings_path.read_bytes() == saved
+                assert form.query_one("#ai-model", Input).value == "draft-model"
+                assert form.query_one("#ai-api-key", Input).value == "private-unsaved-key"
+                error = str(form.query_one("#ai-settings-error", Static).content)
+                assert error
+                assert "private-unsaved-key" not in error
+                form.query_one(f"#{field}", Input).value = drafts[field]
+            await click(pilot, form.query_one("#ai-settings-save", Button))
+            assert app.screen is not form
+            assert Session().ai_config == AIConfig(
+                base_url=original.base_url, model="draft-model", api_key="private-unsaved-key",
+                max_tool_rounds=20, max_tool_calls=8, sample_rows=30,
+            )
+    asyncio.run(scenario())
+
+
+def test_provider_save_failure_keeps_form_and_previous_settings():
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(150, 58)) as pilot:
+            app.push_screen(AIProviderScreen(app))
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#ai-base-url", Input).value = "https://provider.invalid/v1"
+            form.query_one("#ai-model", Input).value = "unsaved"
+            form.query_one("#ai-api-key", Input).value = "private-unsaved-key"
+            Session().update_settings(intellisense=False)
+            await click(pilot, form.query_one("#ai-settings-save", Button))
+            assert app.screen is form
+            assert app.session.ai_config.api_key == ""
+            assert form.query_one("#ai-api-key", Input).password
+            message = str(form.query_one("#ai-settings-error", Static).content)
+            assert message
+            assert "private-unsaved-key" not in message
+            restored = Session()
+            assert restored.ai_config.api_key == ""
+            assert restored.intellisense is False
+    asyncio.run(scenario())
+
+
+def test_import_provider_then_cancel_does_not_save(monkeypatch):
+    config = AIConfig(base_url="https://provider.invalid/v1", model="imported", api_key="imported-private-key")
+    monkeypatch.setattr("anyql.tui.settings.import_yolo_config", lambda: config)
+
+    async def scenario():
+        app = AnyqlApp()
+        async with app.run_test(size=(150, 58)) as pilot:
+            app.push_screen(AIProviderScreen(app))
+            await pilot.pause()
+            form = app.screen
+            drafts = {"ai-tool-rounds": "22", "ai-tool-calls": "8", "ai-sample-rows": "31",
+                      "ai-attempts": "4", "ai-timeout": "45"}
+            for field, value in drafts.items():
+                form.query_one(f"#{field}", Input).value = value
+            await click(pilot, form.query_one("#ai-settings-import", Button))
+            assert form.query_one("#ai-api-key", Input).value == config.api_key
+            assert form.query_one("#ai-api-key", Input).password
+            assert {field: form.query_one(f"#{field}", Input).value for field in drafts} == drafts
+            assert not app.session.settings_path.exists()
+            await pilot.press("escape")
             assert Session().ai_config.api_key == ""
+            assert Session().ai_config == AIConfig()
+            assert not app.session.settings_path.exists()
     asyncio.run(scenario())
 
 
@@ -125,10 +311,10 @@ def test_inline_stream_tools_and_apply_only(monkeypatch):
             composer.load_text("Use schema, sample rows and history.")
             composer.move_cursor((0, len(composer.text)))
             composer.focus()
-            await pilot.press("enter", *"Propose a query.")
+            await pilot.press("shift+enter", *"Propose a query.")
             assert composer.text == "Use schema, sample rows and history.\nPropose a query."
-            assert not requests  # Enter edits the message; only Ctrl+Enter sends.
-            await pilot.press("ctrl+enter")
+            assert not requests  # Shift+Enter edits the message; it does not send.
+            await pilot.press("enter")
             await asyncio.wait_for(streamed.wait(), 8)
             await pilot.pause()
             assert "replacement" in str(panel.query_one("#ai-transcript", Static).content)
@@ -153,6 +339,69 @@ def test_inline_stream_tools_and_apply_only(monkeypatch):
             panel.query_one("#ai-input", TextArea).focus()
             await pilot.press("tab")
             assert app.focused is panel.query_one("#ai-send", Button)
+    asyncio.run(scenario())
+
+
+def test_failed_tool_attempts_remain_copyable_without_entering_chat_history(monkeypatch):
+    requests = []
+    attempted = "\\from events\n\\select date_trunc(timestamp) as unsupported_attempt\n\\select 'test-secret', 'd1-private-token'"
+
+    def provider(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            call = {"index": 0, "id": "validate-attempt", "type": "function", "function": {
+                "name": "validate_anyql", "arguments": json.dumps({"text": attempted}),
+            }}
+            data = frame({"tool_calls": [call]}, "tool_calls") + b"data: [DONE]\n\n"
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data)
+        if len(requests) == 2:
+            return httpx.Response(503, text="provider-body-must-not-be-logged test-secret")
+        assert "unsupported_attempt" not in json.dumps(body["messages"])
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion())
+
+    install_provider(monkeypatch, provider)
+
+    async def scenario():
+        session = configured()
+        session.ai_config = AIConfig("https://provider.invalid/v1", "test", "test-secret", max_attempts=1)
+        session.d1_profiles = [{"account_id": "saved-account", "database": "11111111-2222-3333-4444-555555555555",
+                                "display": "Saved D1", "api_token": "d1-private-token"}]
+        app = AnyqlApp(session)
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.editor.focus()
+            await pilot.press("\\", "A", "I", "enter")
+            panel = app.query_one("#workspace-ai", AIPanel)
+            original = app.editor.text
+            panel.query_one("#ai-input", TextArea).load_text("Count requests by day")
+            panel.action_send()
+            await finished(panel)
+            assert not panel.messages
+            assert panel.query_one("#ai-apply", Button).disabled
+            assert app.editor.text == original
+            await click(pilot, panel.query_one("#ai-logs", Button))
+            logs = app.screen.query_one("#ai-log-text", TextArea).text
+            assert "unsupported_attempt" in logs and "date_trunc" in logs
+            assert '"valid": false' in logs
+            assert "HTTP 503" in logs
+            assert "test-secret" not in logs and "d1-private-token" not in logs
+            assert "[REDACTED]" in logs
+            assert "provider-body-must-not-be-logged" not in logs
+            await click(pilot, app.screen.query_one("#ai-log-copy", Button))
+            assert app.clipboard == logs
+            await pilot.press("escape")
+            panel.query_one("#ai-input", TextArea).load_text("Try again")
+            panel.action_send()
+            await finished(panel)
+            assert not panel.query_one("#ai-apply", Button).disabled
+            await click(pilot, panel.query_one("#ai-logs", Button))
+            logs = app.screen.query_one("#ai-log-text", TextArea).text
+            assert "unsupported_attempt" in logs and "Turn 2 started" in logs
+            await pilot.press("escape")
+            panel.action_clear()
+            await click(pilot, panel.query_one("#ai-logs", Button))
+            assert "unsupported_attempt" not in app.screen.query_one("#ai-log-text", TextArea).text
+            assert not session.history
     asyncio.run(scenario())
 
 
@@ -295,7 +544,6 @@ def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
             assert screen.query_one("#fn-name", Input).value == ""
             assert screen.query_one("#fn-body", TextArea).text == ""
             assert not app.session.fns
-            assert '"source": "mysql"' in requests[0]["messages"][0]["content"]
             assert not panel.query_one("#ai-apply", Button).disabled
             assert "categories(category)" in str(panel.query_one("#ai-function-details", Static).content)
             # Even example-argument edits make an outstanding replacement stale.

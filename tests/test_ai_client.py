@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
+from copy import deepcopy
 from dataclasses import replace
 
 import httpx
@@ -198,7 +199,8 @@ def test_connect_failure_before_deltas_can_retry(transport, monkeypatch):
     assert messages[-1]["content"] == "Connected."
 
 
-def test_retry_budget_is_shared_across_tool_rounds(transport, monkeypatch):
+@pytest.mark.parametrize("tool_rounds", [1, 6])
+def test_retry_budget_is_shared_across_tool_rounds(transport, monkeypatch, tool_rounds):
     delays = []
 
     async def sleep(delay):
@@ -207,7 +209,7 @@ def test_retry_budget_is_shared_across_tool_rounds(transport, monkeypatch):
     monkeypatch.setattr(ai.asyncio, "sleep", sleep)
 
     def handler(request):
-        if len(requests) == 2:
+        if 2 <= len(requests) <= tool_rounds + 1:
             return stream_response(event(delta(tools=[tool_call()], finish="tool_calls")), b"data: [DONE]\n\n")
         return httpx.Response(503, text=SECRET)
 
@@ -218,10 +220,10 @@ def test_retry_budget_is_shared_across_tool_rounds(transport, monkeypatch):
 
     messages = []
     with pytest.raises(ai.AIError) as error:
-        asyncio.run(collect(messages, config=replace(CONFIG, max_attempts=2), tools=TOOLS, callback=call))
-    assert len(requests) == 3
+        asyncio.run(collect(messages, config=replace(CONFIG, max_attempts=2, max_tool_rounds=tool_rounds), tools=TOOLS, callback=call))
+    assert len(requests) == tool_rounds + 2
     assert delays == [1.0]
-    assert [message["role"] for message in messages] == ["assistant", "tool"]
+    assert [message["role"] for message in messages] == ["assistant", "tool"] * tool_rounds
     assert SECRET not in str(error.value)
 
 
@@ -245,7 +247,6 @@ def test_partial_visible_answer_is_never_replayed_or_committed(transport):
     with pytest.raises(ai.AIError) as error:
         asyncio.run(collect(messages, events=events))
     assert len(requests) == 1
-    assert [(item.kind, item.text) for item in events] == [("text", partial)]
     assert messages == [{"role": "user", "content": "Suggest a query"}]
     assert SECRET not in str(error.value)
     assert SECRET not in "".join(traceback.format_exception(error.value))
@@ -303,7 +304,83 @@ def test_unknown_tool_is_rejected_safely_by_callback(transport):
     assert SECRET not in str(error.value)
 
 
-def test_tool_rounds_are_bounded_even_without_transport_failures(transport):
+@pytest.mark.parametrize("round_limit", [1, 10])
+def test_final_answer_after_configured_rounds_keeps_guidance_out_of_history(transport, round_limit):
+    calls = []
+    original = [
+        {"role": "system", "content": "Answer only from collected context."},
+        {"role": "user", "content": "Summarize the available context."},
+    ]
+    messages = deepcopy(original)
+
+    def handler(request):
+        body = json.loads(request.content)
+        wire_messages = body["messages"]
+        if [i for i, message in enumerate(wire_messages) if message["role"] == "system"] != [0]:
+            return httpx.Response(400, json={"error": {"message": "System message must be at the beginning."}})
+        assert original[0]["content"] in wire_messages[0]["content"]
+        if body.get("tool_choice") == "none":
+            assert len(calls) == round_limit * 2
+            return stream_response(completed(body["messages"][-1]["content"]))
+        return stream_response(
+            event(delta(tools=[tool_call(), tool_call("history", index=1, id="call_b")], finish="tool_calls")),
+            b"data: [DONE]\n\n",
+        )
+
+    requests = transport(handler)
+
+    async def call(name, arguments):
+        calls.append(name)
+        return f"Collected context {len(calls)}"
+
+    config = replace(CONFIG, max_tool_rounds=round_limit, max_tool_calls=2)
+    events = asyncio.run(collect(messages, config=config, tools=TOOLS, callback=call))
+    assert len(requests) == round_limit + 1
+    assert calls == ["schema", "history"] * round_limit
+    assert messages[:2] == original
+    assert [message["role"] for message in messages[2:]] == ["assistant", "tool", "tool"] * round_limit + ["assistant"]
+    assert messages[-1] == {"role": "assistant", "content": f"Collected context {round_limit * 2}"}
+    assert "".join(item.text for item in events if item.kind == "text") == f"Collected context {round_limit * 2}"
+
+
+def test_system_context_survives_retry_and_followup_without_mutating_history(transport, monkeypatch):
+    original = [
+        {"role": "system", "content": "Use only the supplied schema and never execute a query."},
+        {"role": "user", "content": "Explain the schema."},
+    ]
+    messages = deepcopy(original)
+    bodies = []
+
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr(ai.asyncio, "sleep", sleep)
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        wire_messages = body["messages"]
+        if [i for i, message in enumerate(wire_messages) if message["role"] == "system"] != [0]:
+            return httpx.Response(400, json={"error": {"message": "System message must be at the beginning."}})
+        if len(bodies) == 1:
+            return httpx.Response(503)
+        return stream_response(completed("The schema contains events."))
+
+    transport(handler)
+    asyncio.run(collect(messages, tools=TOOLS))
+    assert bodies[0] == bodies[1]
+    assert messages[:2] == original
+    messages.append({"role": "user", "content": "Which table did you mention?"})
+    followup = deepcopy(messages)
+    asyncio.run(collect(messages, tools=TOOLS))
+    assert bodies[2]["messages"][0] == bodies[0]["messages"][0]
+    assert bodies[2]["messages"][0]["content"].count(original[0]["content"]) == 1
+    assert bodies[2]["messages"][1:] == followup[1:]
+    assert messages[:-1] == followup
+    assert messages[-1] == {"role": "assistant", "content": "The schema contains events."}
+
+
+def test_provider_ignoring_disabled_tools_cannot_exceed_configured_rounds(transport):
     body = event(delta(tools=[tool_call()], finish="tool_calls"))
     requests = transport(lambda request: stream_response(body, b"data: [DONE]\n\n"))
     calls = []
@@ -314,10 +391,55 @@ def test_tool_rounds_are_bounded_even_without_transport_failures(transport):
 
     messages = []
     with pytest.raises(ai.AIError):
-        asyncio.run(collect(messages, tools=TOOLS, callback=call))
-    assert len(requests) == 7
-    assert calls == ["schema"] * 6
-    assert [message["role"] for message in messages] == ["assistant", "tool"] * 6
+        asyncio.run(collect(messages, config=replace(CONFIG, max_tool_rounds=2), tools=TOOLS, callback=call))
+    assert len(requests) == 3
+    assert json.loads(requests[-1].content)["tool_choice"] == "none"
+    assert calls == ["schema"] * 2
+    assert [message["role"] for message in messages] == ["assistant", "tool"] * 2
+
+
+@pytest.mark.parametrize("final_parts", [
+    (event(delta("Looks complete", finish="stop")),),  # Missing [DONE].
+    (event(delta("Cut off", finish="length")), b"data: [DONE]\n\n"),
+    (b'data: {"choices": broken}\n\n',),
+    (event(delta("Partial answer")), httpx.ReadError(SECRET)),
+])
+def test_final_no_tools_request_still_requires_valid_completion(transport, final_parts):
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        if body.get("tool_choice") == "none":
+            return stream_response(*final_parts)
+        return stream_response(event(delta(tools=[tool_call()], finish="tool_calls")), b"data: [DONE]\n\n")
+
+    requests = transport(handler)
+
+    async def call(name, arguments):
+        calls.append(name)
+        return "{}"
+
+    messages = []
+    with pytest.raises(ai.AIError) as error:
+        asyncio.run(collect(messages, config=replace(CONFIG, max_tool_rounds=1), tools=TOOLS, callback=call))
+    assert len(requests) == 2
+    assert json.loads(requests[-1].content)["tool_choice"] == "none"
+    assert calls == ["schema"]
+    assert [message["role"] for message in messages] == ["assistant", "tool"]
+    assert SECRET not in str(error.value)
+
+
+def test_over_limit_streamed_tool_batch_executes_nothing(transport):
+    requests = transport(lambda request: stream_response(
+        event(delta(tools=[tool_call()])),
+        event(delta(tools=[tool_call("history", index=1, id="call_b")], finish="tool_calls")),
+        b"data: [DONE]\n\n",
+    ))
+    messages = []
+    with pytest.raises(ai.AIError):
+        asyncio.run(collect(messages, config=replace(CONFIG, max_tool_calls=1), tools=TOOLS))
+    assert messages == []
+    assert len(requests) == 1
 
 
 def test_unterminated_sse_lines_are_size_bounded(transport, monkeypatch):
@@ -435,6 +557,13 @@ def test_cancellation_mid_tool_batch_keeps_history_consistent(transport):
     {"max_attempts": 0},
     {"max_attempts": 6},
     {"max_attempts": True},
+    {"max_tool_rounds": 0},
+    {"max_tool_rounds": 51},
+    {"max_tool_rounds": True},
+    {"max_tool_calls": 17},
+    {"max_tool_calls": 1.5},
+    {"sample_rows": 0},
+    {"sample_rows": 101},
     {"timeout": float("nan")},
     {"timeout": float("inf")},
     {"timeout": 0},

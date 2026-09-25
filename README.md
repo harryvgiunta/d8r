@@ -80,8 +80,8 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 - **Results / SQL / History tabs** — Results shows the executed rows, or the
   parser/engine error line when a run is refused; SQL shows the compiled
   document for the active dialect (read-only, never executed); History lists
-  every document this session has run; selecting a row loads that document back
-  into the editor.
+  saved successful runs across sessions; selecting a row restores its document,
+  source target and dialect without executing it or reconnecting automatically.
 - **Footer** — the key hints, and a status line that reports what just happened
   (rows, milliseconds, source, dialect).
 
@@ -93,15 +93,51 @@ and Keybindings. Highlighting a category displays its options and explanation
 in the center without changing a setting.
 
 Use Up/Down to browse, Enter or Right to focus the category's controls, and
-Enter to apply the selected action. Tab/Shift+Tab switch panels; Left or Escape
-returns to the sidebar without losing the selected category. Escape from the
-sidebar closes Settings. Connection and provider forms return to the same page.
+Enter or click a row to toggle, select, or edit it; the footer names the action
+for the current category. Tab/Shift+Tab switch panels; Left or Escape returns
+to the sidebar without losing the selected category. Escape from the sidebar
+closes Settings. Connection and provider forms return to the same page and row.
+
+Preferences are loaded from `~/.anyql/settings.json` and saved when changed.
+You can also edit the JSON while anyQL is closed; restart to load edits. Settings
+shows the actual file path. See [Configuration and backups](#configuration-and-backups)
+for the directory override, file format, and credential handling.
+
+**General → Default rows returned** starts at **50**. Save a whole number from
+0 to 1,000,000; **0 disables the default**. Ordinary Run and Compile apply it only
+when the top-level query has no explicit `\limit`. An explicit `\limit`, including
+`\limit 0`, wins. The document and AST remain unchanged. Temporary-table creation
+uses exactly the query's own limits, and AI sample reads keep their separate cap.
+The results pane's independent 10,000-row preview buffer still applies.
+
+### Workspace recovery
+
+The editor document/caret, selected source/dialect, last workspace or function
+view, unsaved function draft/target, query history, and target-scoped AI chats
+are autosaved to `workspace.json`. Editing is debounced and the latest widget
+contents are flushed on exit, including an unsent AI message. Function drafts
+remain drafts: only **Save**/**Run preview** changes the function library.
+
+Startup restores this state without running queries, sending AI requests, or
+opening database connections. A saved D1 database or SQLite snapshot remains
+visibly **disconnected** until explicitly reconnected; its draft never silently
+runs against demo data. Local snapshot paths are remembered for reconnection.
+Use the header's **Reconnect** button or select the saved source in Settings to
+reconnect deliberately. `ctrl+o` still opens the add-source form without making
+a live connection just by opening it; a restored snapshot path is prefilled.
+Result grids, temporary tables, transaction state, diagnostic logs, in-flight
+requests, and applicable AI proposals are not restored. A restored conversation
+can continue on Send, using freshly captured context and validation.
 
 ## AI assistance
 
-Open Settings with `ctrl+comma`, select **AI provider** → **Configure provider**,
-and set an OpenAI-compatible **Chat Completions** base URL (including `/v1`), model, and
-API key. A full `/chat/completions` URL also works. This calls your provider;
+Open Settings with `ctrl+comma`, select **AI provider**, then press Enter or click
+**Endpoint**, **Model**, **API key**, **AI turns/tool rounds**, **Tool calls per round**,
+**Sample records per read**, **Maximum attempts**, or **Request timeout**.
+The provider form opens with that field focused. Edit an OpenAI-compatible
+**Chat Completions** base URL (including `/v1`), model, and masked API key, then
+choose **Save** to persist changes; **Cancel** or Escape discards them.
+A full `/chat/completions` URL also works. This calls your provider;
 anyQL does not host an endpoint or use OMP as a dependency. The separate OpenAI
 Responses API is not supported by this adapter.
 
@@ -121,27 +157,31 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   **Apply** updates the editor only: it does not run a query or save a function.
   Invalid, incomplete, cancelled, or stale proposals cannot be applied. Changing
   the document or function draft invalidates its pending proposal; switching
-  sources or targets clears the conversation.
+  sources or targets switches to that target's own saved conversation.
 - In `\fn`, click **Make with AI** at the top of the form. Nothing is sent until
   you describe what you want and press Enter or **Generate**. No name, parameters,
   or body need to be filled in first. The helper takes over the editor area;
   the source picker stays available above it.
 - Review the proposed name, description, parameters, example call, and body.
   Ask for changes in the same input, or **Apply** the complete draft to the form.
-  Apply returns you to the editor without saving or executing anything; use
-  **Save** or **Run preview** when ready. The helper refuses proposals that would
+  Apply returns you to the editor without defining a function or executing it;
+  the draft is autosaved. Use **Save** or **Run preview** when ready. The helper refuses proposals that would
   overwrite a different saved function. **Back**/Escape leaves the draft alone;
   **Start over** clears the conversation. Controls stay visible on small terminals,
   with a scrollable draft review.
 - **Settings** in the function helper (or **AI settings** in workspace chat)
   opens provider configuration directly and returns to your unsent request.
-- **New chat** clears the in-memory conversation. AI settings, keys, and chats are
-  never persisted and disappear when the app exits. The key input is masked;
-  provider errors do not echo response bodies or credentials.
+- **New chat** durably clears the current target's conversation, not other
+  targets. Completed chat exchanges and the composer draft survive exit;
+  incomplete replies never enter replayable history. **Save** in AI settings
+  persists the provider URL, model, key, tool-round/call/sample limits, attempts,
+  and timeout. The key input stays masked; provider errors do not echo response
+  bodies or credentials. Protect the local JSON files and their backups.
 
 Sending a message shares the current document/function draft with the provider.
-The assistant can request read-only schema and backend capabilities, up to five
-sample rows from a registered table (20 columns; long string cells truncated),
+The assistant can request read-only schema and backend capabilities, bounded
+sample rows from a registered table (5 by default; at most 20 columns, with long
+string cells truncated),
 the active target source's latest ten matching successful queries, and saved
 function definitions. These context tools also expose parser-only validation.
 They cannot execute arbitrary model-generated queries, modify data, read files,
@@ -150,10 +190,87 @@ or run shell commands. Treat proposed changes as suggestions to review.
 The existing `httpx` dependency handles SSE streaming directly. Transient HTTP
 408/429/5xx and connection failures receive bounded backoff; Settings defaults
 to three attempts (two automatic retries shared across a chat turn). Partial
-streams are never automatically replayed. A turn permits at most six context
-tool rounds; responses and tool payloads have size limits. The request timeout
-also bounds each streaming request and context-tool call. Authentication errors,
-truncation, and malformed streams remain visible errors, not successful edits.
+streams are never automatically replayed. Each user message permits up to the
+configured number of context tool rounds (10 by default), with the remaining
+budget sent to the model. After that budget is used,
+tools are disabled for a final response using the collected context; if it is
+insufficient, the assistant is instructed to explain what is missing instead of
+inventing a query. A provider that ignores disabled tools still fails safely.
+Responses and tool payloads have size limits. The request timeout also bounds
+each streaming request and context-tool call. Authentication errors, truncation,
+and malformed streams remain visible errors, not successful edits.
+Editor instructions and request-local tool-budget guidance share one initial
+system message, including on retries and follow-up requests, for providers with
+strict chat templates such as Yolo. The guidance never accumulates in chat history.
+
+Provider limits are independent and saved together only on **Save**:
+
+| Setting | Default | Allowed | Meaning |
+| --- | --- | --- | --- |
+| AI turns/tool rounds | 10 | 1–50 | Context batches per user message, followed by one final tools-disabled answer |
+| Tool calls per round | 16 | 1–16 | Maximum calls in one model response; an oversized batch is rejected before any call executes |
+| Sample records per read | 5 | 1–100 | Maximum rows in each sample; an omitted tool limit uses this value |
+| Maximum attempts | 3 | 1–5 | One initial attempt plus a shared allowance of `attempts - 1` transient retries across the message |
+| Request timeout | 60 seconds | >0–300 seconds | Time bound for each provider request or context-tool call |
+
+A tool round is not another chat message: it may batch schema reads, sample
+reads, history, function lookups, and validation calls. Those calls share the
+round and per-round call budgets; sampled records do not count as extra turns.
+Retries do not consume additional tool rounds or reset their budget. Increasing
+rounds or samples can increase latency, provider usage, and data sent. The
+existing 20-column, 500-character string-cell, and 256-KiB tool-result limits
+still apply; oversized results fail safely rather than bypassing the byte cap.
+Limits are captured when sending a message; settings changes affect later
+messages, not in-flight work. Older settings files receive missing defaults in
+memory without being rewritten on load. **Import yolo key** preserves budget
+values already entered in the form.
+
+The assistant's language guide covers composing multiple filters with CTEs or
+inline subqueries, joining filtered inputs, and grouping daily counts without
+inventing SQL syntax. Each request includes the current UTC time. Relative-date
+requests use explicit literal bounds with the range/timezone stated in the reply:
+these are fixed when generated, not a rolling expression when rerun. Parser
+validation does not verify execution or column-type compatibility.
+
+For exclusions such as “free users who never subscribed,” the guide recommends
+projecting matching keys on both sides of `\except`, then joining surviving keys
+back to the detail table. It distinguishes lifetime purchase history from current
+subscription status and calls out nullable-key pitfalls with `not in`.
+Set operations accept nullability-only type differences (`!string` versus
+`string`) without changing values; genuinely different value types still fail.
+Whether a ledger includes trials, failed payments, or manual grants remains a
+business-rule question, not something syntax validation can establish.
+
+### AI failure diagnostics
+
+Choose **Logs** in workspace chat or the function helper to inspect the current
+chat's diagnostic trace. It opens at the latest entries; scroll up for earlier
+attempts. **Refresh** updates the snapshot while a request runs, **Copy logs**
+copies the displayed trace, and Escape/**Close** returns to the assistant.
+
+The trace includes UTC timestamps, model/request settings (not credentials or
+endpoint URLs), the submitted prompt and editor context, tool-round counts,
+HTTP status/retries, model output, requested and executed tool calls with their
+arguments/results, parser validation, failures, cancellation, and explicit Apply.
+Incomplete output is labeled and never becomes an applicable proposal. Internal
+failures include the exception type and code locations, not exception text or
+locals. Raw provider error bodies, HTTP headers, and hidden model reasoning are
+not logged. Known AI-provider keys and saved/connected D1 tokens are redacted.
+
+Failed attempts remain inspectable after another message, but are **not** added
+to the AI conversation. Diagnostics are never sent back to the model. Retention
+is bounded to 256 entries / 262,144 characters, with at most 65,536 characters
+per entry; truncation and eviction are marked. Logs are in memory only: New chat,
+Start over, a target/source switch, or exiting discards them. Copy anything needed
+before doing so. Logs can contain schema, sample values, and query text; review
+them before sharing. There is no automatic log file.
+
+For capability investigations, inspect the attempted `validate_anyql` text and
+its error alongside the returned schema/capabilities. That validator checks the
+anyQL parser, not Ibis execution: rejection may identify a missing anyQL mapping
+for an operation that Ibis supports. A parser-valid draft can still fail later
+during compilation or execution. Such Run errors remain in the Results pane;
+the AI diagnostic log does not execute proposals to diagnose them.
 
 ## Keys
 
@@ -281,7 +398,10 @@ A fresh `@` reopens a dismissed popup, unless IntelliSense is disabled.
 and calls the function with the preview arguments; its rows do not enter History.
 Saved names, ordered parameters, descriptions, and bodies load automatically
 when anyQL starts. **Delete** (`ctrl+d`) removes the definition from disk too.
-Draft edits and AI **Apply** are not auto-saved.
+Draft edits and AI **Apply** are autosaved separately in `workspace.json`, not
+committed as function definitions. Returning from the function editor refreshes
+IntelliSense at the existing caret, so newly saved calls appear without retyping;
+disabled or Escape-dismissed completion stays closed.
 
 Functions are shared across sources: the selected target is an authoring/preview
 context, not a permanent binding. A later `\from name(args)` runs against that
@@ -349,15 +469,25 @@ Press `ctrl+o`, or open Settings (`ctrl+comma`) → **Data source** →
    to connect to hosted D1.
 5. **Test connection** discovers the real tables and row counts without
    registering or saving anything. **Add** activates the live source and saves
-   its account ID, resolved database UUID, and display name. Connection work runs
+   its account ID, resolved database UUID, display name, and API token. Connection work runs
    in the background; editing fields or cancelling discards the pending result.
    Row counts are fetched in batches of at most five tables/views to respect
    Cloudflare's compound-SELECT limit; larger schemas are discovered in full.
 
-On a later launch, choose the entry under **Saved connection**, paste a fresh
-token, and press **Add**. Startup does not contact Cloudflare or silently fall
-back to a local database. Empty hosted databases can connect with zero tables;
-this form connects to an existing database rather than provisioning one.
+On later launches, saved D1 profiles remain in the main **datasource dropdown**,
+Settings → **Data source**, and the function editor's source picker, marked
+**disconnected**. Selecting one opens the connection dialog and immediately
+connects using its saved credentials. Startup and merely opening the dropdown
+do not contact Cloudflare. The active source stays unchanged until connection
+succeeds; failure or Cancel leaves the saved choice available for another attempt.
+Once connected, it appears as a normal source, without a duplicate saved entry.
+Reconnecting an unchanged profile does not rewrite its credentials. Connecting
+from the function picker changes only the function target, not the workspace.
+
+Older profiles without a token open the masked token field without attempting a
+connection. Enter the token and choose **Connect**. You can also use `ctrl+o` →
+**Saved connection** → **Add** to inspect or update credentials. Empty hosted
+databases can connect with zero tables; this form connects rather than provisions.
 
 For offline work, enter an existing SQLite database file in **Local snapshot**.
 This overrides the live fields and never syncs with Cloudflare. Snapshot paths
@@ -369,33 +499,88 @@ builds a fresh file rather than reusing pages from an existing database.
 
 Live sources ship their compiled SQLite SQL to Cloudflare's D1 REST API and run
 on the real engine there; snapshots run on a real SQLite engine in-process. The
-**API token** you paste is used per request and kept only in memory: it is never
-written to disk, never logged, and never echoed back into the UI.
+**API token** is used per request and saved locally on **Add**, or on **Connect**
+when you change the saved profile's fields. It is never
+logged or displayed unmasked. **Test connection** and **Cancel** save nothing.
 
-## Local memory
+## Configuration and backups
 
-Custom functions and token-free D1 connection profiles are stored in one
-versioned `memory.json` file:
+The default home is `~/.anyql` on every platform (`%USERPROFILE%\.anyql` on
+Windows). Set `ANYQL_DATA_DIR` before launching to use another directory:
 
-| Platform | Default location |
+```powershell
+$env:ANYQL_DATA_DIR = "D:\anyql-home"
+uv run anyql
+```
+
+On macOS/Linux: `ANYQL_DATA_DIR=/path/to/anyql-home uv run anyql`.
+An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
+
+| File | Saved contents |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\anyql\memory.json` |
-| macOS | `~/Library/Application Support/anyql/memory.json` |
-| Linux | `$XDG_DATA_HOME/anyql/memory.json`, or `~/.local/share/anyql/memory.json` |
+| `settings.json` | Intellisense, pane visibility, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout |
+| `memory.json` | Custom functions and D1 profiles: account ID, resolved database UUID, display name, API token |
+| `workspace.json` | Document/caret and stable target identity, last view, function draft, query history, completed AI conversations/composer drafts, source references and snapshot paths |
 
-Set `ANYQL_DATA_DIR` before launching to choose a different directory. The
-function editor displays the actual save path. Back up that file to keep your
-library; it contains function text in plain JSON, so do not put secrets in bodies
-or descriptions. Cloudflare tokens, AI keys/configuration, chats, query history,
-unsaved documents, active-source choices, and temporary tables are not saved.
+These files are versioned, editable JSON. Toggle preferences save immediately;
+the provider and default-row forms require **Save**. Import only fills the
+provider form, and Cancel discards it. D1 credentials save on **Add** or after
+edited fields are submitted with **Connect**; function definitions persist on
+**Save**/**Run preview** or Delete. Workspace drafts and histories autosave
+independently. Loading never connects, executes, or saves a function definition.
+Unavailable workspace targets restore as disconnected, preserving their identity
+and drafts until explicitly reconnected or replaced with another source.
+
+A `settings.json` example (omitted keys use defaults):
+
+```json
+{
+  "version": 1,
+  "intellisense": true,
+  "panes": {"results": true, "sql": true, "history": false, "schema": true},
+  "source": "demo",
+  "dialect": "duckdb",
+  "default_rows": 50,
+  "ai": {
+    "base_url": "https://provider.example/v1",
+    "model": "your-model",
+    "api_key": "",
+    "max_attempts": 3,
+    "timeout": 60,
+    "max_tool_rounds": 10,
+    "max_tool_calls": 16,
+    "sample_rows": 5
+  }
+}
+```
+
+Leave `ai` out for an unconfigured provider. Unknown keys or invalid values
+produce a startup error rather than being silently discarded. Changes made
+outside the app take effect on restart, not through live reload.
+
+**Back up all three JSON files to retain settings, functions, credentials, and
+your workspace. They are plaintext, not encrypted.** In addition to credentials
+in settings/memory, workspace chats can contain schema, sampled data, query text,
+and unsent drafts. Keep backups private and never commit them to source control.
+Restore files into the chosen home while anyQL is closed. New directories/files
+are owner-only on POSIX; Windows uses filesystem ACLs. Result buffers, temporary
+tables, transactions, partial AI streams and diagnostic logs remain memory-only.
+
+For an existing installation, copy `memory.json` from the former platform data
+directory into `~/.anyql`, or point `ANYQL_DATA_DIR` at that existing directory.
+Former defaults were `%LOCALAPPDATA%\anyql` on Windows,
+`~/Library/Application Support/anyql` on macOS, and `$XDG_DATA_HOME/anyql` (or
+`~/.local/share/anyql`) on Linux. No files are moved automatically. Old profiles
+without tokens load unchanged; their next **Add**/**Connect** saves the supplied token.
 
 Writes use a temporary file, a save lock, and atomic replacement. Failed writes
-leave the last saved library and current definitions unchanged. If another app
-instance has saved newer data, copy your unsaved draft and restart rather than
-overwrite it. A lock or temp file left by a crashed save clears itself after a
-minute — no manual cleanup. An invalid/unreadable file produces a startup error
-and blocks saves: repair it or move it aside, then restart. The original file is
-not silently reset.
+leave saved data and current settings unchanged; unsaved workspace drafts and
+completed query results remain available in memory, with a visible save error.
+Editor, chat and query-history writes merge under one session lock. If another
+app instance or editor changes a file, copy your unsaved work and restart rather
+than overwrite it. A lock or temp file left by a crashed save clears itself after a minute.
+An invalid/unreadable file is preserved and blocks saves to that file: repair it
+or move it aside, then restart. It is never silently reset.
 
 ## The results explorer
 
