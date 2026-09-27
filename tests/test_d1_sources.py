@@ -107,8 +107,30 @@ def test_snapshot_values_survive_a_thread_switch(sqlite_file):
 
 
 def test_capabilities_honest_for_snapshot(sqlite_file):
-    """A D1 snapshot is a real SQLite engine, not a mock — it says so."""
-    assert capabilities_for(add_sqlite_source("d1", sqlite_file))["backend"] == "sqlite (D1 snapshot)"
+    """A D1 snapshot is a real SQLite engine, not a mock — it says so, and its
+    operation flags are probed against the SQLite backend, not copied from
+    DuckDB."""
+    caps = capabilities_for(add_sqlite_source("d1", sqlite_file))
+    assert caps["backend"] == "sqlite (D1 snapshot)"
+    supports = caps["supports"]
+    assert supports["savepoints"] is True
+    # Measured SQLite truth: no quantile rule, no as-of join, no seeded
+    # sample, no native unnest — plain sampling and ILIKE (LOWER … LIKE) are
+    # pure SQL and stay.
+    assert supports["quantile"] is False
+    assert supports["asofJoin"] is False
+    assert supports["samplingSeed"] is False
+    assert supports["unnest"] is False
+    assert supports["sampling"] is True
+    assert supports["ilike"] is True
+    offered = caps["functions"]["string"]
+    # The snapshot's SQLite backend registers UDFs the mock duckdb has no
+    # rule for: translate and the URL accessors are offered here…
+    assert "translate" in offered and "url_host" in offered
+    # …while rules no SQLite backend has (levenshtein, strptime casts,
+    # convert_base) are not.
+    for fn in ("levenshtein", "as_date", "as_time", "as_timestamp", "convert_base"):
+        assert fn not in offered
 
 
 def test_snapshot_source_requires_an_explicit_path(tmp_path):
@@ -283,10 +305,21 @@ def test_live_capabilities_refuse_udf_backed_functions_and_regex():
     assert "~" not in caps["operators"] and "!~" not in caps["operators"]
     assert caps["supports"]["regex"] is False
     offered = caps["functions"]["string"]
-    for fn in ("reverse", "repeat", "lpad", "rpad", "regexp_extract", "regexp_replace"):
+    for fn in (
+        "reverse", "repeat", "lpad", "rpad", "regexp_extract", "regexp_replace",
+        "translate", "levenshtein", "as_date", "as_time", "as_timestamp",
+    ):
         assert fn not in offered
     for fn in ("capitalize", "lower", "upper", "replace", "find", "substr"):
         assert fn in offered
+    # `ilike` is pure SQL (`LOWER … LIKE`) — D1 runs it; the probed operation
+    # flags are the honest static SQLite drop (no quantile/as-of/seed/unnest).
+    assert "ilike" in caps["operators"]
+    assert caps["supports"]["ilike"] is True
+    assert caps["supports"]["quantile"] is False
+    assert caps["supports"]["asofJoin"] is False
+    assert caps["supports"]["samplingSeed"] is False
+    assert caps["supports"]["unnest"] is False
 
 
 def test_live_probe_counts_tables():

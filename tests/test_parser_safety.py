@@ -8,10 +8,22 @@ import pytest
 
 from d8r.engine.execute import execute
 from d8r.query import ColumnDef, FnDef, SchemaContext, TableDef, clause_line, parse_query, payload_from_ast
-from d8r.query.parser import MAX_FUNCTION_DEPTH, MAX_FUNCTION_EXPANSIONS, MAX_NUMERIC_CHARS, block_extent
+from d8r.query.parser import MAX_FUNCTION_DEPTH, MAX_FUNCTION_EXPANSIONS, MAX_NUMERIC_CHARS, MAX_WHERE_DEPTH, block_extent
 from d8r.storage import MemoryStore
 from d8r.tui.app import D8RApp
 from d8r.tui.session import Session
+
+
+def test_where_grouping_depth_is_bounded_not_crashed():
+    def doc(nesting: int) -> str:
+        return "\\from events\n\\where " + "(" * nesting + "user_id = 1" + ")" * nesting
+
+    allowed = parse_query(doc(MAX_WHERE_DEPTH), settled=True)
+    assert allowed.errors == []
+    refused = parse_query(doc(MAX_WHERE_DEPTH + 1), settled=True)
+    assert [error.line for error in refused.errors] == [2]
+    assert "nested too deeply" in refused.errors[0].message
+
 
 
 @pytest.mark.parametrize("clause", [

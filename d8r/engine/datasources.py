@@ -3,7 +3,7 @@
 A datasource is a named connection carrying its own dataset schemas. `demo`
 is the bundled Parquet directory executed on a real in-process DuckDB; other
 bundled entries are vendor-shaped mock schemas mirrored into DuckDB. Explicitly
-added D1 sources either use a local SQLite snapshot or Cloudflare's live API.
+added sources use a local SQLite snapshot, Cloudflare's live D1 API, or PostgreSQL.
 
 Every bundled path resolves from this module's own file, never the process
 working directory, so the engine behaves the same however it is launched.
@@ -20,15 +20,17 @@ vendor's own for mocks); callers may override per query.
 from __future__ import annotations
 
 import datetime as dt
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import ibis
+import ibis.expr.operations as ops
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from d8r.query.functions import SCALAR_FUNCTIONS
+from d8r.query.functions import DUCKDB_UNRENDERABLE, SCALAR_FUNCTIONS, URL_ACCESSORS
 
 from .d1api import CloudflareD1, schema_connection
 from .expression import PayloadError, compile_sql
@@ -54,15 +56,26 @@ CAPABILITIES: dict = {
     "aggregates": ["sum", "avg", "count", "min", "max"],
     # Type-keyed scalar functions: dtype family -> usable functions. The
     # front end filters completion by the column's dtype, so a timestamp
-    # offers date parts and a float offers aggregates.
+    # offers date parts and a float offers aggregates. The string list is
+    # this backend's honest truth: the URL accessors and `convert_base`
+    # compile to nothing here (see `DUCKDB_UNRENDERABLE` in the function
+    # catalog), so they are absent until a source can actually run them.
     "functions": {
         "timestamp": ["year", "month", "day", "quarter", "hour", "minute", "second"],
         "date": ["year", "month", "day", "quarter"],
         "time": ["hour", "minute", "second"],
-        "string": [fn for fn in SCALAR_FUNCTIONS if fn != "string"],
-        "any": ["string"],
+        "string": [
+            fn for fn in SCALAR_FUNCTIONS
+            if fn not in {"string", "coalesce", "nullif"} and fn not in DUCKDB_UNRENDERABLE
+        ],
+        # `coalesce`/`nullif` are cross-type: any dtype, any backend (both
+        # compile to plain SQL everywhere this app reaches).
+        "any": ["string", "coalesce", "nullif"],
     },
-    "operators": ["=", "!=", ">", ">=", "<", "<=", "like", "~", "!~", "in", "not in"],
+    "operators": [
+        "=", "!=", ">", ">=", "<", "<=", "like", "ilike", "~", "!~",
+        "in", "not in", "between", "is null", "is not null",
+    ],
     # Rank-style window functions usable as `<fn>() over ( … )` in a select.
     "windowFunctions": ["rank", "dense_rank", "row_number"],
     "supports": {
@@ -71,6 +84,7 @@ CAPABILITIES: dict = {
         "limit": True,
         "distinct": True,
         "like": True,
+        "ilike": True,
         "case": True,
         "window": True,
         "cte": True,
@@ -85,41 +99,195 @@ CAPABILITIES: dict = {
         "temp": True,
         "transactions": True,
         "savepoints": False,
+        # ibis-level operation surface, duckdb truth (live-probed per source;
+        # see `_probe_flags`). Conservative False defaults — a source only
+        # claims what its compiler can actually render.
+        "quantile": True,
+        "asofJoin": True,
+        "sampling": True,
+        "samplingSeed": True,
+        "unnest": True,
     },
 }
+
+# The probe surface: flag -> ibis operation class whose compilation rule a
+# connection must have (`con.has_operation`). The flags not listed here —
+# `asofJoin` and `samplingSeed` — have no operation class in ibis 12 (an
+# as-of join lowers to an ordinary Join with a marker; sampling folds the seed
+# into `Sample`), so they are probed by compiling a representative expression
+# against the backend's own compiler. `has_operation` is the backend's own
+# declaration and never raises; the compile probes are wrapped anyway.
+_PROBE_OPS: dict[str, str] = {
+    "quantile": "Quantile",
+    "unnest": "TableUnnest",
+    "ilike": "StringSQLILike",
+    "sampling": "Sample",
+}
+
+_PROBE_TABLE = {"a": "int64", "s": "string", "ts": "timestamp", "arr": "array<int64>"}
+_PROBE_JOIN = {"k": "int64", "ts": "timestamp"}
+
+
+# Probes are cheap (offline compiles) but `supports()` runs per UI check, so
+# each connection's answers are memoized. Connections live as long as their
+# source; if a connection cannot be weak-referenced the probe just reruns.
+_PROBE_CACHE: "weakref.WeakKeyDictionary[object, dict]" = weakref.WeakKeyDictionary()
+
+
+def _probe_compile(con, make) -> bool:
+    """Whether `con` can build and render `make()` (offline, no execution).
+
+    The expression is built inside the guard: some backends refuse certain
+    operations at construction (SQLite rejects ASOF joins and seeded samples
+    before any SQL is compiled), and a refusal is a refusal.
+    """
+    try:
+        compile_sql(make(), dialect=getattr(con, "name", None))
+    except Exception:
+        return False
+    return True
+
+
+def _probe_flags(con) -> dict:
+    """Derive the operation-support flags from one live connection.
+
+    `has_operation` answers for the backend's own compiler; the two flags
+    with no operation class of their own (`asofJoin`, `samplingSeed`) are
+    compile probes. The probe tables are bound to `con` (a `con.sql` stub
+    with a declared schema — never executed) so per-backend construction
+    checks, like SQLite refusing an ASOF join or a seeded sample outright,
+    count as refusals too. On probe failure the flag is False — the
+    conservative direction.
+    """
+    flags = {flag: False for flag in (*_PROBE_OPS, "asofJoin", "samplingSeed")}
+    for flag, op_name in _PROBE_OPS.items():
+        try:
+            flags[flag] = bool(con.has_operation(getattr(ops, op_name)))
+        except Exception:
+            flags[flag] = False
+    try:
+        t = con.sql("SELECT 1", schema=_PROBE_TABLE)
+        left = con.sql("SELECT 1", schema=_PROBE_JOIN)
+        right = con.sql("SELECT 2", schema=_PROBE_JOIN)
+    except Exception:
+        return flags
+    flags["samplingSeed"] = _probe_compile(con, lambda: t.sample(0.1, seed=7))
+    flags["asofJoin"] = _probe_compile(
+        con, lambda: left.asof_join(right, "k", predicates=[left.ts < right.ts])
+    )
+    return flags
+
+
+def _unrenderable_on(con) -> frozenset[str]:
+    """Scalar functions this connection's compiler cannot render at all.
+
+    Measured, not declared: each candidate call is compiled (offline, without
+    executing) against the connection's own backend. A connection that cannot
+    compile anything (a stub, a broken handle) has every candidate unmeasured,
+    and honest conservatism is not to advertise what cannot be verified.
+    """
+    calls = {
+        "translate": lambda: t.s.translate("a", "b"),
+        "levenshtein": lambda: t.s.levenshtein("x"),
+        "as_date": lambda: t.s.as_date("%Y-%m-%d"),
+        "as_time": lambda: t.s.as_time("%H:%M:%S"),
+        "as_timestamp": lambda: t.s.as_timestamp("%Y-%m-%d %H:%M:%S"),
+        "convert_base": lambda: t.s.convert_base(16, 10),
+        "url_protocol": lambda: t.s.protocol(),
+        "url_host": lambda: t.s.host(),
+        "url_path": lambda: t.s.path(),
+        "url_query": lambda: t.s.query(),
+        "url_fragment": lambda: t.s.fragment(),
+    }
+    try:
+        t = con.sql("SELECT 1", schema={"a": "int64", "s": "string"})
+    except Exception:
+        return frozenset(calls)
+    dead = set()
+    for name, make in calls.items():
+        if not _probe_compile(con, lambda make=make: make().name("x")):
+            dead.add(name)
+    return frozenset(dead)
+
+# Functions ibis's PostgreSQL compiler renders but a server only answers
+# when an extension provides them (fuzzystrmatch owns levenshtein). A compile
+# probe cannot see server state; the catalog can, and it is queried once per
+# connection at first capability call — introspection like schema discovery,
+# never a row scan, never an extension install.
+_PG_EXTENSION_FUNCTIONS = frozenset({"levenshtein"})
+
+
+def _pg_extension_function_gaps(con) -> frozenset[str]:
+    try:
+        with con.con.cursor() as cursor:
+            rows = cursor.execute(
+                "select proname from pg_proc where proname = any(%s)",
+                (sorted(_PG_EXTENSION_FUNCTIONS),),
+            ).fetchall()
+    except Exception:
+        # Catalog unreadable: conservative honesty is not to advertise.
+        return _PG_EXTENSION_FUNCTIONS
+    have = {row[0] for row in rows}
+    return frozenset(n for n in _PG_EXTENSION_FUNCTIONS if n not in have)
+
+
+def _probes_for(con) -> dict:
+    """`_probe_flags` + `_unrenderable_on` for one connection, memoized."""
+    try:
+        cached = _PROBE_CACHE.get(con)
+    except TypeError:  # unhashable/unsupported connection object
+        cached = None
+    if cached is not None:
+        return cached
+    dead = _unrenderable_on(con)
+    if getattr(con, "name", None) == "postgres":
+        dead = dead | _pg_extension_function_gaps(con)
+    probed = {**_probe_flags(con), "dead": dead}
+    try:
+        _PROBE_CACHE[con] = probed
+    except TypeError:
+        pass
+    return probed
 
 
 def capabilities_for(source: "DataSource") -> dict:
     """The capability set as advertised for one datasource.
 
-    Mock connections advertise the same ibis-translatable surface; only the
-    `backend` label differs so the UI states honestly what it is talking to.
-    A D1 source is a real SQLite engine, not a mock, and says which flavor: a
-    local snapshot, or a live Cloudflare D1 reached over its API. A live D1 is
-    reached over stateless HTTP, so it can neither keep a transaction nor hold a
-    temp table; a snapshot runs in-process and can do both, savepoints included.
+    Mock connections run on DuckDB and are live-probed like the demo — same
+    compiler, same truth; only the `backend` label differs so the UI states
+    honestly what it is talking to. A D1 source is a real SQLite engine, not
+    a mock, and says which flavor: a local snapshot, or a live Cloudflare D1
+    reached over its API. A live D1 is reached over stateless HTTP, so it can
+    neither keep a transaction nor hold a temp table; a snapshot runs
+    in-process and can do both, savepoints included.
+
+    The operation-support flags (`quantile`, `asofJoin`, `sampling`,
+    `samplingSeed`, `unnest`, `ilike`) come from `_probe_flags` wherever a
+    real connection exists — demo, mocks, snapshots, and PostgreSQL all
+    answer for their own compilers. Live D1 has no connection to probe (the
+    SQL runs remotely over HTTP) and drops honestly what Cloudflare cannot
+    run: no quantile rule in SQLite SQL, no as-of join, no seeded sampling,
+    no native unnest — while `ilike` (pure `LOWER … LIKE`) and unseeded
+    sampling (`WHERE random() <= f`) stay.
     """
-    if source.kind == "demo":
-        return CAPABILITIES
-    if source.kind == "d1":
-        return {
-            **CAPABILITIES,
-            "backend": "sqlite (D1 snapshot)",
-            "supports": {**CAPABILITIES["supports"], "savepoints": True},
-        }
     if source.kind == "d1-live":
         return {
             **CAPABILITIES,
             "backend": "sqlite (Cloudflare D1)",
-            # These SQLite translations compile to Python UDFs (`_IBIS_*`) that
-            # only the local Ibis backend registers; Cloudflare D1 has no such
-            # functions. The rest — capitalize included, which compiles to pure
-            # SQL (UPPER/SUBSTRING) — D1 runs natively.
+            # These SQLite translations compile to Python UDFs (`_IBIS_*`) or
+            # to rules plain Cloudflare SQLite has never heard of; D1 has no
+            # such functions. The rest — capitalize included, which compiles
+            # to pure SQL (UPPER/SUBSTRING) — D1 runs natively. (`translate`
+            # rides `_IBIS_TRANSLATE`; the URL accessors and `convert_base`
+            # are absent from the base list already.)
             "functions": {
                 **CAPABILITIES["functions"],
                 "string": [
                     fn for fn in CAPABILITIES["functions"]["string"]
-                    if fn not in {"reverse", "repeat", "lpad", "rpad"}
+                    if fn not in {
+                        "reverse", "repeat", "lpad", "rpad", "translate",
+                        "levenshtein", "as_date", "as_time", "as_timestamp",
+                    }
                 ],
             },
             # `~`/`!~` compile to `_IBIS_REGEX_SEARCH`, so the regex operators
@@ -132,10 +300,53 @@ def capabilities_for(source: "DataSource") -> dict:
                 "regex": False,
                 "temp": False,
                 "transactions": False,
+                "quantile": False,
+                "asofJoin": False,
+                "samplingSeed": False,
+                "unnest": False,
             },
         }
-    return {**CAPABILITIES, "backend": f"{source.dialect} (mock)"}
-
+    caps = {**CAPABILITIES, "backend": f"{source.dialect} (mock)"}
+    if source.kind == "demo":
+        caps = CAPABILITIES
+    elif source.kind == "d1":
+        caps = {
+            **CAPABILITIES,
+            "backend": "sqlite (D1 snapshot)",
+            "supports": {**CAPABILITIES["supports"], "savepoints": True},
+        }
+    elif source.kind == "postgres-live":
+        regex = source.con.con.info.server_version >= 150000
+        caps = {
+            **CAPABILITIES,
+            "backend": "postgres (live)",
+            "supports": {
+                **CAPABILITIES["supports"],
+                # Ibis 12 renders regex matching with regexp_like (PostgreSQL 15+).
+                "regex": regex,
+                "savepoints": True,
+            },
+            "operators": [
+                op for op in CAPABILITIES["operators"]
+                if regex or op not in {"~", "!~"}
+            ],
+        }
+    if source.con is None:
+        return caps
+    probed = _probes_for(source.con)
+    dead = probed["dead"]
+    string_fns = [
+        fn for fn in caps["functions"]["string"] if fn not in dead
+    ] + [
+        fn for fn in URL_ACCESSORS if fn not in dead
+        and fn not in caps["functions"]["string"]
+    ]
+    flags = {k: v for k, v in probed.items() if k != "dead"}
+    return {
+        **caps,
+        "functions": {**caps["functions"], "string": string_fns},
+        "supports": {**caps["supports"], **flags},
+    }
 
 # ---------------------------------------------------------------------------
 # Compile targets. `compiles: False` means ibis bundles the compiler but this
@@ -360,15 +571,17 @@ class DataSource:
     id: str
     display: str
     doc: str
-    kind: str  # "demo" | "mock" | "d1" | "d1-live"
+    kind: str  # "demo" | "mock" | "d1" | "d1-live" | "postgres-live"
     dialect: str  # suggested default compile dialect
     dir: Path
-    con: object = None
+    con: object = field(default=None, repr=False)
     datasets: dict[str, dict] = field(default_factory=dict)
     # A live Cloudflare D1 connection (d8r.engine.d1api.CloudflareD1) when
     # kind == "d1-live". Its presence tells the caller to ship compiled SQLite
     # SQL over the D1 HTTP API instead of executing on a local `con`.
     d1: object = None
+    # Connection identity only: the password stays with the driver/profile owner.
+    postgres: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def type_name(dtype) -> str:
@@ -626,3 +839,131 @@ def add_d1_live_source(
     except Exception:
         d1.close()
         raise
+
+
+def add_postgres_source(
+    source_id: str,
+    *,
+    host: str,
+    port: int | str = 5432,
+    database: str,
+    user: str,
+    password: str,
+    schema: str = "public",
+    sslmode: str = "prefer",
+    display: str | None = None,
+) -> DataSource:
+    """Connect explicitly to PostgreSQL and discover one schema without scanning rows.
+
+    Ibis owns all query compilation/execution. Supplying an existing autocommit
+    psycopg connection avoids retaining its password in Ibis connection kwargs;
+    Ibis 12's ``from_connection`` only configures adapters and the UTC timezone,
+    never creates extensions. Its query transaction contexts become savepoints
+    inside an explicit ``BEGIN``, leaving the session's transaction in charge.
+    """
+    metadata = {}
+    for key, value in (("host", host), ("database", database), ("user", user), ("schema", schema)):
+        if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError(f"a valid PostgreSQL {key} is required")
+        metadata[key] = value.strip()
+    if "://" in metadata["host"] or "," in metadata["host"]:
+        raise ValueError("PostgreSQL host must be one hostname or address, not a connection URL")
+    if isinstance(port, bool) or not isinstance(port, (int, str)):
+        raise ValueError("PostgreSQL port must be an integer from 1 to 65535")
+    try:
+        port_number = int(port)
+    except ValueError:
+        raise ValueError("PostgreSQL port must be an integer from 1 to 65535") from None
+    if not 1 <= port_number <= 65535:
+        raise ValueError("PostgreSQL port must be an integer from 1 to 65535")
+    if sslmode not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+        raise ValueError("select a supported PostgreSQL SSL mode")
+    if metadata["schema"].lower().startswith("pg_") or metadata["schema"].lower() == "information_schema":
+        raise ValueError("select a PostgreSQL user schema, not a system schema")
+    if not isinstance(password, str) or "\x00" in password:
+        raise ValueError("a valid PostgreSQL password is required")
+    metadata.update(port=str(port_number), sslmode=sslmode)
+
+    raw = None
+    stage = "connect"
+    try:
+        import psycopg
+
+        raw = psycopg.connect(
+            host=metadata["host"],
+            port=port_number,
+            dbname=metadata["database"],
+            user=metadata["user"],
+            password=password,
+            sslmode=sslmode,
+            connect_timeout=10,
+            autocommit=True,
+        )
+        stage = "inspect"
+        con = ibis.postgres.from_connection(raw)
+        # Connection state, not query SQL. Identifier quoting makes commas,
+        # quotes and dots a single schema name, never a search_path expression.
+        with raw.cursor() as cursor:
+            cursor.execute(
+                psycopg.sql.SQL("SET search_path TO {}").format(
+                    psycopg.sql.Identifier(metadata["schema"])
+                )
+            )
+        if metadata["schema"] not in con.list_databases():
+            raise ValueError("selected schema is unavailable")
+
+        def public_text(value: str) -> str:
+            return value.replace(password, "[redacted]") if password else value
+
+        source = DataSource(
+            id=source_id,
+            display=public_text((display or "").strip() or f"PostgreSQL · {metadata['database']}"),
+            doc=public_text(f"PostgreSQL · {metadata['database']} · {metadata['schema']}"),
+            kind="postgres-live",
+            dialect="postgres",
+            dir=Path("."),
+            con=con,
+            postgres=metadata,
+        )
+        location = (metadata["database"], metadata["schema"])
+        # Ibis 12 list_tables(public) also unions temporary names, even when
+        # a schema was requested. Discover exactly this schema through Ibis
+        # instead, without peeking at rows or other sessions' temp objects.
+        relations = ops.DatabaseTable(
+            "tables",
+            ibis.schema({
+                "table_catalog": "string",
+                "table_schema": "string",
+                "table_name": "string",
+                "table_type": "string",
+            }),
+            source=con,
+            namespace=ops.Namespace(database="information_schema"),
+        ).to_expr()
+        names = relations.filter(
+            relations.table_catalog == metadata["database"],
+            relations.table_schema == metadata["schema"],
+            relations.table_type.isin(["BASE TABLE", "VIEW", "FOREIGN"]),
+        ).select("table_name").order_by("table_name").execute()
+        for name in names.table_name:
+            source.datasets[name] = {
+                "table": con.table(name, database=location),
+                "doc": public_text(f"{name} · {metadata['schema']}"),
+                "rows": None,
+            }
+        return source
+    except Exception:
+        if raw is not None:
+            try:
+                raw.close()
+            except Exception:
+                pass
+        # Driver/server exceptions can contain a DSN, password or arbitrary
+        # server text. Neither their message nor their chain reaches the UI.
+        if stage == "connect":
+            raise PayloadError(
+                "PostgreSQL connection failed; check the host, port, database, credentials and SSL mode"
+            ) from None
+        raise PayloadError(
+            "PostgreSQL schema discovery failed; check the schema, permissions and supported column types"
+        ) from None

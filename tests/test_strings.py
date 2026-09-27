@@ -114,6 +114,54 @@ def test_explicit_conversion_is_required_and_booleans_are_not_integers(con, call
         expression.build(con, payload_from_ast(ast))
 
 
+def test_ilike_needs_a_string_column(con):
+    payload = payload_from_ast(parse_query("\\from events\n\\where amount ilike \"5\"\n\\limit 2"))
+    with pytest.raises(expression.PayloadError, match="`ilike` needs a string column"):
+        expression.build(con, payload)
+
+
+def test_translate_levenshtein_and_strptime_casts_execute_on_duckdb(con):
+    """The parse-only catalog becomes engine truth: result dtypes flow through
+    the same scalar node (date/time/timestamp serialize as ISO text)."""
+    result = run(
+        "\\from events\n"
+        "\\select translate('SwEdEn', 'AEIOU', 'aeiou') as translit, "
+        "levenshtein('kitten', 'sitting') as distance, "
+        "as_date('2024-02-03', '%Y-%m-%d') as day, "
+        "as_time('13:04:05', '%H:%M:%S') as clock, "
+        "as_timestamp('2024-02-03 13:04:05', '%Y-%m-%d %H:%M:%S') as moment\n"
+        "\\limit 1",
+        con,
+    )
+    assert result["rows"] == [["Sweden", 3, "2024-02-03T00:00:00", "13:04:05", "2024-02-03T13:04:05+00:00"]]
+
+
+def test_url_accessors_and_translate_execute_on_a_local_sqlite_snapshot(tmp_path):
+    """The SQLite backend registers URL/translate UDFs DuckDB lacks — the same
+    calls run there, `ilike` included (`LOWER … LIKE`)."""
+    path = tmp_path / "links.sqlite"
+    with sqlite3.connect(path) as raw:
+        raw.execute("create table links (id integer, url text)")
+        raw.executemany(
+            "insert into links values (?, ?)",
+            [(1, "https://acme.test/docs/intro?q=1#sec"), (2, "not a url")],
+        )
+    source = add_sqlite_source("links", str(path))
+    try:
+        result = run(
+            "\\from links\n\\select id, url_host(url) as host, "
+            "url_path(url) as part, translate(url, 'ae', 'AE') as tiled\n"
+            "\\where url ilike 'https://%'\n\\order id",
+            source.con,
+            tables={name: dataset["table"] for name, dataset in source.datasets.items()},
+        )
+        assert result["rows"] == [
+            [1, "acme.test", "/docs/intro", "https://AcmE.tEst/docs/intro?q=1#sEc"],
+        ]
+    finally:
+        source.con.disconnect()
+
+
 @pytest.mark.parametrize("scalar", [
     {"fn": "lower", "args": []},
     {"fn": "lower", "args": [{"column": "path"}, {"column": "path"}]},

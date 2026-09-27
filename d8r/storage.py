@@ -57,7 +57,9 @@ def _text(value: object, label: str, *, nonempty: bool = False) -> None:
 
 def _validate(value: object) -> dict:
     """Validate structure, never parse/execute bodies against the active schema."""
-    document = _record(value, {"version", "functions", "d1_profiles"}, "memory")
+    if isinstance(value, dict):
+        value = {"postgres_profiles": [], **value}
+    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles"}, "memory")
     if type(document["version"]) is not int or document["version"] != 1:
         raise ValueError("unsupported memory version (expected 1)")
     functions = document["functions"]
@@ -99,6 +101,22 @@ def _validate(value: object) -> dict:
         identity = (record["account_id"], database)
         if identity in identities:
             raise ValueError("duplicate D1 profile")
+        identities.add(identity)
+    postgres_profiles = document["postgres_profiles"]
+    if not isinstance(postgres_profiles, list):
+        raise ValueError("postgres_profiles must be a list")
+    identities = set()
+    for profile in postgres_profiles:
+        _record(profile, {"host", "port", "database", "user", "password", "schema", "sslmode", "display"}, "PostgreSQL profile")
+        for key, text in profile.items():
+            _text(text, f"PostgreSQL profile {key}", nonempty=key != "password")
+        if not profile["port"].isascii() or not profile["port"].isdigit() or not 1 <= int(profile["port"]) <= 65535:
+            raise ValueError("PostgreSQL port must be between 1 and 65535")
+        if profile["sslmode"] not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+            raise ValueError("invalid PostgreSQL SSL mode")
+        identity = tuple(profile[key] for key in ("host", "port", "database", "user", "schema", "sslmode"))
+        if identity in identities:
+            raise ValueError("duplicate PostgreSQL profile")
         identities.add(identity)
     return {**document, "d1_profiles": [
         {**profile, "api_token": profile.get("api_token", "")} for profile in profiles
@@ -275,13 +293,15 @@ class _JSONStore:
 
 
 class MemoryStore(_JSONStore):
-    """Durable function definitions and saved D1 credentials (memory schema v1)."""
+    """Durable function definitions and saved database credentials (schema v1)."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        super().__init__(data_dir, "memory", {"version": 1, "functions": [], "d1_profiles": []}, _validate)
+        super().__init__(data_dir, "memory", {"version": 1, "functions": [], "d1_profiles": [], "postgres_profiles": []}, _validate)
 
-    def save(self, functions: list[dict], profiles: list[dict[str, str]]) -> None:
-        self._save({"version": 1, "functions": functions, "d1_profiles": profiles})
+    def save(self, functions: list[dict], profiles: list[dict[str, str]],
+             postgres_profiles: list[dict[str, str]] | None = None) -> None:
+        self._save({"version": 1, "functions": functions, "d1_profiles": profiles,
+                    "postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles})
 
 
 class SettingsStore(_JSONStore):

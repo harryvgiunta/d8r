@@ -40,6 +40,7 @@ from .results import ResultsTable
 from .session import RunOutcome, Session, default_dialect
 from .settings import SettingsScreen
 from .fn import FnScreen
+from . import splash
 
 # The document a fresh session opens with: a real query against the demo
 # source, so `ctrl+enter` does something true on the very first keystroke.
@@ -87,9 +88,10 @@ def column_label(column: ColumnDef) -> Text:
     return Text.assemble(column.name, "  ", (column.type, "dim"))
 
 
-def dataset_label(name: str, rows: int) -> Text:
-    """A dataset row in the schema explorer: the name, then its row count."""
-    return Text.assemble((name, "bold"), "  ", (f"{rows} rows", "dim"))
+def dataset_label(name: str, rows: int | None) -> Text:
+    """Remote schemas need not scan whole tables just to populate the explorer."""
+    detail = "row count not loaded" if rows is None else f"{rows} rows"
+    return Text.assemble((name, "bold"), "  ", (detail, "dim"))
 
 
 class D8RApp(App):
@@ -352,7 +354,7 @@ class D8RApp(App):
         root.expand()
         datasets = self.session.source.datasets
         for name, entry in datasets.items():
-            label = dataset_label(name, int(entry["rows"]))
+            label = dataset_label(name, entry["rows"])
             if entry.get("temp"):
                 label.append(Text("  temp", style="dim italic"))
             node = root.add(
@@ -824,7 +826,9 @@ class D8RApp(App):
 
 
 def main() -> None:
-    """`python -m d8r` — run the app."""
+    """`python -m d8r` — play the boot splash, then run the app."""
+    if splash.should_play():
+        splash.play()
     D8RApp().run()
 
 

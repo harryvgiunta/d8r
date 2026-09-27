@@ -1,7 +1,7 @@
-"""Connect to live Cloudflare D1, or open an explicitly selected SQLite snapshot.
+"""Connect to live Cloudflare D1 or PostgreSQL, or open a SQLite snapshot.
 
-Only Add remembers a live profile including its API token and transfers the source to the
-app. Test owns its connection until Add, a field change, or cancellation.
+Only Add remembers live credentials and transfers the source to the app.
+Test owns its connection until Add, a field change, or cancellation.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import asyncio
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
@@ -33,48 +33,91 @@ class AddSourceModal(ModalScreen):
         self._busy = False
         self._observed_fields: tuple[str, ...] = ()
         self._profiles = list(session.d1_profiles)
+        self._postgres_profiles = list(session.postgres_profiles)
         self._initial_profile = dict(profile) if profile is not None else None
         self._snapshot_path = snapshot_path
         self._reconnect_fields: tuple[str, ...] | None = None
+        self._shown_backend: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="add-source"):
             yield Label("Reconnect local SQLite snapshot" if self._snapshot_path else
-                        "Connect saved data source · Cloudflare D1" if self._initial_profile is not None else
-                        "Add a data source · Cloudflare D1", id="add-source-title")
+                        "Connect saved data source" if self._initial_profile is not None else
+                        "Add a data source", id="add-source-title")
             yield Static(
-                "Live connects to your hosted database through Cloudflare's official API. "
-                "A local SQLite snapshot is offline and does not sync with Cloudflare.",
+                "Connect to Cloudflare D1 or PostgreSQL, or open an offline SQLite snapshot. "
+                "Add saves connection credentials locally in plaintext; keep connection backups private. "
+                "Test and Cancel save nothing.",
                 id="add-source-note",
                 markup=False,
             )
-            yield Static(
-                "Cloudflare dashboard: copy your Account ID from the account overview. "
-                "Open Workers & Pages → D1 → your database for its UUID or database name "
-                "(not a Worker binding).\n"
-                "My Profile → API Tokens → Create Token → Custom token: choose "
-                "Account → D1 → Read and include only the intended account. "
-                "Use this scoped read-only token, not a Global API key.\n"
-                "Add saves the Account ID, resolved database UUID, display name and API token. "
-                "Connection backups contain plaintext secrets; keep them private. Test and Cancel save nothing.",
-                id="d1-setup-help",
-                markup=False,
-            )
-            yield Label("Saved connection", classes="field-label")
+            yield Label("Backend", classes="field-label")
             yield Select(
-                [(f"{profile['display']} · {profile['database']}", index)
-                 for index, profile in enumerate(self._profiles)],
-                prompt="New connection",
-                id="d1-profile",
+                [("Cloudflare D1 / local SQLite snapshot", "d1"), ("PostgreSQL", "postgres")],
+                value="postgres" if self._initial_profile and self._initial_profile.get("kind") == "postgres-live" else "d1",
+                allow_blank=False,
+                id="source-backend",
             )
-            yield Label("Account ID", classes="field-label")
-            yield Input(placeholder="32-character Cloudflare account id", id="account-id")
-            yield Label("Database UUID or name", classes="field-label")
-            yield Input(placeholder="UUID recommended; not a Worker binding", id="database")
-            yield Label("API token · Account / D1 / Read", classes="field-label")
-            yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="api-token")
-            yield Label("Local snapshot · optional, overrides the live fields", classes="field-label")
-            yield Input(self._snapshot_path or "", placeholder="existing .sqlite path — skips the network", id="snapshot-path")
+            with Vertical(id="d1-fields"):
+                yield Static(
+                    "Cloudflare dashboard: copy your Account ID from the account overview. "
+                    "Open Workers & Pages → D1 → your database for its UUID or database name "
+                    "(not a Worker binding).\n"
+                    "My Profile → API Tokens → Create Token → Custom token: choose "
+                    "Account → D1 → Read and include only the intended account. "
+                    "Use this scoped read-only token, not a Global API key.\n"
+                    "A local SQLite snapshot is offline and does not sync with Cloudflare.",
+                    id="d1-setup-help",
+                    markup=False,
+                )
+                yield Label("Saved D1 connection", classes="field-label")
+                yield Select(
+                    [(f"{profile['display']} · {profile['database']}", index)
+                     for index, profile in enumerate(self._profiles)],
+                    prompt="New connection",
+                    id="d1-profile",
+                )
+                yield Label("Account ID", classes="field-label")
+                yield Input(placeholder="32-character Cloudflare account id", id="account-id")
+                yield Label("Database UUID or name", classes="field-label")
+                yield Input(placeholder="UUID recommended; not a Worker binding", id="database")
+                yield Label("API token · Account / D1 / Read", classes="field-label")
+                yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="api-token")
+                yield Label("Local snapshot · optional, overrides the live fields", classes="field-label")
+                yield Input(self._snapshot_path or "", placeholder="existing .sqlite path — skips the network", id="snapshot-path")
+            with Vertical(id="postgres-fields"):
+                yield Static(
+                    "Use a database role with read-only access. For remote databases, use the TLS "
+                    "mode required by your provider; verify-full verifies the server certificate and hostname.",
+                    id="postgres-setup-help",
+                    markup=False,
+                )
+                yield Label("Saved PostgreSQL connection", classes="field-label")
+                yield Select(
+                    [(f"{profile['display']} · {profile['database']}", index)
+                     for index, profile in enumerate(self._postgres_profiles)],
+                    prompt="New connection",
+                    id="postgres-profile",
+                )
+                yield Label("Host", classes="field-label")
+                yield Input("localhost", id="postgres-host")
+                yield Label("Port", classes="field-label")
+                yield Input("5432", type="integer", id="postgres-port")
+                yield Label("Database", classes="field-label")
+                yield Input(placeholder="database name", id="postgres-database")
+                yield Label("User", classes="field-label")
+                yield Input(placeholder="database role", id="postgres-user")
+                yield Label("Password", classes="field-label")
+                yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="postgres-password")
+                yield Label("Schema", classes="field-label")
+                yield Input("public", id="postgres-schema")
+                yield Label("TLS / SSL mode", classes="field-label")
+                yield Select(
+                    [(mode, mode) for mode in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")],
+                    value="prefer",
+                    allow_blank=False,
+                    id="postgres-sslmode",
+                )
             yield Label("Display name", classes="field-label")
             yield Input(placeholder="optional label for the datasource list", id="display-name")
             yield Static("", id="add-source-message", markup=False)
@@ -84,29 +127,58 @@ class AddSourceModal(ModalScreen):
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
+        self._show_backend()
         self._observed_fields = self._fields()
-        self.query_one("#account-id", Input).focus()
         if self._initial_profile is not None:
+            postgres = self._initial_profile.get("kind") == "postgres-live"
+            profile = {key: value for key, value in self._initial_profile.items() if key != "kind"}
+            profiles = self._postgres_profiles if postgres else self._profiles
+            selector = "postgres-profile" if postgres else "d1-profile"
             with self.prevent(Select.Changed, Input.Changed):
-                self.query_one("#d1-profile", Select).value = self._profiles.index(self._initial_profile)
-                self._fill_profile(self._initial_profile)
+                if profile in profiles:
+                    self.query_one(f"#{selector}", Select).value = profiles.index(profile)
+                if postgres:
+                    self._fill_postgres_profile(profile)
+                else:
+                    self._fill_profile(profile)
             self._reconnect_fields = self._fields()
-            if self._initial_profile.get("api_token"):
+            if postgres or profile.get("api_token"):
                 self.call_after_refresh(self.action_add)
             else:
                 self.query_one("#api-token", Input).focus()
         elif self._snapshot_path:
             self.query_one("#snapshot-path", Input).focus()
 
+    def _show_backend(self) -> None:
+        backend = str(self.query_one("#source-backend", Select).value)
+        if backend == self._shown_backend:
+            return
+        self._shown_backend = backend
+        postgres = backend == "postgres"
+        self.query_one("#d1-fields").display = not postgres
+        self.query_one("#postgres-fields").display = postgres
+        self.query_one("#postgres-host" if postgres else "#account-id", Input).focus()
+
     def _fields(self) -> tuple[str, ...]:
-        return tuple(self.query_one(f"#{name}", Input).value.strip() for name in (
+        # Keep the D1 field positions stable. Passwords are deliberately not stripped.
+        d1 = tuple(self.query_one(f"#{name}", Input).value.strip() for name in (
             "account-id", "database", "api-token", "snapshot-path", "display-name",
         ))
+        postgres = tuple(self.query_one(f"#postgres-{name}", Input).value.strip() for name in (
+            "host", "port", "database", "user",
+        ))
+        return (*d1, str(self.query_one("#source-backend", Select).value), *postgres,
+                self.query_one("#postgres-password", Input).value,
+                self.query_one("#postgres-schema", Input).value.strip(),
+                str(self.query_one("#postgres-sslmode", Select).value))
 
     def _message(self, text: str, error: bool = False) -> None:
-        token = self.query_one("#api-token", Input).value.strip()
+        for secret in (self.query_one("#api-token", Input).value.strip(),
+                       self.query_one("#postgres-password", Input).value):
+            if secret:
+                text = text.replace(secret, "[redacted]")
         widget = self.query_one("#add-source-message", Static)
-        widget.update(text.replace(token, "[redacted]") if token else text)
+        widget.update(text)
         widget.set_class(error, "error")
 
     def _set_busy(self, busy: bool) -> None:
@@ -124,8 +196,8 @@ class AddSourceModal(ModalScreen):
 
     @classmethod
     def _release_finished(cls, task: asyncio.Task) -> None:
-        # to_thread cannot stop a running HTTP request. A cancelled screen must
-        # still claim and close the eventual result, including the completion race.
+        # to_thread cannot stop a running connection attempt. A cancelled screen
+        # must still claim and close its eventual result, including completion races.
         try:
             source = task.result()
         except (asyncio.CancelledError, Exception):
@@ -153,6 +225,39 @@ class AddSourceModal(ModalScreen):
             self._invalidate()
             self._message("Fields changed. Test or Add to connect with these values.")
 
+    @on(Select.Changed, "#source-backend")
+    def _backend_selected(self) -> None:
+        if self._connection_form_closed:
+            return
+        self._show_backend()
+        self._fields_changed()
+
+    @on(Select.Changed, "#postgres-sslmode")
+    def _sslmode_selected(self) -> None:
+        self._fields_changed()
+
+    @on(Select.Changed, "#postgres-profile")
+    def _postgres_profile_selected(self, event: Select.Changed) -> None:
+        if self._connection_form_closed:
+            return
+        self._invalidate()
+        profile = self._postgres_profiles[event.value] if isinstance(event.value, int) else {}
+        with self.prevent(Select.Changed, Input.Changed):
+            self._fill_postgres_profile(profile)
+
+    def _fill_postgres_profile(self, profile: dict[str, str]) -> None:
+        defaults = {"host": "localhost", "port": "5432", "schema": "public"}
+        for key in ("host", "port", "database", "user", "password", "schema"):
+            self.query_one(f"#postgres-{key}", Input).value = profile.get(key, defaults.get(key, ""))
+        self.query_one("#postgres-sslmode", Select).value = profile.get("sslmode", "prefer")
+        self.query_one("#display-name", Input).value = profile.get("display", "")
+        self._observed_fields = self._fields()
+        self._message("Saved PostgreSQL credentials loaded. Test or Add to connect." if profile else "")
+
+    @staticmethod
+    def _postgres_profile(fields: tuple[str, ...]) -> dict[str, str]:
+        return dict(zip(("host", "port", "database", "user", "password", "schema", "sslmode"), fields[6:]))
+
     @on(Select.Changed, "#d1-profile")
     def _profile_selected(self, event: Select.Changed) -> None:
         if self._connection_form_closed:
@@ -173,7 +278,15 @@ class AddSourceModal(ModalScreen):
         )
 
     def _build(self, fields: tuple[str, ...]) -> DataSource:
-        account_id, database, api_token, path, display = fields
+        account_id, database, api_token, path, display = fields[:5]
+        if fields[5] == "postgres":
+            profile = self._postgres_profile(fields)
+            if not all(profile[key] for key in ("host", "port", "database", "user", "schema")):
+                raise ValueError("Host, port, database, user and schema are required.")
+            port = int(profile.pop("port"))
+            if not 1 <= port <= 65535:
+                raise ValueError("Port must be between 1 and 65535.")
+            return self.session.build_postgres_source(**profile, port=port, display=display or None)
         if path:
             return self.session.build_sqlite_source(path, display)
         if not (account_id and database and api_token):
@@ -191,7 +304,7 @@ class AddSourceModal(ModalScreen):
         self._message("Connecting… You can edit fields or Cancel while this runs.")
         self._worker = self.run_worker(
             self._connect(fields, self._generation, add),
-            name="D1 connection", group="d1-connect", exit_on_error=False,
+            name="Source connection", group="source-connect", exit_on_error=False,
         )
 
     async def _connect(self, fields: tuple[str, ...], generation: int, add: bool) -> None:
@@ -217,6 +330,10 @@ class AddSourceModal(ModalScreen):
                     # Selecting an unchanged saved profile reconnects, not re-saves.
                     if fields != self._reconnect_fields:
                         self.session.remember_d1(source.d1.account_id, source.d1.database_uuid, source.display, api_token=fields[2])
+                elif source.kind == "postgres-live" and fields != self._reconnect_fields:
+                    profile = self._postgres_profile(fields)
+                    profile["display"] = source.display
+                    self.session.remember_postgres(profile)
                 self._built = None  # ownership passes to the app's dismissal callback
                 self._connection_form_closed = True
                 self.dismiss(source)
@@ -227,20 +344,28 @@ class AddSourceModal(ModalScreen):
             raise
         except (D1Error, PayloadError, OSError, RuntimeError, ValueError) as exc:
             if not self._connection_form_closed and generation == self._generation and fields == self._fields():
-                self._message(str(exc), error=True)
+                self._message(self._connection_error(fields) if fields[5] == "postgres" else str(exc), error=True)
         except Exception:
             if not self._connection_form_closed and generation == self._generation and fields == self._fields():
-                self._message("Could not connect. Check the account, database and token permissions, then try again.", error=True)
+                self._message(self._connection_error(fields), error=True)
         finally:
             if generation == self._generation:
                 self._worker = None
                 if not self._connection_form_closed:
                     self._set_busy(False)
 
+    @staticmethod
+    def _connection_error(fields: tuple[str, ...]) -> str:
+        if fields[5] == "postgres":
+            return ("Could not connect to PostgreSQL or save the connection. Check the host, port (1–65535), "
+                    "database, user, password, schema, TLS mode and access permissions, then try again.")
+        return "Could not connect. Check the account, database and token permissions, then try again."
+
     def action_cancel(self) -> None:
         self._connection_form_closed = True
         self._invalidate()
         self.query_one("#api-token", Input).value = ""
+        self.query_one("#postgres-password", Input).value = ""
         self.dismiss(None)
 
     def on_unmount(self) -> None:

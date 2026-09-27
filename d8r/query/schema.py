@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 
-from .functions import SCALAR_FUNCTIONS
+from .functions import DUCKDB_UNRENDERABLE, SCALAR_FUNCTIONS
 
 AGGREGATES: tuple[str, ...] = ("sum", "avg", "count", "min", "max")
 
@@ -91,12 +91,16 @@ DEFAULT_CAPABILITIES = Capabilities(
         "timestamp": TEMPORAL,
         "date": ("year", "month", "day", "quarter"),
         "time": ("hour", "minute", "second"),
-        "string": tuple(fn for fn in SCALAR_FUNCTIONS if fn != "string"),
-        "any": ("string",),
+        "string": tuple(
+            fn for fn in SCALAR_FUNCTIONS
+            if fn not in {"string", "coalesce", "nullif"} and fn not in DUCKDB_UNRENDERABLE
+        ),
+        "any": ("string", "coalesce", "nullif"),
     },
-    operators=("=", "!=", ">", ">=", "<", "<=", "like"),
+    operators=("=", "!=", ">", ">=", "<", "<=", "like", "ilike", "in", "not in",
+               "between", "is null", "is not null"),
     window_functions=("rank", "dense_rank", "row_number"),
-    supports={"groupBy": True, "orderBy": True, "limit": True, "distinct": True, "like": True},
+    supports={"groupBy": True, "orderBy": True, "limit": True, "distinct": True, "like": True, "ilike": True},
 )
 
 

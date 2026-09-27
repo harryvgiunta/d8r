@@ -48,8 +48,17 @@ async def finished(panel):
 
 
 async def click(pilot, widget):
+    # scroll_visible schedules a smooth scroll; one pause is not a guarantee
+    # the target has arrived when the machine is loaded (a full-suite run
+    # raised OutOfBounds on a still-travelling row). Poll until the widget's
+    # region sits inside the screen's visible region before clicking.
     widget.scroll_visible(animate=False)
-    await pilot.pause()
+    for _ in range(50):
+        await pilot.pause()
+        # The pilot's own guard: the click offset is `widget.region.offset`,
+        # rejected when outside the screen region. Wait for that to hold.
+        if widget.region.offset in widget.screen.region:
+            break
     await pilot.click(widget)
 
 

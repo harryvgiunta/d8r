@@ -90,6 +90,19 @@ def test_mock_capabilities_label_honest(sources):
     caps = capabilities_for(sources["snowflake"])
     assert caps["backend"] == "snowflake (mock)"
     assert caps["aggregates"]  # same ibis-translatable surface as demo
+    # A mock answers from a real DuckDB connection, so the probed flags are
+    # that connection's truth — including the new operation surface.
+    assert caps["supports"]["ilike"] is True
+    assert all(
+        caps["supports"][k]
+        for k in ("quantile", "asofJoin", "sampling", "samplingSeed", "unnest")
+    )
+    # …and the function list is honest about it: the URL accessors have no
+    # DuckDB compilation rule, so they are not offered.
+    offered = caps["functions"]["string"]
+    assert "translate" in offered and "levenshtein" in offered
+    assert not any(fn.startswith("url_") for fn in offered)
+    assert "convert_base" not in offered
 
 
 def test_dialects_lists_all_with_compile_flags():

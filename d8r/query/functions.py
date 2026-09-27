@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 ArgumentKind = Literal["string", "integer", "any"]
-ResultKind = Literal["string", "integer", "boolean"]
+ResultKind = Literal["string", "integer", "boolean", "date", "time", "timestamp", "any"]
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class ScalarFunction:
 
 SCALAR_FUNCTIONS: dict[str, ScalarFunction] = {
     "string": ScalarFunction(("any",), 1),
+    "coalesce": ScalarFunction(("any", "any"), 2, "any", variadic=True),
+    "nullif": ScalarFunction(("any", "any"), 2, "any"),
     "concat": ScalarFunction(("string", "string"), 2, variadic=True),
     "concat_ws": ScalarFunction(("string", "string"), 2, variadic=True),
     "lower": ScalarFunction(("string",), 1),
@@ -48,4 +50,26 @@ SCALAR_FUNCTIONS: dict[str, ScalarFunction] = {
     "lpad": ScalarFunction(("string", "integer", "string"), 2),
     "rpad": ScalarFunction(("string", "integer", "string"), 2),
     "find": ScalarFunction(("string", "string", "integer"), 2, "integer"),
+    "translate": ScalarFunction(("string", "string", "string"), 3),
+    "levenshtein": ScalarFunction(("string", "string"), 2, "integer"),
+    "url_protocol": ScalarFunction(("string",), 1),
+    "url_host": ScalarFunction(("string",), 1),
+    "url_path": ScalarFunction(("string",), 1),
+    "url_query": ScalarFunction(("string",), 1),
+    "url_fragment": ScalarFunction(("string",), 1),
+    "as_date": ScalarFunction(("string", "string"), 2, "date"),
+    "as_time": ScalarFunction(("string", "string"), 2, "time"),
+    "as_timestamp": ScalarFunction(("string", "string"), 2, "timestamp"),
+    "convert_base": ScalarFunction(("string", "integer", "integer"), 3),
 }
+
+# The five URL accessors, in catalog order: renderable where a backend has a
+# rule (the local SQLite backend registers UDFs for them; DuckDB in this ibis
+# build has none), so the per-source `functions` lists subtract them where the
+# compiler cannot reach them.
+URL_ACCESSORS: tuple[str, ...] = ("url_protocol", "url_host", "url_path", "url_query", "url_fragment")
+
+# What the bundled DuckDB cannot render at all (verified per ibis 12.0.0 by
+# compiling against a live connection): the URL accessors have no compilation
+# rule there, and `convert_base` has none in any backend of this build.
+DUCKDB_UNRENDERABLE = frozenset({"convert_base", *URL_ACCESSORS})

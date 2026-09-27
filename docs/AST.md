@@ -49,7 +49,7 @@ document together.
 | `\select` | expression | appends to `select` |
 | `\distinct` | — | removes duplicate output rows after projection and set operations |
 | `\unique` | — | alias for `\distinct` |
-| `\where` | `column op value`, or `[not] in ( subquery )` | sets `where` (a later `\where` replaces) |
+| `\where` | `col op val [and/or ( … ) …]`, `between`, `is [not] null`, `[not] in (list\|subquery)` | sets `where` (a later `\where` replaces) |
 | `\group` | `column[ column…]` | appends to `groupBy` |
 | `\order` | `target [asc\|desc]` | appends to `orderBy` (default `asc`) |
 | `\case` | `<alias> = when … then … [else …]` | appends a computed column (repeatable) |
@@ -79,6 +79,29 @@ Argument rules:
   the value `John Smith` without requiring quotes. Quotes are optional and one
   matching layer is stripped when present (`"paid"` and `'paid'` both store
   `paid`); a value containing a quote character keeps it.
+- `\where`/`\case` operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `like`,
+  `ilike`, `~`, `!~`, `in`, `not in`, `between`, `is null`, `is not null` (what
+  the active backend advertises; see `supports` in the capability map). `like`
+  is **SQL's own pattern match**: `%` matches any run of characters, `_` exactly
+  one, and the operand is passed through untouched — no `%` is stripped, no
+  implicit containment is added (`like "p/1"` matches only paths that are
+  literally `p/1`). `ilike` is the case-insensitive form (`ILIKE` on
+  DuckDB/PostgreSQL, `LOWER … LIKE` on SQLite).
+- `between <low> and <high>` is inclusive on both ends and stores its bounds in
+  `low`/`high`, taking no `value`. `is null`/`is not null` take **no operand**
+  (a trailing one is `` `is null` takes no operand ``). `in`/`not in` take
+  either an inline **subquery** `( \from … )` or a literal **list** `( a, b )`;
+  a list item `null` is the SQL keyword, and a mixed-type list against a typed
+  column is the engine's `` cannot compare numeric column … ``.
+- One `\where` line composes with the joining words `and` and `or` (`or` binds
+  looser): `a or b and c` is `or[a, and[b, c]]`. The first condition rides in
+  the flat fields, the rest in `ands` (ANDed to it) and `ors` (each an or-group
+  of `[first, *its_ands]`). A `( … )` piece is a **group**: the whole tree of
+  its own line recurses under `group` (the group node's own flat fields are
+  empty), so `(a or b) and c` and `a or b and c` mean different things.
+  `between`'s own `and` and any `and`/`or` inside a quoted value or a `( … )`
+  never read as joiners — the same masking the parser
+  and the palette's completion share. Groups nest to `MAX_WHERE_DEPTH` (32).
 - Expressions in `\select` are one of: a plain column (`customer_id`), a
   **literal constant** (`'x'`, `"1"`, `1`, `-2.5`, `true`, `null`), a
   **star** (`*`, see below), an aggregate call over a column (`sum(amount)`) or
@@ -159,9 +182,10 @@ For example:
 ```
 
 The complete scalar catalog is below. `text`, `separator`, `prefix`, `suffix`,
-`old`, `new`, `needle`, and `pad` require string values; `start`, `length`, and
-`count` require integers. Each argument can itself be a compatible column,
-typed literal, or scalar call. Brackets denote optional positional arguments;
+`old`, `new`, `needle`, `pad`, `from`, `to`, `other`, `url`, and `format`
+require string values; `start`, `length`, `count`, `from_base`, and `to_base`
+require integers. Each argument can itself be a compatible column, typed
+literal, or scalar call. Brackets denote optional positional arguments;
 `...` permits more string arguments, never empty argument slots.
 
 | signature | result / behavior |
@@ -188,15 +212,31 @@ typed literal, or scalar call. Brackets denote optional positional arguments;
 | `lpad(text, length[, pad])` | string; left-pad (default padding is a space) |
 | `rpad(text, length[, pad])` | string; right-pad (default padding is a space) |
 | `find(text, needle[, start])` | integer; **0-based** position, `-1` when absent |
+| `translate(text, from, to)` | string; replace characters in `from` by the paired characters in `to` |
+| `levenshtein(text, other)` | integer; edit distance between two strings |
+| `url_protocol(url)` | string; the URL's scheme (`https`) |
+| `url_host(url)` | string; the URL's host (`acme.test`) |
+| `url_path(url)` | string; the URL's path (`/docs/intro`) |
+| `url_query(url)` | string; the URL's query string (`q=1`) |
+| `url_fragment(url)` | string; the URL's fragment (`section`) |
+| `as_date(text, format)` | date; parse a string with a `strptime` format |
+| `as_time(text, format)` | time; parse a string with a `strptime` format |
+| `as_timestamp(text, format)` | timestamp; parse a string with a `strptime` format |
+| `convert_base(digits, from_base, to_base)` | string; re-render an integer-as-text in another base |
 
 Positions follow **Ibis**, not a backend SQL dialect's 1-based positions.
 `find`'s optional `start` is also 0-based; `substr` without a length extends to
 the end. D8R builds Ibis expressions rather than writing SQL. Backend support
 and string/cast behavior (including Unicode, padding, and unusual offsets) can
-differ; unsupported operations surface as build/compile/execution errors.
-Live D1 does not offer `capitalize`, `reverse`, `repeat`, `lpad`, or `rpad`:
-the installed Ibis SQLite compiler implements them with Python UDFs available
-in a local SQLite snapshot, not over D1's HTTP connection.
+differ; unsupported operations surface as build/compile/execution errors. The
+capability map's `functions` lists are each source's measured truth — the demo
+DuckDB never lists the URL accessors or `convert_base` (no compilation rule
+there), a local SQLite snapshot does list the URL accessors (its backend
+registers UDFs for them), and so on. Live D1 additionally drops `capitalize`,
+`reverse`, `repeat`, `lpad`, `rpad`, `translate`, `levenshtein`, `as_date`,
+`as_time`, and `as_timestamp`: the installed Ibis SQLite compiler implements
+those with Python UDFs or rules available in a local snapshot, not over D1's
+HTTP connection.
 Arguments are not implicitly converted to text: use `concat(path,
 string(user_id))`, not `concat(path, user_id)` for a numeric ID. Type checks
 belong to the engine; parsing validates grammar and arity, not column dtypes.
@@ -287,10 +327,12 @@ alias is `__count`; an explicit `as` alias overrides it, including for windows.
   no derived auto-alias — the clause name *is* the output name); a malformed
   clause is `` \case expects `<alias> = when <col> <op> <value> then <value>
   [when …] [else <value>]` `` and is not added to `cases`.
-- Operators are the same set `\where` accepts (`=`, `!=`, `>`, `>=`, `<`,
-  `<=`, `like`); `then`/`else` values follow the same quote-stripping rule as
-  `\where` values. A quoted value containing `when`/`then`/`else` never splits a
-  branch — keyword scanning skips quoted strings and parentheses.
+- Branch conditions take the comparison set (`=`, `!=`, `>`, `>=`, `<`, `<=`,
+  `like`, `ilike`, `~`, `!~`) and the null tests (`is null`, `is not null`,
+  which carry no value); `between` and `in`/`not in` are refused (the clause
+  fails `\case expects …`). `then`/`else` values follow the same quote-stripping
+  rule as `\where` values. A quoted value containing `when`/`then`/`else` never
+  splits a branch — keyword scanning skips quoted strings and parentheses.
 - Case columns are projected after the select list. `\else` is optional;
   the AST stores `else: null` and the engine maps it to SQL `ELSE NULL`.
 
@@ -402,11 +444,16 @@ Three positions accept one:
   identifier later clauses address it by, exactly as for a dataset. A set-op
   operand takes no alias (nothing addresses it). The body is built as a relation
   and joined — never inlined SQL.
-- **`\where … in ( … )` / `not in ( … )`** — a semi/anti join over the
-  subquery's single column; a subquery that projects more (or fewer) is the
-  engine's `` `in` needs a subquery of exactly one column — it projects: … ``.
-  `in` without a subquery is `` `in` expects an inline subquery — write
-  ( \from … ) ``: this language has no bare value list.
+- **`\where … in ( … )` / `not in ( … )`** — either a **subquery** (a semi/anti
+  join over its single column; one that projects more, or fewer, is the engine's
+  `` `in` needs a subquery of exactly one column — it projects: … ``) or a
+  literal **list** `( a, b )` with no command inside. A bare `( … )` is a list, a
+  `( \from … )` a subquery; the distinction is the command, not the commas, so
+  `in (3)` is a one-item list. List mistakes name themselves: `in (3, 4` is
+  `` `in` list is unfinished — close it with ) ``, `in ()` is `` `in` expects at
+  least one value ``, `in (3, )` is `` `in` expects a value after each comma ``,
+  and an operand that is neither shape (`in 3`) is `` `in` expects a list (a, b)
+  or an inline subquery — write ( \from … ) ``.
 - **`\where <column> <op> ( … )`** and **`\select ( … ) as <alias>`** — a
   **scalar subquery**, compared against a column or projected as one. Both need
   exactly one column (`` a scalar subquery must project exactly one column — it
@@ -418,9 +465,9 @@ Three positions accept one:
 
 A parenthesized operand is read as a subquery when it **contains a command**:
 `\where amount = (3)` keeps comparing against the value `(3)`, so the literal
-never turns into an empty body — and an operator that takes text (`like`, `~`)
-keeps its operand as written, subquery-shaped or not. Correlation is not a
-subquery feature here — only a lateral body may read outside itself (next
+never turns into an empty body — and an operator that takes text (`like`,
+`ilike`, `~`) keeps its operand as written, subquery-shaped or not. Correlation
+is not a subquery feature here — only a lateral body may read outside itself (next
 section).
 
 ### LATERAL joins / CROSS APPLY
@@ -431,6 +478,9 @@ the `on` is left off. The body correlates through its `\where`, as one equality
 against an outer column (qualified — `\where e.user_id = u.user_id`); anything
 else is refused
 (`` a lateral body correlates through `= <outer column>` in its \where: … ``).
+A correlation hidden inside a `( … )` group, or a second outer-reading
+condition left in the body after the hoist, is refused by name too — ibis
+cannot see either, so the engine never approximates or crashes on one.
 The left side is visible to the body's *own* clauses; a subquery nested inside
 the body reads nothing from outside it, because the correlation is the body's
 `\where` and nothing deeper — there, an outer-looking value is an ordinary value
@@ -717,7 +767,12 @@ statements alone carries no query and answers with their status.
   "distinct": false,        // true for \distinct or \unique; always present
   "where": {                 // or null
     "line": 3, "raw": "status = \"paid\"", "column": "status", "op": "=", "value": "paid",
-    "subquery": null         // a full QueryAST for `in`/`not in` and scalar comparisons
+    "subquery": null,        // a full QueryAST for `in`/`not in` and scalar comparisons
+    "low": "1", "high": "999.5",   // `between` only
+    "values": ["a", null],   // `in`/`not in` literal list only (null is the SQL keyword)
+    "group": { /* full where shape */ }, // `( … )` group only; then column/op/value are ""
+    "ands": [ /* same condition shape */ ],      // ANDed to this line, only when present
+    "ors": [[ /* first cond */ /*, its ands */ ]] // extra or-groups, only when present
   },
   "groupBy": [{ "line": 5, "column": "customer_id" }],
   "orderBy": [{ "line": 10, "target": "customer_total", "direction": "desc", "resolvesTo": 3 }],
@@ -811,10 +866,15 @@ Typing `\` opens the palette; the pure rule behind it is `view_for(...)` in
   offers the temp tables there are to drop. This
   document's open-table columns for `\select`/`\group`/`\order`
   (the cross-dataset pool when the document has no `\from` yet), and for
-  `\where` the chain column → capability operator → that column's distinct
-  values (numeric values inserted bare, text values quoted), which stop once the
-  clause carries a closed value, since one `\where` sets exactly one — and stop
-  right after `~`, `!~`, `in` or `not in`, whose operand is typed, not chosen;
+  `\where` a small state machine over the condition tree, reading the raw text
+  before the caret with the parser's own `split_logic` masking: a column after
+  the start or a joining `and`/`or`; the backend's operators after a column (and
+  the multi-word `is [not] null` completed in place from `amount is`); then the
+  operand — that column's distinct values for `=`/`like`/`between` bounds
+  (numeric values inserted bare, text values quoted), the `and` between
+  `between`'s two bounds, nothing typed after `~`, `!~`, `in` or `not in` (a
+  pattern, list, or subquery is typed, not chosen); and `and`/`or` after a
+  complete condition (`is [not] null` is complete on its own).
 - in `\select`, the fields first and then the functions that apply to them: the
   aggregates the backend advertises, the temporal extractions at least one open
   column can carry, and the rank functions. An open call (`sum(`) offers that

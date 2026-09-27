@@ -392,6 +392,7 @@ class AIPanel(Vertical):
         self._diagnostics.protect([
             config.api_key,
             *(profile.get("api_token", "") for profile in self.session.d1_profiles),
+            *(profile.get("password", "") for profile in self.session.postgres_profiles),
             *(source.d1.api_token for source in self.session.sources.values() if source.d1 is not None),
         ])
         try:

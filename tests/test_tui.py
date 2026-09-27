@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import sqlite3
 import subprocess
 import sys
@@ -26,11 +27,12 @@ import d8r
 from d8r.engine import DIALECTS, add_sqlite_source
 from d8r.query import SchemaContext
 from d8r.tui.add_source import AddSourceModal
-from d8r.tui.app import D8RApp
-from d8r.tui.palette import VALUE_SUGGESTIONS, view_for
+from d8r.tui.app import D8RApp, main as app_main
+from d8r.tui.palette import VALUE_SUGGESTIONS, View, view_for
 from d8r.tui.session import PREVIEW_ROW_CAP, VALUE_POOL_LIMIT, Session
 from d8r.tui.settings import SettingsScreen
 from d8r.tui.fn import FnScreen
+from d8r.tui import splash
 from tests.conftest import REPO_ROOT
 
 TUI_DIR = Path(d8r.__file__).resolve().parent / "tui"
@@ -666,14 +668,14 @@ def test_palette_follows_the_caret_and_the_schema():
         await type_document(pilot, "pu")
         await pilot.press("enter")
         assert app.editor.text.endswith('\\where event_type = "purchase" ')
+        assert app.palette.view.labels == ["and", "or"]  # the condition is complete
 
-        # Moving the caret onto a completable spot does not summon anything —
-        # the arrows stay the document's own — but the next keystroke does.
+        # A bare caret move carries the open popup along — the arrows stay the
+        # document's own — and the next keystroke re-syncs it where it landed.
         app.editor.cursor_location = (1, len("\\select user_id "))
         await pilot.pause()
-        assert app.palette.is_open is False
-        await type_document(pilot, ", ")
         assert app.palette.is_open is True
+        await type_document(pilot, ", ")
         assert app.palette.view.labels[:2] == ["timestamp", "user_id"]
 
     run_app(scenario)
@@ -706,14 +708,34 @@ def test_the_palette_view_picks_its_span_and_its_offers():
     assert view_for(session, "\\join ", "\\join ", len("\\join ")).labels  # still a choice
     joined = "\\join users on user_id "
     assert view_for(session, joined, joined, len(joined)) is None
+    # A `\where` condition offers values until the value closes, then joiners:
+    # `and`/`or` follow a complete condition, and a joiner opens the next column.
+    def where(line: str) -> View | None:
+        return view_for(session, "\\from events\n" + line, line, len(line))
 
-    # A `\where` takes one value: offered until the value is closed, gone after.
-    open_value = "\\where event_type = "
-    assert view_for(session, open_value, open_value, len(open_value)).labels
-    half = '\\where event_type = "pur'
-    assert view_for(session, half, half, len(half)).labels == ["purchase"]
-    done = '\\where event_type = "purchase" '
-    assert view_for(session, done, done, len(done)) is None
+    assert where("\\where event_type = ").labels  # the column's values
+    assert where('\\where event_type = "pur').labels == ["purchase"]
+    assert where('\\where event_type = "purchase" ').labels == ["and", "or"]
+    assert where('\\where event_type = "purchase" and ').labels[:2] == [
+        "timestamp", "user_id",
+    ]
+    assert where("\\where event_type between ").labels  # the low bound
+    assert where('\\where event_type between "c" ').labels == ["and"]
+    # the high bound completes the pair; a closed pair ends the condition
+    assert where('\\where event_type between "c" and ').labels
+    assert where('\\where event_type between "c" and "d" ').labels == ["and", "or"]
+    # `between`'s own `and` is masked: a closed low bound reads as the operand,
+    # not a joiner — the offer after `between "c" ` is the bound's `and`.
+    assert where("\\where amount between 1 ").labels == ["and"]
+    # `is null` completes the condition; the list and subquery operand is typed.
+    assert where("\\where event_type is null ").labels == ["and", "or"]
+    assert where("\\where user_id in ") is None
+    assert where("\\where user_id in (1, 2) ").labels == ["and", "or"]
+    # A column alone offers the operator list, including the multi-word ops.
+    labels = where("\\where amount ").labels
+    assert "is null" in labels and "not in" in labels and "between" in labels
+    # Partial operator words complete the phrase: `amount is |` offers `is null`.
+    assert set(where("\\where amount is ").labels) == {"is null", "is not null"}
 
 
 def test_set_op_offers_the_documents_tables_and_its_modifier():
@@ -792,16 +814,15 @@ def test_intellisense_escape_shows_and_hides_the_popup():
         assert app.palette.view.labels == ["purchase"]
         await pilot.press("enter")
         assert app.editor.text.endswith('\\where event_type = "purchase" ')
-        # The clause now carries its value: nothing left to offer, so Enter is
-        # a newline again without an Escape first.
+        # The condition is complete, so the offers that stay open are the
+        # joiners — Escape dismisses them, and Enter is a newline again.
+        assert app.palette.view.labels == ["and", "or"]
+        await pilot.press("escape")
         assert app.palette.is_open is False
         await pilot.press("enter")
         assert app.editor.text.endswith('\\where event_type = "purchase" \n')
 
-        # Nothing to summon at a done clause, and Escape leaves it that way; a
-        # fresh `\` is still the summon that brings the command list back.
-        await pilot.press("escape")
-        assert app.palette.is_open is False
+        # A fresh `\` is still the summon that brings the command list back.
         await type_document(pilot, "\\")
         assert app.palette.is_open is True
         assert "\\from" in app.palette.view.labels
@@ -1485,11 +1506,30 @@ def test_a_where_operand_that_is_typed_offers_nothing():
     session = Session()
     for line in ("\\where path ~ ", "\\where path !~ ", "\\where user_id in ", "\\where user_id not in "):
         assert view_for(session, line, line, len(line)) is None
-    # The operators themselves are offered, and `like` still offers values.
+    # The operators themselves are offered, and `like`/`ilike` still offer values.
     operators = view_for(session, "\\where path ", "\\where path ", len("\\where path ")).labels
-    assert "~" in operators and "in" in operators
+    assert "~" in operators and "in" in operators and "ilike" in operators
     like = '\\where event_type like '
     assert view_for(session, like, like, len(like)).labels
+    ilike = '\\where event_type ilike '
+    assert view_for(session, ilike, ilike, len(ilike)).labels
+
+
+def test_where_completion_reads_through_a_group():
+    """The state machine peels `( … )` and keeps completing inside it."""
+    session = Session()
+    # Just after the open paren: columns, as at the start of a clause.
+    opened = "\\where ("
+    view = view_for(session, opened, opened, len(opened))
+    assert view is not None and "amount" in view.labels
+    # Inside an unclosed group: the partial condition offers its operators.
+    inside = "\\where (amount "
+    view = view_for(session, inside, inside, len(inside))
+    assert view is not None and ">" in view.labels
+    # A closed group is a complete condition: the joiners follow.
+    closed = "\\where (amount > 1)"
+    view = view_for(session, closed, closed, len(closed))
+    assert view is not None and "and" in view.labels and "or" in view.labels
 
 
 def test_a_typed_document_keeps_a_temp_table_and_drops_it_again():
@@ -2246,3 +2286,99 @@ def test_saved_sources_reconnect_in_secondary_pickers(monkeypatch, saved_d1_sess
                 assert not app.session.settings_path.exists()
             assert not app.session.history
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# The boot splash: `main()` plays it once, on a terminal, before the IDE
+# ---------------------------------------------------------------------------
+
+
+def test_the_splash_tells_its_story_frame_by_frame():
+    """Chaos scrolls, the dozer pops in one frame, the lane it clears is empty."""
+    # CHAOS: the wall is full and it moves.
+    assert splash.frame_lines(0)[3].strip()
+    assert splash.frame_lines(1)[3] != splash.frame_lines(0)[3]
+
+    # ENTRY: absent one frame, fully present the next — a pop, not a fade.
+    # The wall covers every column before the dozer; the machine is the only
+    # cyan thing on screen, so that is what marks its arrival.
+    cyan = lambda cell: isinstance(cell, tuple) and cell[1] == splash.CYAN  # noqa: E731
+    assert not any(cyan(cell) for cell in splash.build(splash.ENTRY - 1).c[6][: splash.PROW])
+    assert any(cyan(cell) for cell in splash.build(splash.ENTRY).c[6][: splash.PROW])
+
+    # SWEEP: above the machine, everything behind the prow has been shoved off.
+    prow = splash.blade_x(splash.PARK_AT) + splash.PROW
+    assert set(splash.frame_lines(splash.PARK_AT)[1][:prow]) == {" "}
+
+    # HOLD: the mark landed, the title typed, the cursor retired, and the
+    # ending holds pixel-still to the last frame.
+    final = splash.frame_lines(splash.TOTAL_FRAMES - 1)
+    assert "████" in final[1]
+    assert "THE DATA HARNESS" in final[7]
+    assert "▊" not in final[7]
+    assert splash.frame_lines(80) == final
+
+
+def test_the_splash_keeps_out_of_everything_that_is_not_a_terminal():
+    """A pipe, a closed stream: the gate says no; only a tty says yes."""
+    assert splash.should_play(io.StringIO()) is False
+    class _TTY:
+        def isatty(self) -> bool:
+            return True
+
+    assert splash.should_play(_TTY()) is True
+
+    closed = io.StringIO()
+    closed.close()  # isatty on a closed stream must not crash the gate
+    assert splash.should_play(closed) is False
+
+
+def test_the_splash_play_paces_every_frame_and_gives_the_cursor_back():
+    """`play` draws all 120 frames on the injected clock and restores the terminal."""
+
+    class _Record:
+        def __init__(self) -> None:
+            self.chunks: list[str] = []
+
+        def write(self, text: str) -> int:
+            self.chunks.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+    sink, slept = _Record(), []
+    splash.play(color=True, out=sink, sleep=slept.append)
+    rendered = "".join(sink.chunks)
+    assert rendered.count("\x1b[H") == splash.TOTAL_FRAMES
+    assert rendered.startswith("\x1b[?25l")
+    assert rendered.endswith("\x1b[?25h\n")
+    assert len(slept) == splash.TOTAL_FRAMES
+
+    plain = _Record()
+    splash.play(color=False, out=plain, sleep=lambda _s: None)
+    naked = "".join(plain.chunks)
+    # colorless output positions but never styles: no SGR color, no cursor swap
+    assert "\x1b[0m" not in naked and "\x1b[?25" not in naked
+    assert "\x1b[H" in naked          # …still homes each frame
+    assert "████" in naked            # …and still shows the mark
+
+
+def test_main_splashes_on_a_terminal_and_only_there(monkeypatch):
+    """The entry point shows the dozer first on a tty, and never on a pipe."""
+
+    class _Stub:
+        def run(self) -> None:
+            order.append("app")
+
+    order: list[str] = []
+    monkeypatch.setattr("d8r.tui.app.D8RApp", _Stub)
+    monkeypatch.setattr(splash, "play", lambda **kw: order.append("splash"))
+    monkeypatch.setattr(splash, "should_play", lambda stream=None: True)
+    app_main()
+    assert order == ["splash", "app"]
+
+    order.clear()
+    monkeypatch.setattr(splash, "should_play", lambda stream=None: False)
+    app_main()
+    assert order == ["app"]

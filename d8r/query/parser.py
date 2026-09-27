@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from .alias import effective_alias
 from .ast import (
@@ -58,14 +58,18 @@ _COL_RE = re.compile(rf"^{_COL}$")
 _AGG_RE = re.compile(rf"^([A-Za-z_][A-Za-z0-9_]*)\((\*|{_COL})\)$")
 _CALL_HEAD_RE = re.compile(rf"^({_IDENT})\s*\(")
 _AS_RE = re.compile(r"^(.*?)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
-# `\where <column> <op> <tail>`; the tail is a value, or `( … )` for `in`/`not in`
-# and for the scalar-subquery form of a comparison.
+# `\where <column> <op> <tail>`; the tail is a value, a `between` pair, an
+# `in`/`not in` list `( a, b )`, or `( … )` for `in`/`not in` and the
+# scalar-subquery form of a comparison. `is [not] null` takes no tail.
 _WHERE_HEAD_RE = re.compile(
-    rf"^({_COL})\s+(not\s+in|in|!=|!~|>=|<=|like|~|=|>|<)\s*(.*)$", re.IGNORECASE
+    rf"^({_COL})\s+(is\s+not\s+null|is\s+null|between|not\s+in|in|!=|!~|>=|<=|ilike|like|~|=|>|<)\s*(.*)$",
+    re.IGNORECASE,
 )
 # The `\where` operators that take an inline subquery instead of a literal.
 SUBQUERY_OPS = frozenset({"in", "not in"})
-# The regex operators: POSIX-style matching, SQL's `~`/`!~`.
+# The operators whose operand is neither a literal nor a subquery.
+NULL_OPS = frozenset({"is null", "is not null"})
+# The regex operators: POSIX-style matching (`~`/`!~`).
 REGEX_OPS = frozenset({"~", "!~"})
 _ORDER_RE = re.compile(rf"^({_COL})(?:\s+(asc|desc))?$", re.IGNORECASE)
 # The `on <col>[ = <col>]` tail of a `\join`, on its own (a lateral join's `on`
@@ -156,6 +160,7 @@ _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
 MAX_NUMERIC_CHARS = 640
 MAX_FUNCTION_DEPTH = 16
 MAX_FUNCTION_EXPANSIONS = 256
+MAX_WHERE_DEPTH = 32
 
 
 def checked_integer(text: str, label: str) -> int:
@@ -252,6 +257,66 @@ def keyword_positions(text: str, keyword: str) -> list[int]:
                     continue
         i += 1
     return out
+
+
+def logic_positions(text: str, keyword: str) -> list[int]:
+    """Positions of a joining `and`/`or` outside quotes, parens, and `between … and …`.
+
+    A `between`'s own `and` joins its two bounds, not two conditions. The
+    bound connector is found operand-first — after `between` comes a quoted
+    string or a bare token, then the `and` — so a quoted low bound containing
+    the word `and` never mis-masks the joining one.
+    """
+    if keyword.lower() not in ("and", "or"):
+        raise ValueError("logic_positions joins on `and`/`or` only")
+    positions = keyword_positions(text, keyword)
+    if keyword.lower() != "and":
+        # Only `between`'s own `and` is a bound connector; a joining `or`
+        # after a bound is still a joiner (quotes are already skipped).
+        return positions
+    consumed: set[int] = set()
+    for start in keyword_positions(text, "between"):
+        i = start + len("between")
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i < len(text) and text[i] in "\"'":
+            quote = text[i]
+            i += 1
+            while i < len(text) and text[i] != quote:
+                i += 1
+            i += 1
+        else:
+            while i < len(text) and not text[i].isspace():
+                i += 1
+        nxt = next((p for p in positions if p >= i), None)
+        if nxt is not None:
+            consumed.add(nxt)
+    return [p for p in positions if p not in consumed]
+
+
+def split_logic(text: str, keyword: str) -> list[str]:
+    """`text` cut at every joining `and`/`or`; empty pieces are kept as-is."""
+    pieces: list[str] = []
+    last = 0
+    for pos in logic_positions(text, keyword):
+        pieces.append(text[last:pos])
+        last = pos + len(keyword)
+    pieces.append(text[last:])
+    return pieces
+
+
+def where_head(text: str) -> tuple[str, str, str] | None:
+    """A condition's `(column, op, tail)` before its operand is interpreted.
+
+    The parser's own first step and the palette's completion state machine's:
+    the normalized operator tells both which operand shape follows. `None`
+    when the text is not `<column> <op> …` at all. Surrounding whitespace is
+    irrelevant — pieces split off `and`/`or` carry it.
+    """
+    match = _WHERE_HEAD_RE.match(text.strip())
+    if match is None:
+        return None
+    return match.group(1), re.sub(r"\s+", " ", match.group(2).lower()), match.group(3).strip()
 
 
 def take_paren(text: str) -> tuple[str, str] | None:
@@ -389,6 +454,143 @@ def absorb(ast: QueryAST, child: QueryAST) -> None:
     """A nested query's errors belong to the document; the nested AST keeps none."""
     ast.errors.extend(child.errors)
     child.errors = []
+
+
+def _where_condition(
+    text: str, line: int, opts: ParseOpts, ast: QueryAST, report: Callable[[str], None]
+) -> WhereClause | None:
+    """One `\\where` condition: `<column> <op> <operand>`, no joining `and`/`or`.
+
+    The operand is a literal, a `between low and high` pair, an `in`/`not in`
+    inline list `( a, b )` or subquery `( \from … )`, a scalar-subquery
+    `( \from … )` under a comparison, or nothing at all for `is [not] null`.
+    `report` is the clause loop's error sink (it owns the typing-line rule).
+    `None` means the text is not a condition; a half-typed one on the typing
+    line reports nothing, exactly like the rest of the grammar.
+    """
+    parts = where_head(text)
+    if parts is None:
+        report("\\where expects `column op value`")
+        return None
+    column, op, tail = parts
+    cond = WhereClause(line=line, raw=text.strip(), column=column, op=op, value="")
+    if op in NULL_OPS:
+        if tail:
+            report(f"`{op}` takes no operand")
+            return None
+        return cond
+    if not tail:
+        report("\\where expects `column op value`")
+        return None
+    paren = take_paren(tail)
+    is_subquery = paren is not None and "\\" in paren[0] and not paren[1]
+    if op == "between":
+        bounds = [bound.strip() for bound in split_logic(tail, "and")]
+        if len(bounds) != 2 or not all(bounds):
+            report("`between` needs low and high")
+            return None
+        cond.low = unquote(bounds[0])
+        cond.high = unquote(bounds[1])
+        return cond
+    if op in SUBQUERY_OPS and not (is_subquery or (paren is not None and not paren[1])):
+        # Neither a subquery nor a balanced `( … )` list.
+        unbalanced = paren is None and tail.startswith("(")
+        report(
+            "`in` list is unfinished — close it with )" if unbalanced
+            else f"`{op}` expects a list (a, b) or an inline subquery — write ( \\from … )"
+        )
+        return None
+    if is_subquery and op not in REGEX_OPS | {"like", "ilike"}:
+        cond.subquery = parse_subquery(paren[0], line, opts)
+        absorb(ast, cond.subquery)
+        return cond
+    if op in SUBQUERY_OPS:
+        items = split_top(paren[0], keep_empty=True)
+        if not items or not any(item.strip() for item in items):
+            report(f"`{op}` expects at least one value")
+            return None
+        values: list[object] = []
+        for item in items:
+            piece = item.strip()
+            if not piece:
+                report(f"`{op}` expects a value after each comma")
+                return None
+            # `null` is the SQL keyword, not the four letters; everything else
+            # keeps its raw spelling (quoted numeric text stays text).
+            values.append(None if piece.lower() == "null" else unquote(piece))
+        cond.values = values
+        return cond
+    cond.value = unquote(tail)
+    return cond
+
+
+def _where_piece(
+    text: str, line: int, opts: ParseOpts, ast: QueryAST,
+    report: Callable[[str], None], depth: int,
+) -> WhereClause | None:
+    """One piece of a `\\where`: a condition, or a `( … )` group of conditions.
+
+    A group is the same grammar one level down — a recursive `_where_tree`
+    over the text inside the parentheses, stored as a group node (empty flat
+    fields, parsed tree in `group`). `depth` bounds the nesting so a pile of
+    parentheses cannot out-recurse the parser.
+    """
+    s = text.strip()
+    if not s.startswith("("):
+        return _where_condition(text, line, opts, ast, report)
+    paren = take_paren(s)
+    if paren is None:
+        report("`(...)` group is unfinished — close it with )")
+        return None
+    body, rest = paren
+    if rest:
+        report(f"`(...)` group has unexpected `{rest}` after its )")
+        return None
+    if depth + 1 > MAX_WHERE_DEPTH:
+        report("where grouping is nested too deeply")
+        return None
+    if not body.strip():
+        report("`(...)` group cannot be empty")
+        return None
+    inner = _where_tree(body, line, opts, ast, report, depth + 1)
+    if inner is None:
+        return None
+    node = WhereClause(line=line, raw=s, column="", op="", value="")
+    node.group = inner
+    return node
+
+
+def _where_tree(
+    text: str, line: int, opts: ParseOpts, ast: QueryAST,
+    report: Callable[[str], None], depth: int = 0,
+) -> WhereClause | None:
+    """An `or`-of-`and` condition tree; `(...)` pieces nest as group nodes.
+
+    `or` binds looser than `and`; a joining keyword is only a keyword outside
+    quotes/parens and a `between`'s own `and` (`logic_positions`), so the split
+    hands whole groups to `_where_piece`. Returns the head condition whose
+    `ands`/`ors` carry the tree; `None` when a piece failed (the error was
+    already `report`ed — the sink owns the typing-line rule)."""
+    head: WhereClause | None = None
+    for segment in split_logic(text, "or"):
+        group: list[WhereClause] = []
+        for piece in split_logic(segment, "and"):
+            cond = _where_piece(piece, line, opts, ast, report, depth)
+            if cond is None:
+                return None
+            group.append(cond)
+        if not group:
+            report("\\where expects `column op value`")
+            return None
+        first, *tail_ands = group
+        if head is None:
+            head = first
+            head.raw = text
+            head.ands = tail_ands
+        else:
+            first.ands = tail_ands
+            head.ors.append(first)
+    return head
 
 
 def visible_ctes_of(opts: ParseOpts, own: tuple[str, ...]) -> list[str]:
@@ -740,16 +942,20 @@ def parse_case_arg(rest: str) -> CaseClause | None:
         cond_match = _WHERE_HEAD_RE.match(cond)
         if cond_match is None:
             return None
-        # A `\case` branch carries a literal comparison (regex operators
-        # included); the subquery operators have no operand there.
+        # A `\case` branch carries a literal comparison (regex operators and
+        # the null tests included); the subquery and `between` operators have
+        # no place in one, and a null test takes no operand.
         op = re.sub(r"\s+", " ", cond_match.group(2).lower())
-        if op in SUBQUERY_OPS or not cond_match.group(3).strip():
+        operand = cond_match.group(3).strip()
+        if op in SUBQUERY_OPS or op == "between":
+            return None
+        if (op in NULL_OPS) != (not operand):
             return None
         whens.append(
             CaseBranch(
                 column=cond_match.group(1),
                 op=op,
-                value=unquote(cond_match.group(3)),
+                value=unquote(operand),
                 then=unquote(then_val),
             )
         )
@@ -1385,47 +1591,11 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             continue
 
         if cmd == "where":
-            wm = _WHERE_HEAD_RE.match(rest)
-            if wm is None:
-                err("\\where expects `column op value`")
-                i += 1
-                continue
-            column = wm.group(1)
-            op = re.sub(r"\s+", " ", wm.group(2).lower())
-            tail = wm.group(3).strip()
-            if not tail:
-                err("\\where expects `column op value`")
-                i += 1
-                continue
-            subquery: QueryAST | None = None
-            value = tail
-            # An operand that is a command sequence is a subquery; a bare
-            # parenthesized literal (`= (3)`) stays the value it looks like, and
-            # so does one under an operator that takes text (`like`, `~`).
-            paren = take_paren(tail)
-            is_subquery = paren is not None and "\\" in paren[0] and not paren[1]
-            if op in SUBQUERY_OPS:
-                if not is_subquery:
-                    err(f"`{op}` expects an inline subquery — write ( \\from … )")
-                    i += 1
-                    continue
-                subquery = parse_subquery(paren[0], line, opts)
-                absorb(ast, subquery)
-                value = ""
-            elif is_subquery and op not in REGEX_OPS | {"like"}:
-                subquery = parse_subquery(paren[0], line, opts)
-                absorb(ast, subquery)
-                value = ""
-            else:
-                value = unquote(tail)
-            ast.where = WhereClause(
-                line=line,
-                raw=rest,
-                column=column,
-                op=op,
-                value=value,
-                subquery=subquery,
-            )
+            # `or` binds looser than `and`, and a `(...)` piece is a group of
+            # either — the recursive tree parser owns both rules.
+            head = _where_tree(rest, line, opts, ast, err)
+            if head is not None:
+                ast.where = head
             i += 1
             continue
 
@@ -1610,7 +1780,8 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
                 if s.window.order:
                     check(s.line, s.window.order.column)
         if ast.where:
-            check(ast.where.line, ast.where.column)
+            for cond in ast.where.conditions():
+                check(cond.line, cond.column)
         for g in ast.group_by:
             check(g.line, g.column)
         for o in ast.order_by:
@@ -1669,6 +1840,50 @@ def parse_query(doc: str, *, schema: SchemaContext = EMPTY_SCHEMA, settled: bool
     return parse_slice(lines, ParseOpts(
         schema=schema, typing_line=0 if settled else last_content_line,
     ))
+
+
+def _cond_payload(cond: WhereClause) -> dict:
+    """One `\\where` condition as the engine's condition object.
+
+    The base four keys are the original wire shape; `low`/`high` appear only
+    for `between`, `values` only for an `in`/`not in` literal list. A group
+    node carries an empty head and its own where-tree under `group`.
+    """
+    if cond.group is not None:
+        return {
+            "column": "",
+            "op": "",
+            "value": "",
+            "subquery": None,
+            "group": _where_payload(cond.group),
+        }
+    data: dict = {
+        "column": cond.column,
+        "op": cond.op,
+        "value": cond.value,
+        "subquery": payload_from_ast(cond.subquery) if cond.subquery else None,
+    }
+    if cond.low or cond.high:
+        data["low"] = cond.low
+        data["high"] = cond.high
+    if cond.values is not None:
+        data["values"] = list(cond.values)
+    return data
+
+
+def _where_payload(where: WhereClause) -> dict:
+    """A `\\where` line as the engine's filter object.
+
+    Single-condition documents keep the bare condition shape the engine has
+    always read; composition adds `ands` (conditions ANDed to this line) and
+    `ors` (extra `or`-groups, each `[first, *its_ands]`).
+    """
+    data = _cond_payload(where)
+    if where.ands:
+        data["ands"] = [_cond_payload(c) for c in where.ands]
+    if where.ors:
+        data["ors"] = [[_cond_payload(c) for c in [g, *g.ands]] for g in where.ors]
+    return data
 
 
 def payload_from_ast(ast: QueryAST) -> dict:
@@ -1765,16 +1980,7 @@ def payload_from_ast(ast: QueryAST) -> dict:
             for s in ast.select
         ],
         "distinct": ast.distinct,
-        "where": (
-            {
-                "column": ast.where.column,
-                "op": ast.where.op,
-                "value": ast.where.value,
-                "subquery": payload_from_ast(ast.where.subquery) if ast.where.subquery else None,
-            }
-            if ast.where
-            else None
-        ),
+        "where": _where_payload(ast.where) if ast.where else None,
         "groupBy": [g.column for g in ast.group_by],
         "orderBy": [{"target": o.target, "direction": o.direction} for o in ast.order_by],
         "limit": ast.limit,

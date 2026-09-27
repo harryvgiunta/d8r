@@ -28,7 +28,9 @@ def _to_py(value):
     if isinstance(value, (dt.datetime, dt.date, dt.time)):  # covers pd.Timestamp
         return value.isoformat()
     if isinstance(value, Decimal):
-        return str(value)
+        # `str(Decimal)` switches to scientific notation for normalized
+        # exponents (3E+1); plain 'f' keeps every digit the server sent.
+        return format(value, "f")
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", "replace")
     return value

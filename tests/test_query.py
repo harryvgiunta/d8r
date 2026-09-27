@@ -591,15 +591,27 @@ def test_case_operators_and_values_follow_where_rules():
     when = ast.cases[0].whens[0]
     assert (when.op, when.value, when.then, ast.cases[0].else_) == ("like", "%paid%", "yes", "no")
 
+    ast = parse_query("\\case flag = when name ILIKE '%paid%' then 'yes'\n\\limit 2")
+    assert ast.errors == []
+    when = ast.cases[0].whens[0]
+    assert (when.op, when.value, when.then) == ("ilike", "%paid%", "yes")
+
 
 # --- `\where` ----------------------------------------------------------------
 
 
-def test_where_lowercases_the_operator_including_like():
+def test_where_lowercases_the_operator_including_like_and_ilike():
     ast = parse_query("\\where amount LIKE 5\n\\limit 2")
     assert ast.errors == []
     assert (ast.where.line, ast.where.raw) == (1, "amount LIKE 5")
     assert (ast.where.column, ast.where.op, ast.where.value) == ("amount", "like", "5")
+
+    ast = parse_query("\\where path ILIKE \"SKU-0%\"\n\\limit 2")
+    assert ast.errors == []
+    assert (ast.where.column, ast.where.op, ast.where.value) == ("path", "ilike", "SKU-0%")
+
+    ast = parse_query("\\where path in (\\from events \\select path)")
+    assert ast.errors == [] and ast.where.op == "in" and ast.where.subquery is not None
 
     for op in ("!=", ">", ">=", "<", "<=", "="):
         ast = parse_query(f"\\where total {op} 3\n\\limit 2")
@@ -943,13 +955,25 @@ def test_payload_maps_the_canonical_document():
     assert payload["setOps"][3]["body"]["dataset"] == "staging"
     assert payload["where"]["op"] == "in"
     assert payload["where"]["subquery"]["dataset"] == "customers"
+    # The and-group on the same line: a `( … )` group node wrapping an
+    # in-list head with an or-group null test inside it.
+    (group,) = payload["where"]["ands"]
+    assert (group["op"], group["column"]) == ("", "")
+    assert group["group"]["op"] == "in"
+    assert group["group"]["values"] == ["purchase", "cli"]
+    (null_test,) = group["group"]["ors"]
+    assert null_test[0]["op"] == "is not null" and null_test[0]["column"] == "user_id"
     assert payload["groupBy"] == []
     assert payload["limit"] == 5
     assert payload["orderBy"] == [{"target": "customer_total", "direction": "desc"}]
     assert payload["cases"] == [
         {
             "alias": "flag",
-            "whens": [{"column": "amount", "op": ">", "value": "100", "then": "high"}],
+            "whens": [
+                {"column": "amount", "op": ">", "value": "100", "then": "high"},
+                {"column": "sku", "op": "ilike", "value": "SKU-0%", "then": "early"},
+                {"column": "customer_id", "op": "is null", "value": "", "then": "missing"},
+            ],
             "else": "low",
         }
     ]
@@ -957,7 +981,10 @@ def test_payload_maps_the_canonical_document():
     assert payload["drop"] == "previous"
     assert payload["tx"] == [{"kind": "begin", "name": None}, {"kind": "commit", "name": None}]
 
-    customer, month_col, total, running, rank_col, extracted, peak, *constants, _scalar = payload["select"]
+    (
+        customer, month_col, total, running, rank_col, extracted, peak,
+        *constants, _scalar, translated, distance, link_host, placed_date,
+    ) = payload["select"]
     assert [item["literal"] for item in constants] == [
         {"value": "1"}, {"value": 1}, {"value": "x"}, {"value": None},
     ]
@@ -1014,6 +1041,33 @@ def test_payload_maps_the_canonical_document():
     assert peak["subquery"]["select"][0]["aggregate"] == {"fn": "max", "arg": "amount"}
     assert peak["alias"] == "peak_amount"
 
+    # The extended catalog calls ride the same `scalar` node: fn plus args.
+    assert translated["scalar"] == {
+        "fn": "translate",
+        "args": [
+            {"column": "sku"},
+            {"literal": {"value": "S"}},
+            {"literal": {"value": "X"}},
+        ],
+    }
+    assert translated["alias"] == "translated_sku"
+    assert distance["scalar"] == {
+        "fn": "levenshtein",
+        "args": [{"column": "sku"}, {"literal": {"value": "SKU-001"}}],
+    }
+    assert link_host["scalar"] == {
+        "fn": "url_host",
+        "args": [{"literal": {"value": "https://acme.test/p"}}],
+    }
+    assert placed_date["scalar"] == {
+        "fn": "as_date",
+        "args": [
+            {"fn": "string", "args": [{"column": "placed_at"}]},
+            {"literal": {"value": "%Y-%m-%d"}},
+        ],
+    }
+    assert placed_date["alias"] == "placed_date"
+
     # The lateral join carries its body and its correlation, left as written.
     lateral = payload["joins"][0]
     assert lateral["lateral"] is True
@@ -1034,7 +1088,38 @@ def test_payload_maps_the_canonical_document():
                 "setOps": [],
                 "select": [],
                 "distinct": False,
-                "where": {"column": "status", "op": "=", "value": "paid", "subquery": None},
+                "where": {
+                    "column": "",
+                    "op": "",
+                    "value": "",
+                    "subquery": None,
+                    "group": {
+                        "column": "status",
+                        "op": "=",
+                        "value": "paid",
+                        "subquery": None,
+                        "ands": [
+                            {
+                                "column": "amount",
+                                "op": "between",
+                                "value": "",
+                                "subquery": None,
+                                "low": "1",
+                                "high": "999.5",
+                            }
+                        ],
+                    },
+                    "ors": [
+                        [
+                            {
+                                "column": "sku",
+                                "op": "is null",
+                                "value": "",
+                                "subquery": None,
+                            }
+                        ]
+                    ],
+                },
                 "groupBy": [],
                 "orderBy": [],
                 "temp": None,

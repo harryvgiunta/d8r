@@ -266,3 +266,56 @@ def test_an_unknown_order_target_in_the_body_is_refused(con):
     )
     with pytest.raises(expression.PayloadError, match="unknown order target in the lateral body"):
         expression.build(con, payload)
+
+
+def test_a_correlation_hidden_in_a_group_is_refused(con):
+    payload = payload_from_ast(
+        parse_query(
+            "\\from users u\n"
+            "\\join lateral (\\from events e \\where (e.user_id = u.user_id or e.amount > 5)) as recent\n"
+            "\\limit 2"
+        )
+    )
+    with pytest.raises(expression.PayloadError, match="cannot correlate through a"):
+        expression.build(con, payload)
+
+
+def test_a_second_outer_reference_is_named_not_crashed(con):
+    payload = payload_from_ast(
+        parse_query(
+            "\\from users u\n"
+            "\\join lateral (\\from events e \\where e.user_id = u.user_id"
+            " and e.amount > u.user_id) as recent\n"
+            "\\limit 2"
+        )
+    )
+    with pytest.raises(expression.PayloadError, match="may not read an outer column"):
+        expression.build(con, payload)
+
+
+def test_a_group_in_the_residual_ride_along_the_hoist(con):
+    # The hoistable equality stands ungrouped; the `( ... )` filter stays the
+    # body's own — the same rows as pandas' per-user top event.
+    result = rows(
+        "\\from users u\n"
+        "\\join lateral (\\from events e \\where (e.event_type = 'click' or e.amount > 5)"
+        " and e.user_id = u.user_id \\order amount desc \\limit 1) as recent\n"
+        "\\select u.user_id\n\\select recent.amount\n\\order u.user_id",
+        con,
+    )
+    events = events_frame(con)
+    users = con.table("users").execute()
+    picked = (
+        events[
+            (events["event_type"] == "click") | (events["amount"] > 5)
+        ]
+        .sort_values("amount", ascending=False)
+        .groupby("user_id")
+        .head(1)
+    )
+    want = sorted(
+        (int(r.user_id), float(r.amount))
+        for r in picked.itertuples()
+        if int(r.user_id) in set(int(u) for u in users["user_id"])
+    )
+    assert sorted((int(a), float(b)) for a, b in result["rows"]) == want

@@ -10,8 +10,8 @@ D8R is a real application, not a mockup. It is a pure-Python
 short `\command` language, that document is parsed into an AST, the AST builds a
 real [ibis](https://ibis-project.org) expression, and the rows you see come from
 real query execution on an in-process DuckDB — or, if you add one, on your own
-Cloudflare D1 database. There is no server to start, no browser, and no port to
-open. `uv run d8r` is the whole app.
+Cloudflare D1 or PostgreSQL database. D8R itself starts no server and needs no
+browser. `uv run d8r` is the whole app; a PostgreSQL source needs a reachable database.
 
 ## The model
 
@@ -74,9 +74,10 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 
 - **Header** — the datasource picker, the dialect picker, and a pill naming the
   backend actually in use (`duckdb`, `postgres (mock)`, `sqlite (D1 snapshot)`,
-  `sqlite (Cloudflare D1)`). Switching either picker re-points the whole app:
+  `sqlite (Cloudflare D1)`, `postgres (live)`). Switching either picker re-points the whole app:
   the tree, the parser's schema seam, and the palette's offers.
-- **Schema pane** — the active source's datasets with their row counts. Expand a
+- **Schema pane** — the active source's datasets with their row counts (PostgreSQL
+  counts are not loaded, avoiding full-table scans during connection). Expand a
   dataset to load its columns (name + dtype) and select one to insert its name
   into the document.
 - **Document pane** — the editor (line numbers on), with the `\` palette
@@ -436,7 +437,12 @@ You can also project constants or return an argument directly in the body:
 Single- and double-quoted values stay strings, even when they look numeric;
 unquoted numbers, `true`, `false`, and `null` retain their scalar types.
 
-## Datasources and dialects
+## Datasources, dialects, and function compatibility
+
+The per-dialect and per-backend function matrix — which catalog calls each
+compile target can render and each live source can run — is documented in
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) (with the sectors and the
+function catalog). It is regenerated from `probe_functions.py`.
 
 The bundled registry (all local, all deterministic):
 
@@ -455,10 +461,66 @@ is no network behind them and no credentials. They exist to exercise the seam a
 real connection would use — and, together with the dialect picker, to make the
 point of the product: write one document, then read it back as any vendor's SQL.
 
+## Add a PostgreSQL database
+
+Press `ctrl+o` (or Settings → **Data source** → **Add data source**), then choose
+**PostgreSQL** in **Backend**. Enter host, port, database, user, masked password,
+schema (default `public`), and TLS/SSL mode. This is a **real Ibis PostgreSQL
+connection**, not the bundled PostgreSQL mock. Tables and views in the selected
+schema populate the explorer; connect separately to use another schema. Empty
+schemas work, and connection discovery does not count all rows or install extensions.
+
+Use **Test connection** before **Add**. Only Add saves the profile and password
+in local `memory.json`; Test and Cancel save nothing. Password whitespace is
+preserved. Saved profiles appear as disconnected after restart and reconnect only
+when explicitly selected. Changing the SQL dialect affects rendering, not the
+database on which Run executes.
+
+For production, use a least-privileged read-only role and the TLS mode required by
+your provider. `verify-full` validates certificates and hostnames using libpq's
+certificate configuration; the default `prefer` allows an unencrypted connection.
+Queries use Ibis expressions. Transactions, savepoints and session-local temp
+tables use the same connection; temporary DDL cannot target persistent tables.
+
+### Local PostgreSQL with Docker
+
+`compose.yaml` runs PostgreSQL 17.9 on **127.0.0.1:55433**, with database/user
+**d8r**, a health check, and a named volume. It does not replace other containers
+or expose the database on your LAN. Put a strong development password in the
+gitignored `.env.postgres` as `D8R_POSTGRES_PASSWORD=...`; never commit that file.
+
+```sh
+docker compose --env-file .env.postgres up -d --wait postgres
+docker compose --env-file .env.postgres stop postgres
+```
+
+Stop preserves the volume. The password initializes a new volume only; changing
+the environment file does not rotate an existing database password. For the
+connection form, use host `127.0.0.1`, port `55433`, database/user `d8r`, schema
+`public`, and SSL mode `prefer` for this local development container.
+
+Ibis's own [Compose services](https://github.com/ibis-project/ibis/blob/main/compose.yaml)
+use per-backend images and readiness checks. Its
+[PostgreSQL image](https://github.com/ibis-project/ibis/blob/main/docker/postgres/Dockerfile)
+also installs spatial/vector extensions for its broader test matrix; this app's
+container uses stock PostgreSQL. Its
+[pytest backend fixture](https://github.com/ibis-project/ibis/blob/main/ibis/backends/postgres/tests/conftest.py)
+connects through Ibis with environment-supplied connection parameters.
+
+The normal D8R test suite is offline. To exercise PostgreSQL integration tests,
+set `D8R_TEST_POSTGRES=1` and `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
+`PGPASSWORD` before `uv run pytest -q`. Against the local container above that
+is `PGHOST=127.0.0.1 PGPORT=55433 PGDATABASE=d8r PGUSER=d8r`, with `PGPASSWORD`
+from `.env.postgres`. Use a **disposable test database**: these tests create and
+remove uniquely named schemas. `tests/test_backend_matrix.py` then runs every
+parity document on DuckDB/Parquet, the SQLite snapshot, **and** live
+PostgreSQL, asserting identical rows; without the gate it runs the two local
+backends only.
+
 ## Add a Cloudflare D1 database
 
 Press `ctrl+o`, or open Settings (`ctrl+comma`) → **Data source** →
-**Add Cloudflare D1** at the top of the center panel.
+**Add data source**, then choose **Cloudflare D1 / local SQLite snapshot**.
 
 1. In the [Cloudflare dashboard](https://dash.cloudflare.com/), select your
    account and copy its **Account ID**.
@@ -523,12 +585,12 @@ An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 | File | Saved contents |
 | --- | --- |
 | `settings.json` | Intellisense, pane visibility, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout |
-| `memory.json` | Custom functions and D1 profiles: account ID, resolved database UUID, display name, API token |
+| `memory.json` | Custom functions; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
 | `workspace.json` | Document/caret and stable target identity, last view, function draft, query history, completed AI conversations/composer drafts, source references and snapshot paths |
 
 These files are versioned, editable JSON. Toggle preferences save immediately;
 the provider and default-row forms require **Save**. Import only fills the
-provider form, and Cancel discards it. D1 credentials save on **Add** or after
+provider form, and Cancel discards it. D1/PostgreSQL credentials save on **Add** or after
 edited fields are submitted with **Connect**; function definitions persist on
 **Save**/**Run preview** or Delete. Workspace drafts and histories autosave
 independently. Loading never connects, executes, or saves a function definition.

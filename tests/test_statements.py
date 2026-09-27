@@ -336,10 +336,19 @@ def test_capabilities_say_what_each_source_can_do():
     assert demo["temp"] is True and demo["transactions"] is True
     assert demo["savepoints"] is False  # DuckDB keeps whole transactions only
     assert demo["subquery"] and demo["lateral"] and demo["frame"] and demo["regex"]
+    # The probed operation surface is duckdb truth on a real connection.
+    assert all(demo[k] for k in ("ilike", "quantile", "asofJoin", "sampling", "samplingSeed", "unnest"))
     assert capabilities_for(live_source())["supports"] == {
         **demo,
         "savepoints": False,
         "temp": False,
         "transactions": False,
         "regex": False,  # `~`/`!~` compile to `_IBIS_REGEX_SEARCH`; D1 has no UDFs
+        # D1 runs SQLite SQL over HTTP: no quantile rule, no as-of join, no
+        # seeded sample, no native unnest. `ilike` (LOWER … LIKE) and unseeded
+        # sampling (WHERE random() <= f) are pure SQL and stay.
+        "quantile": False,
+        "asofJoin": False,
+        "samplingSeed": False,
+        "unnest": False,
     }

@@ -177,7 +177,7 @@ class SettingsScreen(ModalScreen[None]):
         if self.menu == "keys":
             return binding_rows()
         if self.menu == "sources":
-            return [Row("Add Cloudflare D1", "new live connection or local snapshot", "add-source")] + [
+            return [Row("Add data source", "PostgreSQL, Cloudflare D1 or local SQLite snapshot", "add-source")] + [
                 Row(
                     label,
                     "active" if source_id == self.session.active_id else

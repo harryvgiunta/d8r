@@ -28,9 +28,15 @@ AGGREGATE_FNS = frozenset({"sum", "avg", "count", "min", "max"})
 COMPARISONS = {"=": eq, "!=": ne, ">": gt, ">=": ge, "<": lt, "<=": le}
 # The regex operators: POSIX-style matching (`~`) and its negation (`!~`).
 REGEX_OPS = frozenset({"~", "!~"})
-# The operators whose operand is an inline subquery rather than a literal.
+# The operators whose operand is an inline subquery or a literal list.
 SUBQUERY_OPS = frozenset({"in", "not in"})
-OPERATORS = frozenset(COMPARISONS) | {"like", *REGEX_OPS, *SUBQUERY_OPS}
+# Operators with no operand at all.
+NULL_OPS = frozenset({"is null", "is not null"})
+# The range predicate: `between <low> and <high>`.
+BETWEEN_OPS = frozenset({"between"})
+OPERATORS = frozenset(COMPARISONS) | {
+    "like", "ilike", *REGEX_OPS, *SUBQUERY_OPS, *NULL_OPS, *BETWEEN_OPS,
+}
 
 # Temporal extraction functions: dtype family -> method on the ibis column.
 # A temporal call is a derived grouping column (`year(timestamp)` ->
@@ -151,6 +157,118 @@ def _body_column(right: ir.Table, ref: object, what: str) -> ir.Column:
     raise PayloadError(f"unknown {what}: {ref!r}")
 
 
+def _tree_leaves(where: dict) -> tuple[list[dict], bool]:
+    """Every naming condition of a where-tree, and whether it has a group.
+
+    Descends `( ... )` groups (`group` subtrees) as well as `ands`/`ors`.
+    A group node itself names no column — its head is empty — so it is not
+    a leaf; only the conditions inside are. Iterative: nesting is bounded
+    at parse time (`MAX_WHERE_DEPTH`)."""
+    leaves: list[dict] = []
+    grouped = False
+    stack: list[object] = [where]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        inner = node.get("group")
+        if inner is not None:
+            grouped = True
+            stack.append(inner)
+        else:
+            leaves.append(node)
+        for cond in node.get("ands") or []:
+            if isinstance(cond, dict):
+                stack.append(cond)
+        for grp in node.get("ors") or []:
+            if isinstance(grp, list):
+                stack.extend(item for item in grp if isinstance(item, dict))
+            elif isinstance(grp, dict):
+                stack.append(grp)
+    return leaves, grouped
+
+
+def _tree_correlates(where: dict, frames: list[tuple[str, ir.Table]]) -> bool:
+    """True when any condition of a (possibly composed, possibly grouped)
+    `\\where` reads an outer column — group contents included."""
+    leaves, _ = _tree_leaves(where)
+    return any(
+        _outer_ref(leaf.get("column"), frames) or _outer_ref(leaf.get("value"), frames)
+        for leaf in leaves
+    )
+
+
+def _hoist_correlation(
+    where: dict, frames: list[tuple[str, ir.Table]]
+) -> tuple[object, object, dict | None]:
+    """Split a lateral body's `\\where` into its correlation and its remainder.
+
+    An `and` chain may carry the correlating equality anywhere in the chain:
+    that one leaf leaves the body and becomes the join's own equality; the
+    rest stays the body's filter. An equality hoisted out of an `or` would
+    change the body's meaning, so a body that correlates through `or` is
+    refused outright, never approximated — and the same holds for a `( ... )`
+    group, whose correlation ibis could not see through to the join.
+    """
+    if where.get("ors") and _tree_correlates(where, frames):
+        raise PayloadError(
+            "a lateral body correlates through `= <outer column>` joined by `and`, "
+            "never through `or`"
+        )
+    _, grouped = _tree_leaves(where)
+    leaves = [where, *(where.get("ands") or [])]
+    found = next(
+        (
+            index
+            for index, leaf in enumerate(leaves)
+            if isinstance(leaf, dict)
+            and (_outer_ref(leaf.get("column"), frames) or _outer_ref(leaf.get("value"), frames))
+        ),
+        None,
+    )
+    if found is None:
+        if grouped and _tree_correlates(where, frames):
+            raise PayloadError(
+                "a lateral body cannot correlate through a `( ... )` group — "
+                "write the `= <outer column>` equality ungrouped"
+            )
+        return None, None, where
+    leaf = leaves[found]
+    column, value, op = leaf.get("column"), leaf.get("value"), leaf.get("op")
+    if op != "=" or _outer_ref(column, frames) == _outer_ref(value, frames):
+        raise PayloadError(
+            "a lateral body correlates through `= <outer column>` in its \\where: "
+            f"{column} {op} {value}"
+        )
+    left_ref, right_ref = (column, value) if _outer_ref(column, frames) else (value, column)
+    ands = [item for item in (where.get("ands") or []) if isinstance(item, dict)]
+    if found == 0:
+        if not ands:
+            residual = None
+        else:
+            residual = dict(ands[0])
+            if ands[1:]:
+                residual["ands"] = ands[1:]
+            else:
+                residual.pop("ands", None)
+    else:
+        residual = dict(where)
+        rest = [item for index, item in enumerate(ands) if index != found - 1]
+        if rest:
+            residual["ands"] = rest
+        else:
+            residual.pop("ands", None)
+    if residual is not None and _tree_correlates(residual, frames):
+        # A second outer-reading condition — inside a group or further along
+        # the `and` chain — cannot ride the join; ibis would fail on it with
+        # a column error. Name the mistake instead of crashing on it.
+        raise PayloadError(
+            "a lateral body correlates through one `= <outer column>` equality "
+            "joined by `and`; the rest may not read an outer column"
+        )
+    return left_ref, right_ref, residual
+
+
 def _lateral_parts(
     con,
     spec: dict,
@@ -175,25 +293,20 @@ def _lateral_parts(
         raise PayloadError("a lateral join needs a `( … )` body")
     where = body.get("where")
     left_ref = right_ref = None
-    if isinstance(where, dict) and (
-        _outer_ref(where.get("column"), frames) or _outer_ref(where.get("value"), frames)
-    ):
-        column, value, op = where.get("column"), where.get("value"), where.get("op")
-        if op != "=" or _outer_ref(column, frames) == _outer_ref(value, frames):
-            raise PayloadError(
-                "a lateral body correlates through `= <outer column>` in its \\where: "
-                f"{column} {op} {value}"
-            )
-        left_ref, right_ref = (column, value) if _outer_ref(column, frames) else (value, column)
+    residual_where: dict | None = where if isinstance(where, dict) else None
+    if isinstance(where, dict):
+        left_ref, right_ref, residual_where = _hoist_correlation(where, frames)
     # The correlated equality is not a filter of the body; the join carries it.
-    leaves = {"where"} if left_ref is not None else set()
+    rest = {k: v for k, v in body.items() if k != "where"}
+    if residual_where is not None:
+        rest["where"] = residual_where
     on_left, on_right = spec.get("left"), spec.get("right")
     keys = [ref for ref in (left_ref, on_left) if isinstance(ref, str) and ref]
     cap = body.get("limit")
     order_specs = body.get("orderBy") or []
     if cap is None or not keys:
         # An uncorrelated `( … )` body keeps its own global `\limit` and `\order`.
-        right = build(con, {k: v for k, v in body.items() if k not in leaves}, ctes, tables)
+        right = build(con, rest, ctes, tables)
         order_specs, cap = [], None
     else:
         # A per-left-row cap: the ordering has to be named to be counted from.
@@ -203,7 +316,7 @@ def _lateral_parts(
             )
         right = build(
             con,
-            {k: v for k, v in body.items() if k not in leaves | {"limit", "orderBy"}},
+            {k: v for k, v in rest.items() if k not in {"limit", "orderBy"}},
             ctes,
             tables,
         )
@@ -370,18 +483,38 @@ def _aggregate(
 
 
 def _predicate(frames: list[tuple[str, ir.Table]], condition: dict) -> ir.BooleanValue:
-    """Boolean predicate from a `{column, op, value}` condition (shared by
-    `where` and case `when` branches)."""
+    """Boolean predicate from a condition object (shared by `where` and case
+    `when` branches).
+
+    The base shape is `{column, op, value}`; `between` carries `low`/`high`,
+    an `in`/`not in` literal list carries `values`, and `is [not] null` carries
+    neither. A `{subquery}` operand is handled one level up (`_apply_filter`),
+    never inside a `\\case` branch.
+    """
     column = col(frames, condition.get("column"))
     op = condition.get("op")
     value = condition.get("value")
-    if op == "like":
+    if op in NULL_OPS:
+        return column.isnull() if op == "is null" else column.notnull()
+    if op in BETWEEN_OPS:
+        low = _coerce(condition.get("low"), column.type())
+        high = _coerce(condition.get("high"), column.type())
+        return column.between(low, high)
+    if op in SUBQUERY_OPS:
+        values = condition.get("values")
+        if not isinstance(values, list):
+            raise PayloadError(f"`{op}` needs a list of values or a subquery")
+        coerced = [None if v is None else _coerce(v, column.type()) for v in values]
+        return column.isin(coerced) if op == "in" else column.notin(coerced)
+    if op in ("like", "ilike"):
         if not isinstance(column, ir.StringValue):
             raise PayloadError(
-                f"`like` needs a string column: {column.get_name()!r} is {column.type()}"
+                f"`{op}` needs a string column: {column.get_name()!r} is {column.type()}"
             )
-        substring = str(value).strip("%")
-        return column.contains(substring)
+        # SQL's own pattern match: `%`/`_` are wildcards and the operand is
+        # passed through untouched — no `%` stripping, no containment.
+        pattern = str(value)
+        return column.ilike(pattern) if op == "ilike" else column.like(pattern)
     if op in REGEX_OPS:
         return _regex_match(column, op, value)
     compare = COMPARISONS.get(op)
@@ -413,25 +546,85 @@ def _apply_filter(
     ctes: dict[str, ir.Table] | None,
     tables: dict[str, ir.Table] | None,
 ) -> ir.Table:
-    """A `\\where` clause: a literal predicate, or one over an inline subquery."""
+    """A `\\where` clause: a literal predicate, a predicate tree, or one over
+    an inline subquery.
+
+    A single plain condition filters exactly as it always did; composition
+    (`ands`/`ors`, and `( ... )` groups under `group`) reduces through
+    `_where_expr`."""
     if not isinstance(condition, dict):
         raise PayloadError("where must be an object")
-    subquery = condition.get("subquery")
-    if subquery is not None:
-        return _apply_subquery_filter(con, expr, frames, condition, subquery, ctes, tables)
-    return expr.filter(_predicate(frames, condition))
+    return expr.filter(_where_expr(con, frames, condition, ctes, tables))
 
 
-def _apply_subquery_filter(
+def _head(group: object) -> dict:
+    """An or-group's `[first, *ands]` list as one and-group dict."""
+    if not isinstance(group, list) or not group or not isinstance(group[0], dict):
+        raise PayloadError("where or-groups must be non-empty arrays of conditions")
+    return {**group[0], "ands": group[1:]}
+
+
+def _where_expr(
     con,
-    expr: ir.Table,
+    frames: list[tuple[str, ir.Table]],
+    condition: dict,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> object:
+    """A where-tree dict (a clause or a group) as a boolean expression.
+
+    Same shape `_apply_filter` reads at the top level: the head's and-group
+    ANDed, then `ors` ORed over it. A group node recurses through its own
+    `group` subtree — parens are just a where-tree in a box."""
+    if not isinstance(condition, dict):
+        raise PayloadError("where conditions must be objects")
+    ors = condition.get("ors")
+    if ors is not None:
+        if not isinstance(ors, list) or not ors:
+            raise PayloadError("where or-groups must be a non-empty array")
+        groups = [condition, *(_head(group) for group in ors)]
+        return functools.reduce(
+            operator.or_,
+            [_condition_tree(con, frames, group, ctes, tables) for group in groups],
+        )
+    return _condition_tree(con, frames, condition, ctes, tables)
+
+
+def _condition_tree(
+    con,
+    frames: list[tuple[str, ir.Table]],
+    condition: dict,
+    ctes: dict[str, ir.Table] | None,
+    tables: dict[str, ir.Table] | None,
+) -> object:
+    """One and-group as a boolean expression; its leaves AND together.
+
+    Each leaf is a plain predicate, a subquery comparison — a subquery
+    inside composition is still a filter leaf, never a second relation —
+    or a parenthesized group, whose own tree hangs under `group`."""
+    leaves: list[object] = []
+    for cond in [condition, *(condition.get("ands") or [])]:
+        if not isinstance(cond, dict):
+            raise PayloadError("where conditions must be objects")
+        group = cond.get("group")
+        if group is not None:
+            leaves.append(_where_expr(con, frames, group, ctes, tables))
+        elif cond.get("subquery") is not None:
+            leaves.append(_subquery_predicate(con, frames, cond, cond["subquery"], ctes, tables))
+        else:
+            leaves.append(_predicate(frames, cond))
+    return leaves[0] if len(leaves) == 1 else functools.reduce(operator.and_, leaves)
+
+
+def _subquery_predicate(
+    con,
     frames: list[tuple[str, ir.Table]],
     condition: dict,
     subquery: object,
     ctes: dict[str, ir.Table] | None,
     tables: dict[str, ir.Table] | None,
-) -> ir.Table:
-    """A `\\where` over an inline `( … )` subquery.
+) -> object:
+    """A predicate over an inline `( … )` subquery operand.
 
     `in`/`not in` take the subquery's single column as the set; a comparison
     takes it as a scalar subquery (`\\where amount > ( … )`), which needs exactly
@@ -450,11 +643,11 @@ def _apply_subquery_filter(
         )
     inner = sub[projected[0]]
     if op in SUBQUERY_OPS:
-        return expr.filter(column.isin(inner) if op == "in" else column.notin(inner))
+        return column.isin(inner) if op == "in" else column.notin(inner)
     compare = COMPARISONS.get(op)
     if compare is None:
         raise PayloadError(f"unknown operator: {op!r}")
-    return expr.filter(compare(column, inner.as_scalar()))
+    return compare(column, inner.as_scalar())
 
 
 def _literal(value: object) -> ir.Value:
@@ -744,6 +937,10 @@ def _scalar_call(frames: list[tuple[str, ir.Table]], spec: object) -> ir.Value:
             return first.concat(*rest)
         if fn == "concat_ws":
             return first.join(rest)
+        if fn.startswith("url_"):
+            # ibis spells the URL accessors bare (`s.host()`); the catalog
+            # keeps the qualified name so completion never shadows `path`-style words.
+            return getattr(first, fn.removeprefix("url_"))()
         return getattr(first, fn)(*rest)
     except (IbisError, TypeError, ValueError, OverflowError) as exc:
         raise PayloadError(f"invalid {fn} arguments: {exc}") from exc

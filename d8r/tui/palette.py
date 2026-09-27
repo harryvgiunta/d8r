@@ -38,6 +38,7 @@ from textual.widgets.option_list import Option
 
 from d8r.query import (
     AGGREGATES,
+    NULL_OPS,
     REGEX_OPS,
     SUBQUERY_OPS,
     TEMPORAL,
@@ -46,6 +47,9 @@ from d8r.query import (
     dtype_family,
     is_identifier,
     param_spans,
+    split_logic,
+    take_paren,
+    where_head,
 )
 from d8r.query.functions import SCALAR_FUNCTIONS, ArgumentKind
 
@@ -82,7 +86,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Run", "ctrl+enter · execute the document", "run"),
     ("Compile", "ctrl+k · render SQL without running", "compile"),
-    ("Data source…", "ctrl+o · add a D1 database", "add-source"),
+    ("Data source…", "ctrl+o · add PostgreSQL, D1 or SQLite", "add-source"),
     ("Functions…", "\\fn · open or create a table-valued function", "fn"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected or buffered rows as CSV", "export-results"),
@@ -121,7 +125,16 @@ CLAUSE_NAMES = frozenset(name for name, _ in COMMANDS)
 FN_COMMAND = "fn"
 
 # Fallback comparison operators; the live capability set is preferred.
-DEFAULT_OPERATORS: tuple[str, ...] = ("=", "!=", ">", ">=", "<", "<=", "like")
+DEFAULT_OPERATORS: tuple[str, ...] = (
+    "=", "!=", ">", ">=", "<", "<=", "like", "ilike", "in", "not in",
+    "between", "is null", "is not null",
+)
+
+# The words that join two conditions; `between`'s own `and` is not one of them
+# (the parser's `split_logic` masks it), so a bound never reads as a joiner.
+_JOINERS: tuple[str, ...] = ("and", "or")
+_COL_PATTER = re.compile(rf"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_NUMBER_RE = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)$")
 
 # How many value rows the popup shows; the search still reads the whole pool.
 VALUE_SUGGESTIONS = 50
@@ -302,6 +315,22 @@ def _word(rest: str) -> tuple[str, int]:
         return "", len(rest)
     token = rest.split()[-1]
     return token, rest.rfind(token)
+
+
+def _group_token(rest: str, token: str, offset: int) -> tuple[str, int]:
+    """The `\where` token with group parens peeled off its ends.
+
+    Parens are grammar, not filter text: an opening `(` must not filter the
+    column offers it sits before, and a closing `)` ends the *previous*
+    condition, so after it nothing is being typed — the state machine reads
+    the closed group from `before` and offers the joiners.
+    """
+    while token.startswith("("):
+        token = token[1:]
+        offset += 1
+    if token.endswith(")"):
+        return "", len(rest)
+    return token, offset
 
 
 def _column_offers(session: Session, doc: str, token: str, schema: SchemaContext) -> list[Entry]:
@@ -524,6 +553,8 @@ def view_for(
     arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where", "drop"}
     if command in arguments:
         token, offset = _word(rest)
+        if command == "where":
+            token, offset = _group_token(rest, token, offset)
     elif command == "select":
         position = _expression_position(rest)
         if position is None:
@@ -569,36 +600,116 @@ def view_for(
     elif command in COLUMN_COMMANDS:
         entries = _column_offers(session, doc, token, schema)
     elif command == "where":
-        entries = _where_entries(session, doc, rest[:offset].split(), token, schema)
+        entries = _where_entries(session, doc, rest[:offset], token, schema)
     else:
         return None
     return View(start=start, token=token, entries=entries, phase="argument") if entries else None
 
 
 def _where_entries(
-    session: Session, doc: str, head: list[str], token: str, schema: SchemaContext,
+    session: Session, doc: str, before: str, token: str, schema: SchemaContext,
 ) -> list[Entry]:
-    """`\\where` offers a column, then an operator, then that column's values.
+    """`\\where` completion over a condition tree of `and`/`or`.
 
-    Operators whose operand is not one of the column's values — a regex pattern,
-    a subquery — offer nothing after them: the pattern and the `( … )` are typed.
+    The raw text before the caret is read as far as it goes, masking quotes,
+    parens, and `between`'s own `and` (the same `split_logic` the parser uses,
+    so a bound never reads as a joiner). Each state offers the next thing the
+    grammar wants: a column after a joiner or at the start; operators after a
+    column; then the operator's operand — values for `=`/`like`/`between`
+    bounds, nothing typed for a regex pattern, an `in`-list, or a subquery —
+    and `and`/`or` after a complete condition.
     """
-    if len(head) >= 2 and head[1].lower() in operators(schema):
-        if head[1].lower() in REGEX_OPS | SUBQUERY_OPS:
-            return []
-        value_so_far = " ".join(head[2:])
-        if value_so_far and value_so_far.count('"') % 2 == 0:
-            # `\where event_type = "purchase" |` is done: a `\where` carries one
-            # value (a later one replaces it), so nothing follows a closed one —
-            # and a stray Enter cannot append a second value to the clause.
-            return []
-        return _value_entries(session, doc, head[0].split(".")[-1], token, schema)
-    if len(head) == 1:
-        rows = [(0, op, "operator", f"{op} ") for op in operators(schema)]
+    ops = operators(schema)
+    last_or = split_logic(before, "or")[-1]
+    piece = split_logic(last_or, "and")[-1]
+    # Inside a `( ... )` group the machine reads on inside the parens: peel
+    # them and re-split, so `(a or b` offers columns where `b` is being typed
+    # and a closed `(a = 1)` offers the joiners, exactly as the parser's
+    # `_where_tree` descends.
+    core = piece.strip()
+    peeled = False
+    while core.startswith("("):
+        closed = take_paren(core)
+        if closed is None:
+            core = core[1:].strip()
+        else:
+            core = f"{closed[0]} {closed[1]}".strip()
+        peeled = True
+    if peeled:
+        core = split_logic(core, "or")[-1]
+        core = split_logic(core, "and")[-1]
+        piece = core
+    words = piece.split()
+    if not words:
+        # Either nothing is typed yet, or a joining `and`/`or` just landed
+        # (its keyword is the only reason the last piece is blank): the next
+        # thing a condition wants is a column.
+        return _column_offers(session, doc, token, schema)
+    head = where_head(piece.strip())
+    if head is None:
+        if len(words) == 1 and _COL_PATTER.match(words[0]):
+            return _offers([(0, op, "operator", f"{op} ") for op in ops], token)
+        # A column plus partial operator words (`amount is`, `amount n`): the
+        # multi-word operators those words begin, offered as the remainder of
+        # the operator so accepting it completes the phrase in place.
+        typed = " ".join(piece.split()[1:]).lower()
+        rows = [
+            (0, op, "operator", f"{op[len(typed):].lstrip()} ")
+            for op in ops
+            if op.lower().startswith(typed) and op.lower() != typed
+        ]
         return _offers(rows, token)
-    if head:
-        return []
-    return _column_offers(session, doc, token, schema)
+    column, op, tail = head
+    col = column.split(".")[-1]
+    if op in NULL_OPS:
+        # `is [not] null` needs no operand: the condition is complete.
+        return _joiners(token)
+    if op == "between":
+        return _between_entries(session, doc, col, tail, token, schema)
+    if op in REGEX_OPS:
+        # A regex pattern is typed, never offered from the value pool.
+        return _joiners(token) if tail and _closed_operand(tail) else []
+    if op in SUBQUERY_OPS:
+        # An `in` takes a `( … )` — a list or a subquery — which is typed.
+        return _joiners(token) if tail.endswith(")") else []
+    if not tail:
+        return _value_entries(session, doc, col, token, schema)
+    if _closed_operand(tail):
+        return _joiners(token)
+    if tail.startswith('"'):
+        return _value_entries(session, doc, col, token, schema)
+    return []
+
+
+def _joiners(token: str) -> list[Entry]:
+    """`and`/`or`: the rows that follow any complete condition."""
+    return _offers(
+        [(0, joiner, "join conditions", f"{joiner} ") for joiner in _JOINERS],
+        token,
+    )
+
+
+def _between_entries(
+    session: Session, doc: str, col: str, tail: str, token: str, schema: SchemaContext,
+) -> list[Entry]:
+    """`between`'s low, its `and`, then its high — each an offer in turn."""
+    bounds = [bound.strip() for bound in split_logic(tail, "and")]
+    if len(bounds) == 1:
+        if not bounds[0] or not _closed_operand(bounds[0]):
+            return _value_entries(session, doc, col, token, schema)
+        return _offers([(0, "and", "between's high bound", "and ")], token)
+    high = bounds[1]
+    if not high or not _closed_operand(high):
+        return _value_entries(session, doc, col, token, schema)
+    return _joiners(token)
+
+
+def _closed_operand(text: str) -> bool:
+    """True when an operand is finished: a complete number or a closed quote."""
+    if _NUMBER_RE.match(text):
+        return True
+    return len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0]
+
 
 
 class CommandPalette(OptionList):

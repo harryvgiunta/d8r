@@ -95,15 +95,44 @@ def test_a_parenthesized_literal_stays_a_value():
     assert ast.where.value == "(3)"
 
     # An operator that takes text keeps its operand as written, however it looks.
-    ast = parse_query("\\from events\n\\where path like (\\from users \\select user_id)\n\\limit 2")
+    for op in ("like", "ilike", "~"):
+        ast = parse_query(f"\\from events\n\\where path {op} (\\from users \\select user_id)\n\\limit 2")
+        assert ast.errors == [], op
+        assert ast.where.subquery is None
+        assert ast.where.value == "(\\from users \\select user_id)"
+
+
+def test_in_takes_a_literal_list_or_a_subquery():
+    ast = parse_query("\\from events\n\\where user_id in (3, 4)\n\\limit 2")
     assert ast.errors == []
     assert ast.where.subquery is None
-    assert ast.where.value == "(\\from users \\select user_id)"
+    assert ast.where.values == ["3", "4"]
+
+    # `not in` takes the same list; `null` inside it is the SQL keyword.
+    ast = parse_query("\\from events\n\\where user_id not in (\"a\", null)\n\\limit 2")
+    assert ast.errors == []
+    assert ast.where.values == ["a", None]
+
+    # A parenthesized operand with no command and no commas is still a list of one.
+    ast = parse_query("\\from events\n\\where user_id in (3)\n\\limit 2")
+    assert ast.errors == []
+    assert ast.where.values == ["3"]
 
 
-def test_in_without_a_subquery_says_so():
-    ast = parse_query("\\from events\n\\where user_id in (3, 4)\n\\limit 2")
-    assert messages(ast) == ["`in` expects an inline subquery — write ( \\from … )"]
+def test_an_unfinished_or_empty_in_list_says_so():
+    assert messages(parse_query("\\from events\n\\where user_id in (3, 4\n\\limit 2")) == [
+        "`in` list is unfinished — close it with )"
+    ]
+    assert messages(parse_query("\\from events\n\\where user_id in ()\n\\limit 2")) == [
+        "`in` expects at least one value"
+    ]
+    assert messages(parse_query("\\from events\n\\where user_id in (3, )\n\\limit 2")) == [
+        "`in` expects a value after each comma"
+    ]
+    # Not a list and not a subquery at all: the operand is no parenthesized shape.
+    assert messages(parse_query("\\from events\n\\where user_id in 3\n\\limit 2")) == [
+        "`in` expects a list (a, b) or an inline subquery — write ( \\from … )"
+    ]
 
 
 def test_a_scalar_subquery_needs_exactly_one_column_and_an_alias():

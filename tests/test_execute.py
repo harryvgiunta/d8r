@@ -46,18 +46,42 @@ def test_purchases_payload_executes(con):
     assert result["event_type"][0] == "purchase"
 
 
-def test_like_operator_strips_percent_and_is_case_sensitive(con):
+def test_like_is_the_sql_pattern_match_and_ilike_ignores_case(con):
+    """`like` hands the pattern to SQL untouched: `%`/`_` are wildcards, no `%`
+    is stripped, and a bare substring matches nothing it was not written to."""
+    def where(value: str, op: str = "like") -> int:
+        payload = {
+            "dataset": "events",
+            "select": [],
+            "where": {"column": "path", "op": op, "value": value},
+            "groupBy": [],
+            "orderBy": [],
+            "limit": None,
+        }
+        return expression.build(con, payload).execute().shape[0]
+
+    assert where("%/P/%") == 0            # case-sensitive: no path has /P/
+    assert where("%/p/1%") == 11          # i % 9 == 1: i=1..91
+    assert where("/p/1%") == 11           # anchored prefix
+    assert where("p/1") == 0              # containment would have matched 11
+    assert where("_p_1") == 11           # `_` matches the leading slash and the middle slash
+    assert where("/p/1_") == 0           # one character too many
+    assert where("%/P/%", "ilike") == 100  # case-insensitive covers every row
+    assert where("p/1", "ilike") == 0
+
     payload = {
         "dataset": "events",
         "select": [],
-        "where": {"column": "path", "op": "like", "value": "%/P/%"},
+        "where": {"column": "path", "op": "like", "value": "/p/1%"},
         "groupBy": [],
         "orderBy": [],
         "limit": None,
     }
-    assert expression.build(con, payload).execute().shape[0] == 0
-    payload["where"]["value"] = "%/p/1%"
-    assert expression.build(con, payload).execute().shape[0] == 11  # i % 9 == 1: i=1..91
+    sql = expression.compile_sql(expression.build(con, payload))
+    assert "LIKE '/p/1%'" in sql          # the pattern verbatim, not `%…%`
+    payload["where"]["op"] = "ilike"
+    sql = expression.compile_sql(expression.build(con, payload))
+    assert "ILIKE" in sql.upper() and "LIKE" in sql.upper()
 
 
 def test_first10_execute_matches_fixture(con):

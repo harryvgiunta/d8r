@@ -3,9 +3,9 @@
 Three seams, no UI:
 
 * `datasources` — the registry (`load`), what it advertises (`capabilities_for`,
-  `DIALECTS`), and the two ways a real database joins it: `add_sqlite_source`
-  for a local D1/SQLite snapshot, `add_d1_live_source` for a live Cloudflare D1
-  reached over its API.
+  `DIALECTS`), and explicit real database connections: `add_sqlite_source`
+  for local D1/SQLite snapshots, `add_d1_live_source` for Cloudflare D1 over
+  its API, and `add_postgres_source` for PostgreSQL through Ibis/psycopg.
 * `expression` — payload -> ibis expression (`build`) and SQL rendering for any
   advertised dialect (`compile_sql`).
 * `execute` — running a payload (`execute`, `execute_remote`, `materialize`)
@@ -32,6 +32,7 @@ from .datasources import (
     MOCKS,
     DataSource,
     add_d1_live_source,
+    add_postgres_source,
     add_sqlite_source,
     capabilities_for,
     column_values,
@@ -69,6 +70,7 @@ __all__ = [
     "DataSource",
     "PayloadError",
     "add_d1_live_source",
+    "add_postgres_source",
     "add_sqlite_source",
     "begin",
     "build",

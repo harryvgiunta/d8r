@@ -34,8 +34,8 @@ Three layers, one direction:
 | Real database connections | DuckDB in-process over the Parquet under `d8r/engine/data/` |
 | An HTTP server or a browser UI | **The TUI is the app.** `uv run d8r`; nothing listens on a port |
 | Authentication | No login, no users, no session identity |
-| Credentials handling | Only the user-authorized D1 and AI-provider keys below; save locally as authorized, never log or echo them unmasked |
-| Persistence | Only custom functions, D1 profiles/tokens, app/AI settings, and the user-authorized workspace/history state below persist; runtime database/results state stays in memory |
+| Credentials handling | Only the user-authorized D1, PostgreSQL and AI-provider credentials below; save locally as authorized, never log or echo them unmasked |
+| Persistence | Only custom functions, saved connection credentials, app/AI settings, and the user-authorized workspace/history state below persist; runtime database/results state stays in memory |
 | Hand-written SQL generation | Compose ibis expressions; render with `ibis.to_sql(expr, dialect=…)` |
 
 If a task seems to require one of these, it is out of scope. Build the *UI
@@ -57,6 +57,22 @@ connection (`execute_remote` in `d8r/engine/execute.py`). The client uses the
 token per request; explicit **Add** saves it locally for reuse. Tokens are never
 logged or rendered unmasked (the modal's API-token input is `password=True`,
 and the built source never renders it). Startup never connects automatically.
+
+**User-authorized exception — PostgreSQL.** The user explicitly requested a real
+PostgreSQL connection and a local Docker database. `kind="postgres-live"` uses
+Ibis's PostgreSQL backend with psycopg, through the existing payload → expression
+→ execute path. The add-source modal accepts host/port/database/user/password,
+schema and SSL mode. It discovers the selected schema's tables/views without
+full row-count scans or extension installation. Test/Cancel save nothing; Add
+saves PostgreSQL profiles and passwords in `memory.json`. Passwords are masked,
+preserved verbatim and never logged. Saved targets restore disconnected; only
+explicit selection reconnects. Transactions/savepoints/temp tables share one
+autocommit connection with explicit transaction ownership; temp DDL/handles are
+qualified to `pg_temp`, never persistent tables. Production roles should be
+least-privileged and use provider-appropriate TLS. `compose.yaml` provisions an
+isolated loopback-only PostgreSQL development service on port 55433 with a named
+volume; its password lives in gitignored `.env.postgres`. This authorizes no
+other database/network backend, server, login system or arbitrary SQL execution.
 
 **User-authorized exception — local configuration.** `d8r/storage.py` stores
 custom functions (name, ordered parameters, body, description) and D1 profiles
@@ -195,8 +211,9 @@ d8r/
                   VALUE_POOL_LIMIT), palette.py (`\` rules, matching, offers),
                   settings.py (the `\settings` menu), fn.py (the `\fn` function
                   library + editor), add_source.py (the
-                  `ctrl+o` modal), app.tcss
-tests/            pytest suite (298: 255 query/engine + 43 TUI) + fixtures/
+                  `ctrl+o` modal), splash.py (the 6-second boot animation),
+                  app.tcss
+tests/            pytest suite (630: 564 query/engine + 66 TUI) + fixtures/
 spec/             canonical-query.d8r ↔ canonical-query.ast.json (the contract)
 docs/AST.md       language contract — read before touching d8r/query/
 verify/           check_canonical.py — the language gate
@@ -216,7 +233,7 @@ command runs in the project's `.venv`.
 ```bash
 uv sync                                      # create/refresh the project environment (.venv)
 uv run d8r                                 # launch the IDE in this terminal
-uv run pytest -q                             # the whole suite (298 tests)
+uv run pytest -q                             # the whole suite (630 tests, 6 skipped)
 uv run python verify/check_canonical.py      # language contract gate → prints MATCH
 uv run python -m d8r.engine.make_data      # regenerate demo Parquet + fixtures
 ```
@@ -227,7 +244,7 @@ group) and locked in `uv.lock` with `uv lock`. A new dependency means editing
 only dependency records, and there is no second requirements file.
 
 ## Verification bar
-- `uv run pytest -q` must pass — 298 tests: the query/engine contract
+- `uv run pytest -q` must pass — 630 tests (624 pass, 6 skipped): the query/engine contract
   (parser regimes, payload mapping, datasources, D1 sources, set operations,
   subqueries, lateral joins, window frames, regex, table-valued functions, temp
   tables and transactions, execute vs fixtures) plus the TUI end to end.

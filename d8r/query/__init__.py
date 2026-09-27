@@ -35,19 +35,24 @@ from .ast import (
     WithClause,
 )
 from .parser import (
+    NULL_OPS,
     REGEX_OPS,
     SUBQUERY_OPS,
     TX_COMMANDS,
     block_extent,
     clause_line,
     is_identifier,
+    logic_positions,
     param_spans,
     parse_body,
     parse_query,
     payload_from_ast,
+    split_logic,
     split_top,
     substitute_params,
+    take_paren,
     unquote,
+    where_head,
 )
 from .schema import (
     AGGREGATES,
@@ -68,6 +73,7 @@ from .schema import (
 
 __all__ = [
     "AGGREGATES",
+    "NULL_OPS",
     "TEMPORAL",
     "AggCall",
     "Capabilities",
@@ -114,8 +120,8 @@ __all__ = [
     "WindowOrder",
     "WithClause",
     "auto_alias",
-    "block_extent",
     "clause_line",
+    "logic_positions",
     "dtype_family",
     "effective_alias",
     "is_identifier",
@@ -124,7 +130,10 @@ __all__ = [
     "parse_body",
     "parse_query",
     "payload_from_ast",
+    "split_logic",
     "split_top",
     "substitute_params",
+    "take_paren",
     "unquote",
+    "where_head",
 ]

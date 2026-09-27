@@ -1,6 +1,6 @@
 \with recent
   \from orders
-  \where status = "paid"
+  \where (status = "paid" and amount between 1 and 999.5) or sku is null
 \begin
 \from recent
 \join lateral (\from spend_log \where campaign_id = recent.campaign_id \order day desc \limit 2) as last_two on recent.campaign_id = last_two.campaign_id
@@ -11,8 +11,8 @@
 \select rank() over (order by placed_at desc) as recency_rank
 \select regexp_extract(sku, "SKU-([0-9]+)", 1) as sku_number
 \select (\from staging \select max(amount)) as peak_amount
-\case flag = when amount > 100 then "high" else "low"
-\where customer_id in (\from customers \select customer_id \where region = "us")
+\case flag = when amount > 100 then "high" when sku ilike "SKU-0%" then "early" when customer_id is null then "missing" else "low"
+\where customer_id in (\from customers \select customer_id \where region = "us") and (event_type in ("purchase", "cli") or user_id is not null)
 \union archived
 \union all (\from events \select customer_id)
 \intersect other
@@ -24,4 +24,5 @@
 \limit 5
 \select '1' as text_one, 1 as number_one, 'x' as marker, null as missing
 \select concat(upper(sku), '-', string(customer_id)) as customer_sku
+\select translate(sku, "S", "X") as translated_sku, levenshtein(sku, "SKU-001") as sku_distance, url_host("https://acme.test/p") as link_host, as_date(string(placed_at), "%Y-%m-%d") as placed_date
 \distinct

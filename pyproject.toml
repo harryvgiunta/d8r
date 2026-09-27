@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "A keyboard-first IDE for querying data through Ibis, in the terminal"
 requires-python = ">=3.13"
 dependencies = [
-    "ibis-framework[duckdb]==12.0.0",
+    "ibis-framework[duckdb,postgres]==12.0.0",
+    "psycopg[binary]==3.3.6",
     "pyarrow==24.0.0",
     "pyarrow-hotfix==0.7",
     "httpx==0.28.1",

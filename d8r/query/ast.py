@@ -212,24 +212,86 @@ class SelectItem:
 
 @dataclass
 class WhereClause:
+    """One `\\where` line: a single condition, or an `or`-of-`and`-groups tree.
+
+    The flat fields carry the FIRST condition (single-condition documents —
+    and the palette/validator — read only these). `ands` holds conditions
+    ANDed to this line; `ors` holds the extra `or`-groups, each group itself
+    a first-condition `[first, *its_ands]`. `or` binds looser than `and`:
+    `a or b and c` is `or[a, and[b, c]]`. New operand shapes: `between`
+    carries `low`/`high`, `in`/`not in` may carry literal `values` instead of
+    a subquery, `is null`/`is not null` carry neither.
+
+    A parenthesized piece is a **group node**: its flat fields are empty and
+    `group` carries the parsed tree inside the parentheses, so the parens'
+    precedence survives the flat or-of-ands shape. `(a or b) and c` is a
+    group node with `ands=[c]`; its leaves are found through `conditions()`.
+    """
     line: int
     raw: str
     column: str
     op: str
     value: str  # Value with surrounding quotes stripped.
-    # Inline `( \\commands )` operand: `in`/`not in` take its single column, a
+    # Inline `( \commands )` operand: `in`/`not in` take its single column, a
     # comparison takes it as a scalar subquery.
     subquery: QueryAST | None = None
+    low: str = ""  # `between` lower bound (quotes stripped).
+    high: str = ""  # `between` upper bound (quotes stripped).
+    values: list[object] | None = None  # `in`/`not in` literal list.
+    ands: list["WhereClause"] = field(default_factory=list)
+    # Extra `or`-groups: each entry is that group's FIRST condition, with its
+    # own `ands`. `or` binds looser than `and`.
+    ors: list["WhereClause"] = field(default_factory=list)
+    # A `( … )` group: the parsed tree inside the parentheses; set only on a
+    # group node, whose own flat fields are then empty.
+    group: "WhereClause | None" = None
 
-    def to_json(self) -> dict:
-        return {
-            "line": self.line,
-            "raw": self.raw,
+    def conditions(self) -> list["WhereClause"]:
+        """Every condition in this line's tree, in document order.
+
+        A group node contributes the conditions inside it — its own empty
+        flat fields name no column — so validation and completion see every
+        leaf wherever nesting put it."""
+        out: list[WhereClause] = list(self.group.conditions()) if self.group else [self]
+        for cond in self.ands:
+            out.extend(cond.conditions())
+        for group in self.ors:
+            out.extend(group.conditions())
+        return out
+
+    def _cond_json(self) -> dict:
+        if self.group is not None:
+            # The same four keys keep every condition dict one shape; the
+            # group's own tree rides under `group` as a full where-tree json
+            # (its `raw` is the parenthesized text as typed).
+            return {
+                "column": "",
+                "op": "",
+                "value": "",
+                "subquery": None,
+                "group": self.group.to_json(),
+            }
+        data = {
             "column": self.column,
             "op": self.op,
             "value": self.value,
             "subquery": self.subquery.to_json() if self.subquery else None,
         }
+        if self.low or self.high:
+            data["low"] = self.low
+            data["high"] = self.high
+        if self.values is not None:
+            data["values"] = list(self.values)
+        return data
+
+
+    def to_json(self) -> dict:
+        data: dict = {"line": self.line, "raw": self.raw, **self._cond_json()}
+        if self.ands:
+            data["ands"] = [c._cond_json() for c in self.ands]
+        if self.ors:
+            data["ors"] = [[c._cond_json() for c in [g, *g.ands]] for g in self.ors]
+        return data
 
 
 @dataclass

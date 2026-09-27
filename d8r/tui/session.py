@@ -8,6 +8,7 @@ transport lives in `d8r.ai`, while database networking stays in the engine.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
@@ -26,6 +27,7 @@ from d8r.engine import (
     DataSource,
     PayloadError,
     add_d1_live_source,
+    add_postgres_source,
     add_sqlite_source,
     begin,
     build,
@@ -263,6 +265,7 @@ class Session:
             for item in self._memory.document["functions"]
         }
         self.d1_profiles: list[dict[str, str]] = self._memory.document["d1_profiles"]
+        self.postgres_profiles: list[dict[str, str]] = self._memory.document["postgres_profiles"]
         self._settings = SettingsStore(self._memory.path.parent)
         settings = self._settings.document
         if settings["source"] in self.sources:
@@ -287,7 +290,7 @@ class Session:
 
     @property
     def storage_path(self) -> Path:
-        """The local JSON file containing functions and saved D1 credentials."""
+        """The local JSON file containing functions and saved database credentials."""
         return self._memory.path
 
     @property
@@ -400,6 +403,8 @@ class Session:
             return f"saved-d1:{source.d1.account_id}:{source.d1.database_uuid.lower()}"
         if source.kind == "d1":
             return f"snapshot:{source.dir.expanduser().resolve()}"
+        if source.kind == "postgres-live":
+            return self._postgres_profile_id(source.postgres)
         return source_id
 
     def source_connected(self, source_id: str | None = None) -> bool:
@@ -420,7 +425,7 @@ class Session:
             source_id = key
             self.sources[key] = DataSource(
                 id=key, display=f"{label} · disconnected", doc="Reconnect explicitly to use this target.",
-                kind="disconnected", dialect=dialect or "sqlite", dir=Path(saved.get("path") or "."),
+                kind="disconnected", dialect=dialect or ("postgres" if key.startswith("saved-postgres:") else "sqlite"), dir=Path(saved.get("path") or "."),
             )
         if activate:
             self.set_active(source_id)
@@ -434,11 +439,12 @@ class Session:
             payload["limit"] = self.default_rows
         return payload
 
-    def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]]) -> None:
+    def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]],
+                     postgres_profiles: list[dict[str, str]] | None = None) -> None:
         self._memory.save([
             {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc}
             for fn in fns.values()
-        ], profiles)
+        ], profiles, self.postgres_profiles if postgres_profiles is None else postgres_profiles)
 
     def remember_d1(
         self, account_id: str, database: str, display: str, api_token: str = "",
@@ -456,6 +462,27 @@ class Session:
         self._save_memory(self.fns, profiles)
         self.d1_profiles = profiles
 
+    def remember_postgres(self, profile: dict[str, str]) -> None:
+        """Save credentials only following explicit Add; failure keeps prior state."""
+        profile = {key: value for key, value in profile.items() if key != "kind"}
+        profile["port"] = str(int(profile["port"]))
+        identity = self._postgres_profile_id(profile)
+        profiles = list(self.postgres_profiles)
+        for index, saved in enumerate(profiles):
+            if self._postgres_profile_id(saved) == identity:
+                profiles[index] = dict(profile)
+                break
+        else:
+            profiles.append(dict(profile))
+        self._save_memory(self.fns, self.d1_profiles, profiles)
+        self.postgres_profiles = profiles
+
+    @staticmethod
+    def _postgres_profile_id(profile: dict[str, str]) -> str:
+        # JSON preserves boundaries in arbitrary database/user/schema identifiers.
+        identity = [profile[key] for key in ("host", "port", "database", "user", "schema", "sslmode")]
+        return "saved-postgres:" + json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+
     # -- the active source --------------------------------------------------
 
     @property
@@ -470,11 +497,15 @@ class Session:
 
     def saved_source_profile(self, source_id: str) -> dict[str, str] | None:
         """Resolve a saved picker entry without connecting or changing schemas."""
+        postgres = next((profile for profile in self.postgres_profiles
+                         if self._postgres_profile_id(profile) == source_id), None)
+        if postgres is not None:
+            return {**postgres, "kind": "postgres-live"}
         return next((profile for profile in self.d1_profiles
                      if self._profile_id(profile) == source_id), None)
 
     def source_options(self) -> list[tuple[str, str]]:
-        """Connected sources plus saved D1 profiles not already connected."""
+        """Connected sources plus saved profiles not already connected."""
         connected = {(source.d1.account_id, source.d1.database_uuid.lower())
                      for source in self.sources.values() if source.d1 is not None}
         registered = {self.source_key(name) for name in self.sources}
@@ -483,6 +514,10 @@ class Session:
             for profile in self.d1_profiles
             if (profile['account_id'], profile['database'].lower()) not in connected
             and self._profile_id(profile) not in self.sources
+        ] + [
+            (f"{profile['display']} · disconnected", self._postgres_profile_id(profile))
+            for profile in self.postgres_profiles
+            if self._postgres_profile_id(profile) not in registered
         ] + [
             (f"{source['display']} · disconnected", key)
             for key, source in self.workspace["sources"].items()
@@ -515,9 +550,10 @@ class Session:
             self.refresh_schema()
 
     def register(self, source: DataSource, activate: bool = True) -> None:
-        """Add a source built by `add_sqlite_source`/`add_d1_live_source`."""
+        """Register an explicitly built source, replacing its disconnected target."""
         key = (f"saved-d1:{source.d1.account_id}:{source.d1.database_uuid.lower()}" if source.d1 is not None else
-               f"snapshot:{source.dir.expanduser().resolve()}" if source.kind == "d1" else source.id)
+               f"snapshot:{source.dir.expanduser().resolve()}" if source.kind == "d1" else
+               self._postgres_profile_id(source.postgres) if source.kind == "postgres-live" else source.id)
         placeholders = [name for name, item in self.sources.items() if item.con is None and self.source_key(name) == key]
         was_active = self.active_id in placeholders
         for name in placeholders:
@@ -589,7 +625,8 @@ class Session:
         schema = self.schema if schema is None else schema
         source = self.source
         datasets = [
-            (name, "temp table" if entry.get("temp") else f"{entry['rows']} rows")
+            (name, "temp table" if entry.get("temp") else
+             "row count not loaded" if entry["rows"] is None else f"{entry['rows']} rows")
             for name, entry in source.datasets.items()
         ]
         ctes = [(cte.name, "cte") for cte in parse_query(doc, schema=schema).with_]
@@ -748,6 +785,20 @@ class Session:
             display=display or None,
         )
 
+    def build_postgres_source(
+        self, *, host: str, database: str, user: str, password: str,
+        port: int = 5432, schema: str = "public", sslmode: str = "prefer", display: str | None = None,
+    ) -> DataSource:
+        """Build a real PostgreSQL source; Test does not register or persist it."""
+        hint = display or database or "postgres-live"
+        if password:
+            hint = hint.replace(password, "redacted")
+        return add_postgres_source(
+            self.next_source_id(hint),
+            host=host, port=port, database=database, user=user, password=password,
+            schema=schema, sslmode=sslmode, display=display,
+        )
+
     # -- statements the query cannot carry ----------------------------------
 
     def _supports(self, name: str) -> bool:
@@ -833,7 +884,11 @@ class Session:
         if not any(entry.get("temp") for entry in self.source.datasets.values()) and not dropped:
             return
         try:
-            live = set(self.source.con.list_tables())
+            if self.source.kind == "postgres-live":
+                namespace = self.source.con._session_temp_db
+                live = set(self.source.con.list_tables(database=(self.source.postgres["database"], namespace))) if namespace else set()
+            else:
+                live = set(self.source.con.list_tables())
         except Exception:  # a source that cannot list locally keeps what it has
             return
         changed = False

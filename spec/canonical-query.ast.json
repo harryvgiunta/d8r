@@ -17,11 +17,39 @@
         "distinct": false,
         "where": {
           "line": 3,
-          "raw": "status = \"paid\"",
-          "column": "status",
-          "op": "=",
-          "value": "paid",
-          "subquery": null
+          "raw": "(status = \"paid\" and amount between 1 and 999.5) or sku is null",
+          "column": "",
+          "op": "",
+          "value": "",
+          "subquery": null,
+          "group": {
+            "line": 3,
+            "raw": "status = \"paid\" and amount between 1 and 999.5",
+            "column": "status",
+            "op": "=",
+            "value": "paid",
+            "subquery": null,
+            "ands": [
+              {
+                "column": "amount",
+                "op": "between",
+                "value": "",
+                "subquery": null,
+                "low": "1",
+                "high": "999.5"
+              }
+            ]
+          },
+          "ors": [
+            [
+              {
+                "column": "sku",
+                "op": "is null",
+                "value": "",
+                "subquery": null
+              }
+            ]
+          ]
         },
         "groupBy": [],
         "orderBy": [],
@@ -484,12 +512,127 @@
       "regex": null,
       "subquery": null,
       "alias": "customer_sku"
+    },
+    {
+      "line": 27,
+      "raw": "translate(sku, \"S\", \"X\") as translated_sku",
+      "column": null,
+      "literal": null,
+      "scalar": {
+        "fn": "translate",
+        "args": [
+          {
+            "column": "sku"
+          },
+          {
+            "literal": {
+              "value": "S"
+            }
+          },
+          {
+            "literal": {
+              "value": "X"
+            }
+          }
+        ]
+      },
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "translated_sku"
+    },
+    {
+      "line": 27,
+      "raw": "levenshtein(sku, \"SKU-001\") as sku_distance",
+      "column": null,
+      "literal": null,
+      "scalar": {
+        "fn": "levenshtein",
+        "args": [
+          {
+            "column": "sku"
+          },
+          {
+            "literal": {
+              "value": "SKU-001"
+            }
+          }
+        ]
+      },
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "sku_distance"
+    },
+    {
+      "line": 27,
+      "raw": "url_host(\"https://acme.test/p\") as link_host",
+      "column": null,
+      "literal": null,
+      "scalar": {
+        "fn": "url_host",
+        "args": [
+          {
+            "literal": {
+              "value": "https://acme.test/p"
+            }
+          }
+        ]
+      },
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "link_host"
+    },
+    {
+      "line": 27,
+      "raw": "as_date(string(placed_at), \"%Y-%m-%d\") as placed_date",
+      "column": null,
+      "literal": null,
+      "scalar": {
+        "fn": "as_date",
+        "args": [
+          {
+            "fn": "string",
+            "args": [
+              {
+                "column": "placed_at"
+              }
+            ]
+          },
+          {
+            "literal": {
+              "value": "%Y-%m-%d"
+            }
+          }
+        ]
+      },
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "placed_date"
     }
   ],
   "distinct": true,
   "where": {
     "line": 15,
-    "raw": "customer_id in (\\from customers \\select customer_id \\where region = \"us\")",
+    "raw": "customer_id in (\\from customers \\select customer_id \\where region = \"us\") and (event_type in (\"purchase\", \"cli\") or user_id is not null)",
     "column": "customer_id",
     "op": "in",
     "value": "",
@@ -537,7 +680,37 @@
       "tx": [],
       "limit": null,
       "errors": []
-    }
+    },
+    "ands": [
+      {
+        "column": "",
+        "op": "",
+        "value": "",
+        "subquery": null,
+        "group": {
+          "line": 15,
+          "raw": "event_type in (\"purchase\", \"cli\") or user_id is not null",
+          "column": "event_type",
+          "op": "in",
+          "value": "",
+          "subquery": null,
+          "values": [
+            "purchase",
+            "cli"
+          ],
+          "ors": [
+            [
+              {
+                "column": "user_id",
+                "op": "is not null",
+                "value": "",
+                "subquery": null
+              }
+            ]
+          ]
+        }
+      }
+    ]
   },
   "groupBy": [],
   "orderBy": [
@@ -551,7 +724,7 @@
   "cases": [
     {
       "line": 14,
-      "raw": "flag = when amount > 100 then \"high\" else \"low\"",
+      "raw": "flag = when amount > 100 then \"high\" when sku ilike \"SKU-0%\" then \"early\" when customer_id is null then \"missing\" else \"low\"",
       "alias": "flag",
       "whens": [
         {
@@ -559,6 +732,18 @@
           "op": ">",
           "value": "100",
           "then": "high"
+        },
+        {
+          "column": "sku",
+          "op": "ilike",
+          "value": "SKU-0%",
+          "then": "early"
+        },
+        {
+          "column": "customer_id",
+          "op": "is null",
+          "value": "",
+          "then": "missing"
         }
       ],
       "else": "low"
