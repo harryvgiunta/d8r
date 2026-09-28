@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import Callable, Sequence
 
 from .alias import effective_alias
 from .ast import (
     AggCall,
+    ArithmeticExpr,
     CaseBranch,
     CaseClause,
     ColumnRef,
@@ -42,7 +43,14 @@ from .ast import (
     WindowOrder,
     WithClause,
 )
-from .functions import SCALAR_FUNCTIONS
+from .functions import (
+    ARITHMETIC_PRECEDENCE,
+    MAX_EXPRESSION_DEPTH,
+    MAX_EXPRESSION_NODES,
+    MAX_WHERE_DEPTH,
+    MAX_WHERE_NODES,
+    SCALAR_FUNCTIONS,
+)
 from .schema import (
     AGGREGATES,
     TEMPORAL,
@@ -56,7 +64,7 @@ _COL = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 _COL_RE = re.compile(rf"^{_COL}$")
 _AGG_RE = re.compile(rf"^([A-Za-z_][A-Za-z0-9_]*)\((\*|{_COL})\)$")
-_CALL_HEAD_RE = re.compile(rf"^({_IDENT})\s*\(")
+_CALL_HEAD_RE = re.compile(rf"({_IDENT})\s*\(")
 _AS_RE = re.compile(r"^(.*?)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
 # `\where <column> <op> <tail>`; the tail is a value, a `between` pair, an
 # `in`/`not in` list `( a, b )`, or `( … )` for `in`/`not in` and the
@@ -110,6 +118,9 @@ _WITH_NAME_RE = re.compile(rf"^({_IDENT})$", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"^[0-9]+$")
 _NUMBER_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
 _STRING_RE = re.compile(r'''(?:'(?:[^']|'')*'|"(?:[^"]|"")*")''')
+_EXPRESSION_TOKEN_RE = re.compile(
+    rf"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|{_COL}|[()+*/,-]"
+)
 _WHEN_HEAD_RE = re.compile(r"^when\b", re.IGNORECASE | re.ASCII)
 _INDENT_RE = re.compile(r"^\s", re.ASCII)
 
@@ -160,7 +171,20 @@ _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
 MAX_NUMERIC_CHARS = 640
 MAX_FUNCTION_DEPTH = 16
 MAX_FUNCTION_EXPANSIONS = 256
-MAX_WHERE_DEPTH = 32
+
+
+def _command_parts(text: str) -> tuple[str, str] | None:
+    """Normalize a function-call command to a source without rewriting text."""
+    match = _CMD_RE.match(text)
+    if match is None:
+        return None
+    name, rest = match.group(1).lower(), match.group(2).strip()
+    if (rest.startswith("(") and name not in NEEDS_ARGS
+            and name not in TX_COMMANDS and name not in {"distinct", "unique"}):
+        # Preserve case and argument spelling; function names are identifiers,
+        # not case-insensitive command keywords.
+        return "from", text[1:]
+    return name, rest
 
 
 def checked_integer(text: str, label: str) -> int:
@@ -347,54 +371,176 @@ def take_paren(text: str) -> tuple[str, str] | None:
     return None
 
 
-def parse_scalar_call(text: str) -> ScalarCall:
-    """Read only catalog calls; nesting never admits aggregates or subqueries."""
-    head = _CALL_HEAD_RE.match(text)
-    if head is None:
-        raise ValueError(f'cannot parse scalar expression "{text}"')
-    fn = head.group(1).lower()
-    signature = SCALAR_FUNCTIONS.get(fn)
-    if signature is None:
-        raise ValueError(f'unknown scalar function "{head.group(1)}"')
-    paren = take_paren(text[head.end() - 1 :])
-    if paren is None or paren[1]:
-        raise ValueError(f'{fn}() needs balanced parentheses with no trailing expression')
-    parts = split_top(paren[0], keep_empty=True) if paren[0].strip() else []
-    if any(not part for part in parts):
-        raise ValueError(f'{fn}() cannot contain an empty argument')
-    if not signature.accepts(len(parts)):
-        maximum = len(signature.parameters)
-        count = (
-            f"at least {signature.minimum}"
-            if signature.variadic
-            else str(maximum) if signature.minimum == maximum
-            else f"{signature.minimum} to {maximum}"
-        )
-        raise ValueError(f'{fn}() takes {count} argument(s) — got {len(parts)}')
-    args: list[ColumnRef | LiteralValue | ScalarCall] = []
-    for part in parts:
-        literal = parse_literal(part)
-        if literal is not None:
-            args.append(literal)
-        elif _COL_RE.fullmatch(part):
-            args.append(ColumnRef(part))
+Expression = ColumnRef | LiteralValue | ScalarCall | AggCall | ArithmeticExpr
+
+
+def parse_expression(
+    text: str, *, allow_aggregate: bool = True,
+    parse_where: Callable[[str], WhereClause] | None = None,
+) -> Expression:
+    """Parse catalog/numeric expressions with shared precedence and bounded trees."""
+    tokens: list[tuple[str, int, int]] = []
+    pos = 0
+    while pos < len(text):
+        if text[pos].isspace():
+            pos += 1
+            continue
+        call = _CALL_HEAD_RE.match(text, pos)
+        if call and call.group(1).lower() in AGGREGATES:
+            opening = call.end() - 1
+            paren = take_paren(text[opening:])
+            if paren is None:
+                raise ValueError(f"{call.group(1)}() needs balanced parentheses")
+            end = opening + len(paren[0]) + 2
+            tokens.append((text[pos:end], pos, end))
+            pos = end
+            continue
+        match = (_STRING_RE if text[pos] in "\"'" else _EXPRESSION_TOKEN_RE).match(text, pos)
+        if match is None:
+            raise ValueError(f'cannot parse expression near "{text[pos:pos + 32]}"')
+        tokens.append((match.group(), pos, match.end()))
+        pos = match.end()
+        # Parentheses/operators add tokens without adding AST nodes.
+        if len(tokens) > MAX_EXPRESSION_NODES * (MAX_EXPRESSION_DEPTH + 2):
+            raise ValueError("expression is too large")
+    index = 0
+    nodes = 0
+
+    def peek() -> str:
+        return tokens[index][0] if index < len(tokens) else ""
+
+    def node(value: Expression) -> Expression:
+        nonlocal nodes
+        nodes += 1
+        if nodes > MAX_EXPRESSION_NODES:
+            raise ValueError(f"expression exceeds {MAX_EXPRESSION_NODES} nodes")
+        return value
+
+    def numeric(value: Expression) -> None:
+        if isinstance(value, LiteralValue) and (isinstance(value.value, (str, bool))):
+            raise ValueError("arithmetic operands must be numeric or NULL")
+
+    def expression(minimum: int, depth: int, aggregates: bool) -> Expression:
+        nonlocal index
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise ValueError(f"expression exceeds maximum depth {MAX_EXPRESSION_DEPTH}")
+        token = peek()
+        if not token:
+            raise ValueError("expression needs an operand")
+        index += 1
+        if token in {"+", "-"}:
+            # A signed numeric token keeps its longstanding literal wire shape.
+            if (index < len(tokens) and tokens[index - 1][2] == tokens[index][1]
+                    and _NUMBER_RE.fullmatch(peek())):
+                literal = parse_literal(token + peek())
+                if literal is None:
+                    raise ValueError("numeric literal must be finite")
+                index += 1
+                left = node(literal)
+            else:
+                arg = expression(max(ARITHMETIC_PRECEDENCE.values()) + 1, depth + 1, aggregates)
+                numeric(arg)
+                left = node(ArithmeticExpr(token, [arg]))
+        elif token == "(":
+            left = expression(1, depth + 1, aggregates)
+            if peek() != ")":
+                raise ValueError("expression needs balanced parentheses")
+            index += 1
+        elif (call := _CALL_HEAD_RE.match(token)) and call.group(1).lower() in AGGREGATES:
+            fn = call.group(1).lower()
+            if not aggregates:
+                raise ValueError("aggregates cannot appear inside scalar calls — use a CTE")
+            body = token[call.end():-1]
+            argument = re.fullmatch(
+                rf"\s*(\*|{_COL})(?:\s+\\where\b(.*))?\s*", body, re.IGNORECASE | re.DOTALL
+            )
+            if argument is None:
+                raise ValueError(f"{fn}() requires a column or * with optional \\where predicate")
+            arg, predicate = argument.groups()
+            if arg == "*" and fn != "count":
+                raise ValueError(f"{fn}(*) is not supported — only count accepts '*'")
+            where = (parse_where or _aggregate_where)(predicate.strip()) if predicate is not None else None
+            left = node(AggCall(fn=fn, arg=arg, where=where))
+        elif _COL_RE.fullmatch(token) and peek() == "(":
+            fn = token.lower()
+            index += 1
+            signature = SCALAR_FUNCTIONS.get(fn)
+            if signature is None:
+                raise ValueError(f'unknown scalar function "{token}" — windows, subqueries and dedicated calls cannot be arithmetic operands')
+            args: list[Expression] = []
+            if peek() != ")":
+                while True:
+                    if peek() in {"", ",", ")"}:
+                        raise ValueError(f"{fn}() cannot contain an empty argument")
+                    args.append(expression(1, depth + 1, False))
+                    if peek() != ",":
+                        break
+                    index += 1
+            if peek() != ")":
+                raise ValueError(f"{fn}() needs balanced parentheses")
+            index += 1
+            if not signature.accepts(len(args)):
+                maximum = len(signature.parameters)
+                count = (
+                    f"at least {signature.minimum}" if signature.variadic
+                    else str(maximum) if signature.minimum == maximum
+                    else f"{signature.minimum} to {maximum}"
+                )
+                raise ValueError(f"{fn}() takes {count} argument(s) — got {len(args)}")
+            left = node(ScalarCall(fn=fn, args=args))
         else:
-            args.append(parse_scalar_call(part))
-    return ScalarCall(fn=fn, args=args)
+            literal = parse_literal(token)
+            if literal is not None:
+                left = node(literal)
+            elif _COL_RE.fullmatch(token):
+                left = node(ColumnRef(token))
+            else:
+                raise ValueError(f'cannot parse expression operand "{token}"')
+        while peek() in ARITHMETIC_PRECEDENCE and ARITHMETIC_PRECEDENCE[peek()] >= minimum:
+            op = peek()
+            index += 1
+            right = expression(ARITHMETIC_PRECEDENCE[op] + 1, depth + 1, aggregates)
+            numeric(left)
+            numeric(right)
+            left = node(ArithmeticExpr(op, [left, right]))
+        return left
+
+    result = expression(1, 1, allow_aggregate)
+    if index != len(tokens):
+        raise ValueError(f'cannot parse expression tail "{text[tokens[index][1]:]}"')
+    # Left-associative chains can be deep without recursive descent being deep.
+    pending = [(result, 1)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise ValueError(f"expression exceeds maximum depth {MAX_EXPRESSION_DEPTH}")
+        if isinstance(current, (ScalarCall, ArithmeticExpr)):
+            pending.extend((arg, depth + 1) for arg in current.args)
+    return result
 
 
-def split_commands(body: str) -> list[str]:
+def parse_scalar_call(text: str) -> ScalarCall:
+    """Read a catalog call using the same bounded expression grammar."""
+    result = parse_expression(text, allow_aggregate=False)
+    if not isinstance(result, ScalarCall):
+        raise ValueError(f'cannot parse scalar expression "{text}"')
+    return result
+
+
+def split_commands(body: str, *, preserve_indent: bool = False) -> list[str]:
     """An inline `( … )` subquery body as command lines.
 
     The body is the same `\\command` grammar on one document line, so it is cut
     at every `\\` that sits at depth 0 outside quotes — a `\\` inside a nested
     group or a quoted value belongs to that value. Each piece keeps its `\\`,
-    so the identical `parse_slice` reads it.
+    so the identical `parse_slice` reads it. Function documents also preserve
+    each command's original line indentation, which owns its CTE block.
     """
     out: list[str] = []
     depth = 0
     quote: str | None = None
     start = -1
+    indent = ""
     for i, ch in enumerate(body):
         if quote is not None:
             if ch == quote:
@@ -411,10 +557,13 @@ def split_commands(body: str) -> list[str]:
             continue
         if ch == "\\" and depth == 0:
             if start >= 0:
-                out.append(body[start:i].strip())
+                out.append(indent + body[start:i].strip())
             start = i
+            if preserve_indent:
+                prefix = body[body.rfind("\n", 0, i) + 1:i]
+                indent = prefix[:len(prefix) - len(prefix.lstrip())]
     if start >= 0:
-        out.append(body[start:].strip())
+        out.append(indent + body[start:].strip())
     return [s for s in out if s]
 
 
@@ -443,8 +592,9 @@ def parse_subquery(body: str, line: int, opts: ParseOpts, outer: list[str] | Non
             expansion_budget=opts.expansion_budget,
             fixed_line=line,
             typing_line=opts.typing_line,
-            visible_ctes=visible_ctes_of(opts, ()),
+            visible_ctes=opts.visible_ctes,
             top=False,
+            allow_ctes=False,
             outer_idents=list(outer or []),
         ),
     )
@@ -593,9 +743,33 @@ def _where_tree(
     return head
 
 
-def visible_ctes_of(opts: ParseOpts, own: tuple[str, ...]) -> list[str]:
-    """The CTE names a slice may reference: the enclosing ones, then its own."""
-    return [*opts.visible_ctes, *own]
+def _aggregate_where(
+    text: str, line: int = 0, opts: ParseOpts | None = None, ast: QueryAST | None = None,
+) -> WhereClause:
+    """Reuse the clause grammar and subquery scope without filtering the source."""
+    if not text or not balanced_function_text(text):
+        raise ValueError("aggregate \\where needs a balanced predicate")
+    errors: list[str] = []
+    owner = ast if ast is not None else QueryAST()
+    predicate = _where_tree(text, line, opts or ParseOpts(), owner, errors.append)
+    if ast is None and owner.errors:
+        raise ValueError(owner.errors[0].message)
+    if predicate is None or errors:
+        raise ValueError(errors[0] if errors else "aggregate \\where needs a predicate")
+    pending = [predicate]
+    nodes = 0
+    while pending:
+        condition = pending.pop()
+        nodes += 1
+        if nodes > MAX_WHERE_NODES:
+            raise ValueError(f"aggregate where exceeds maximum nodes {MAX_WHERE_NODES}")
+        if split_commands(condition.raw):
+            raise ValueError("unexpected command inside aggregate \\where predicate")
+        pending.extend(condition.ands)
+        pending.extend(condition.ors)
+        if condition.group is not None:
+            pending.append(condition.group)
+    return predicate
 
 
 def parse_frame_bounds(text: str) -> FrameBounds | None:
@@ -727,7 +901,7 @@ def expand_function_body(body: str, args: dict[str, str]) -> list[str]:
     if any(not balanced_function_text(arg) for arg in args.values()):
         raise ValueError("unbalanced quotes or parentheses in function argument")
     commands: list[str] = []
-    for command in split_commands(body):
+    for command in split_commands(body, preserve_indent=True):
         expanded = substitute_params(command, args)
         if expanded is None:
             missing = next(name for _, _, name in param_spans(command) if name not in args)
@@ -821,8 +995,8 @@ def parse_fn_source(
             expansion_budget=opts.expansion_budget,
             fixed_line=line,
             typing_line=opts.typing_line,
-            # A saved body is its own document: it references datasets, never
-            # the caller's CTEs.
+            # A saved body is its own document: its local CTEs and datasets
+            # are visible, never the caller's CTEs.
             visible_ctes=[],
             top=False,
             outer_idents=list(outer or []),
@@ -842,8 +1016,8 @@ def parse_body(
 
     The editor runs this on save so a function that would only fail at a call
     site is refused where it is written. The body is parsed exactly as a call
-    expands it (same grammar, same `top=False` regime that refuses `\\temp`,
-    `\\drop`, transactions, and nested CTEs), against the *live* schema so its
+    expands it (same grammar and local CTE scope, with `top=False` refusing
+    `\\temp`, `\\drop`, and transactions), against the *live* schema so its
     own column references are checked. Every `@token` is blanked first so the
     grammar parses, and one that `params` does not declare is named — a call
     could never bind it. An empty list means the body is a well-formed relation
@@ -1048,8 +1222,8 @@ def block_bounds(lines: list[str], line: int) -> tuple[int, int]:
     start, end = 0, len(lines)
     while True:
         for index in range(start, end):
-            match = _CMD_RE.match(lines[index].strip())
-            if match is None or match.group(1).lower() != "with":
+            command = _command_parts(lines[index].strip())
+            if command is None or command[0] != "with":
                 continue
             stop = block_extent(lines, index)
             if index + 1 < line <= stop:
@@ -1074,11 +1248,11 @@ def clause_line(doc: str, line: int, command: str) -> int | None:
     found: int | None = None
     index = start
     while index < end:
-        match = _CMD_RE.match(lines[index].strip())
-        if match is None:
+        command = _command_parts(lines[index].strip())
+        if command is None:
             index += 1
             continue
-        name = match.group(1).lower()
+        name = command[0]
         if name == "with":
             # The header is this block's clause; its body is a block of its own.
             if wanted == "with":
@@ -1108,9 +1282,10 @@ class ParseOpts:
     typing_line: int = 0
     # CTE names visible to this slice (defined before it, in document order).
     visible_ctes: list[str] = field(default_factory=list)
-    # False inside a `\with` body or an inline subquery: nested CTEs, a nested
-    # `\with`, and the statement-level commands are errors there.
+    # Statement-level commands are only legal in the outer document.
     top: bool = True
+    # Documents and function roots own CTEs; CTE bodies and inline queries do not.
+    allow_ctes: bool = True
     # Set for an inline `( … )` subquery: every node reports this document line,
     # because the whole subquery sits on the clause's one line.
     fixed_line: int | None = None
@@ -1122,11 +1297,8 @@ class ParseOpts:
 def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
     """Parse one slice of command lines into a QueryAST-shaped result."""
     ast = QueryAST()
-
-    def visible_ctes() -> list[str]:
-        # CTEs already defined in this slice (document order) plus any inherited
-        # from an enclosing slice — the names a `\from`/`\join` here may reference.
-        return [*opts.visible_ctes, *[c.name for c in ast.with_]]
+    # Each relation owns its visibility list; expansion budgets remain shared.
+    opts = replace(opts, visible_ctes=list(opts.visible_ctes))
 
     # Errors are only reported for settled lines; `typing_line` is the last
     # non-empty line of the WHOLE document (the one being typed), where
@@ -1149,14 +1321,13 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             err("not a command — lines start with \\")
             i += 1
             continue
-        m = _CMD_RE.match(text)
-        if m is None:
+        command = _command_parts(text)
+        if command is None:
             err("incomplete command")
             i += 1
             continue
 
-        cmd = m.group(1).lower()
-        rest = m.group(2).strip()
+        cmd, rest = command
 
         if not rest and cmd in NEEDS_ARGS:
             err(f"\\{cmd} expects arguments")
@@ -1169,7 +1340,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 err("\\with expects a bare CTE name")
                 i += 1
                 continue
-            if not opts.top:
+            if not opts.allow_ctes:
                 err("nested CTEs are not supported")
                 i += 1
                 continue
@@ -1192,9 +1363,11 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     expansion_stack=opts.expansion_stack,
                     expansion_budget=opts.expansion_budget,
                     offset=body_start + opts.offset,
+                    fixed_line=opts.fixed_line,
                     typing_line=opts.typing_line,
-                    visible_ctes=visible_ctes(),
+                    visible_ctes=opts.visible_ctes,
                     top=False,
+                    allow_ctes=False,
                 ),
             )
             # Body errors belong to the document; nested CTE errors too.
@@ -1205,6 +1378,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 # The CTE name shadows nothing, that's fine; only a dataset
                 # collision is worth flagging (the dataset becomes unreachable).
                 err(f'CTE name "{name}" shadows dataset "{name}"')
+            opts.visible_ctes.append(name)
             continue
 
         if cmd in ("from", "open"):
@@ -1243,8 +1417,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             if (
                 body is None
                 and opts.schema.tables
+                and opts.schema.tables_complete
                 and not opts.schema.table_by_name(table)
-                and table not in visible_ctes()
+                and table not in opts.visible_ctes
             ):
                 err(
                     f'unknown table "{table}" — loaded datasets: '
@@ -1392,8 +1567,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             if (
                 body is None
                 and opts.schema.tables
+                and opts.schema.tables_complete
                 and not opts.schema.table_by_name(table)
-                and table not in visible_ctes()
+                and table not in opts.visible_ctes
             ):
                 err(
                     f'unknown table "{table}" — loaded datasets: '
@@ -1450,8 +1626,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             if (
                 body is None
                 and opts.schema.tables
+                and opts.schema.tables_complete
                 and not opts.schema.table_by_name(name)
-                and name not in visible_ctes()
+                and name not in opts.visible_ctes
             ):
                 err(
                     f'unknown table "{name}" — loaded datasets: '
@@ -1478,7 +1655,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                 # before anything meant for an expression: the body's own ` as `
                 # or ` over ( … )` must never be mistaken for this item's.
                 paren = take_paren(expr)
-                if paren is not None:
+                if paren is not None and paren[0].lstrip().startswith("\\"):
                     body_text, after = paren
                     alias_match = re.match(rf"^(?:as\s+)?({_IDENT})$", after, re.IGNORECASE)
                     item.subquery = parse_subquery(body_text, line, opts)
@@ -1527,16 +1704,6 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     continue
                 regex = _REGEX_FN_RE.match(core)
                 rank = _RANK_RE.match(core)
-                scalar_head = _CALL_HEAD_RE.match(core)
-                if scalar_head and scalar_head.group(1).lower() in SCALAR_FUNCTIONS:
-                    try:
-                        item.scalar = parse_scalar_call(core)
-                    except ValueError as exc:
-                        err(str(exc))
-                    if item.window:
-                        err(f'"{scalar_head.group(1).lower()}" is not a window function — use sum/avg/count/min/max')
-                    ast.select.append(item)
-                    continue
                 if regex:
                     fn = regex.group(1).lower()
                     args = split_top(regex.group(2))
@@ -1565,7 +1732,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         err(f"{fn}() requires order by inside over (...)")
                 else:
                     agg = _AGG_RE.match(core)
-                    if agg:
+                    if agg and agg.group(1).lower() not in SCALAR_FUNCTIONS:
                         fn = agg.group(1).lower()
                         if fn in AGGREGATES:
                             item.aggregate = AggCall(fn=fn, arg=agg.group(2))  # type: ignore[arg-type]
@@ -1585,7 +1752,24 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                             err("a plain column cannot carry over (...) — wrap it in a function")
                         item.column = core
                     else:
-                        err(f'cannot parse expression "{core}"')
+                        try:
+                            value = parse_expression(
+                                core, parse_where=lambda text: _aggregate_where(text, line, opts, ast)
+                            )
+                            if isinstance(value, ArithmeticExpr):
+                                item.arithmetic = value
+                            elif isinstance(value, ScalarCall):
+                                item.scalar = value
+                            elif isinstance(value, AggCall):
+                                item.aggregate = value
+                            elif isinstance(value, LiteralValue):
+                                item.literal = value
+                            else:
+                                item.column = value.column
+                            if item.window and item.aggregate is None:
+                                err("arithmetic, scalar calls and grouped values cannot carry over (...)")
+                        except ValueError as exc:
+                            err(str(exc))
                 ast.select.append(item)
             i += 1
             continue
@@ -1757,23 +1941,30 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
                     )
                 )
 
-        def check_scalar(ref_line: int, call: ScalarCall) -> None:
-            for arg in call.args:
-                if isinstance(arg, ColumnRef):
-                    check(ref_line, arg.column)
-                elif isinstance(arg, ScalarCall):
-                    check_scalar(ref_line, arg)
+        def check_expression(ref_line: int, value: Expression) -> None:
+            if isinstance(value, ColumnRef):
+                check(ref_line, value.column)
+            elif isinstance(value, AggCall):
+                check(ref_line, value.arg)
+                if value.where is not None:
+                    for cond in value.where.conditions():
+                        check(ref_line, cond.column)
+            elif isinstance(value, (ScalarCall, ArithmeticExpr)):
+                for arg in value.args:
+                    check_expression(ref_line, arg)
 
         for s in ast.select:
             check(s.line, s.column or "")
             if s.aggregate:
-                check(s.line, s.aggregate.arg)
+                check_expression(s.line, s.aggregate)
             if s.temporal:
                 check(s.line, s.temporal.arg)
             if s.regex:
                 check(s.line, s.regex.arg)
             if s.scalar:
-                check_scalar(s.line, s.scalar)
+                check_expression(s.line, s.scalar)
+            if s.arithmetic:
+                check_expression(s.line, s.arithmetic)
             if s.window:
                 for p in s.window.partition_by:
                     check(s.line, p)
@@ -1886,6 +2077,26 @@ def _where_payload(where: WhereClause) -> dict:
     return data
 
 
+def _expression_payload(value: Expression) -> dict:
+    if isinstance(value, AggCall):
+        data = {"fn": value.fn, "arg": value.arg}
+        if value.where is not None:
+            data["where"] = _where_payload(value.where)
+        return data
+    if isinstance(value, (ArithmeticExpr, ScalarCall)):
+        key = "op" if isinstance(value, ArithmeticExpr) else "fn"
+        return {
+            key: value.op if isinstance(value, ArithmeticExpr) else value.fn,
+            "args": [
+                {"literal": arg.to_json()} if isinstance(arg, LiteralValue)
+                else {"aggregate": _expression_payload(arg)} if isinstance(arg, AggCall)
+                else _expression_payload(arg)
+                for arg in value.args
+            ],
+        }
+    return value.to_json()
+
+
 def payload_from_ast(ast: QueryAST) -> dict:
     """QueryAST → the engine payload, 1:1 with the wire contract.
 
@@ -1938,8 +2149,9 @@ def payload_from_ast(ast: QueryAST) -> dict:
                 "column": s.column,
                 "literal": s.literal.to_json() if s.literal is not None else None,
                 "scalar": s.scalar.to_json() if s.scalar else None,
+                "arithmetic": _expression_payload(s.arithmetic) if s.arithmetic else None,
                 "star": s.star,
-                "aggregate": {"fn": s.aggregate.fn, "arg": s.aggregate.arg} if s.aggregate else None,
+                "aggregate": _expression_payload(s.aggregate) if s.aggregate else None,
                 "temporal": {"fn": s.temporal.fn, "arg": s.temporal.arg} if s.temporal else None,
                 "rank": {"fn": s.rank.fn} if s.rank else None,
                 "window": (

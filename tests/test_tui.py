@@ -29,9 +29,8 @@ from d8r.query import SchemaContext
 from d8r.tui.add_source import AddSourceModal
 from d8r.tui.app import D8RApp, main as app_main
 from d8r.tui.palette import VALUE_SUGGESTIONS, View, view_for
-from d8r.tui.session import PREVIEW_ROW_CAP, VALUE_POOL_LIMIT, Session
+from d8r.tui.session import PREVIEW_ROW_CAP, Session
 from d8r.tui.settings import SettingsScreen
-from d8r.tui.fn import FnScreen
 from d8r.tui import splash
 from tests.conftest import REPO_ROOT
 
@@ -181,6 +180,34 @@ def test_a_typed_document_fills_the_results_table():
         assert text_of(app, "#results-status").endswith("· demo · duckdb")
         assert history_table(app).row_count == 1
         assert str(history_table(app).get_cell_at((0, 1))) == "demo"
+
+    run_app(scenario)
+
+
+@pytest.mark.parametrize("backward,key", [(False, "ctrl+enter"), (True, "f5")])
+def test_run_executes_selection_then_whole_document_when_cleared(backward, key):
+    async def scenario(app, pilot):
+        document = TYPED_DOCUMENT + "\n\\where user_id = 1"
+        app.editor.load_text(document)
+        start, end = (0, 0), (2, len("\\limit 3"))
+        app.editor.move_cursor(end if backward else start)
+        app.editor.move_cursor(start if backward else end, select=True)
+        await pilot.press(key)
+        await app.workers.wait_for_complete()
+
+        table = results_table(app)
+        assert text_of(app, "#results-error") == ""
+        assert [str(table.get_cell_at((row, 0))) for row in range(table.row_count)] == ["1", "8", "15"]
+        assert app.session.history[0].doc == TYPED_DOCUMENT
+        assert app.editor.text == document
+        assert app.editor.selected_text == TYPED_DOCUMENT
+
+        app.editor.move_cursor(end)
+        await pilot.press(key)
+        await app.workers.wait_for_complete()
+        assert text_of(app, "#results-error") == ""
+        assert [str(table.get_cell_at((row, 0))) for row in range(table.row_count)] == ["1", "1", "1"]
+        assert app.session.history[0].doc == document
 
     run_app(scenario)
 
@@ -710,6 +737,7 @@ def test_the_palette_view_picks_its_span_and_its_offers():
     assert view_for(session, joined, joined, len(joined)) is None
     # A `\where` condition offers values until the value closes, then joiners:
     # `and`/`or` follow a complete condition, and a joiner opens the next column.
+    session.distinct_values(session.source, "events", "event_type")
     def where(line: str) -> View | None:
         return view_for(session, "\\from events\n" + line, line, len(line))
 
@@ -778,10 +806,10 @@ def test_where_values_search_the_pool_not_just_the_first_page(snapshot):
     source = add_sqlite_source("wide", snapshot("wide", 300), "Wide snapshot")
     session = Session({"wide": source})
     doc = "\\from readings\n\\where name = "
+    session.distinct_values(source, "readings", "name")
 
     everything = view_for(session, doc, "\\where name = ", len("\\where name = "))
-    assert len(everything.labels) == VALUE_SUGGESTIONS == 50
-    assert VALUE_POOL_LIMIT > VALUE_SUGGESTIONS
+    assert len(everything.labels) == VALUE_SUGGESTIONS
     first_page = set(everything.labels)
     assert "row-299" not in first_page  # sorting puts it past the shown 50
 
@@ -1033,7 +1061,6 @@ def test_history_is_a_pane_and_an_empty_strip_frees_the_bench():
 
         # No tab is left: the strip goes and the document takes the bench.
         assert app.query_one("#result-tabs", TabbedContent).display is False
-        assert bench.has_class("no-tabs")
         assert editor_pane.region.height == bench.region.height
 
         await type_document(pilot, "\\history")
@@ -1041,7 +1068,6 @@ def test_history_is_a_pane_and_an_empty_strip_frees_the_bench():
         await pilot.pause()
         assert app.pane_visible("history") is True
         assert app.query_one("#result-tabs", TabbedContent).display is True
-        assert not bench.has_class("no-tabs")
         assert editor_pane.region.height < bench.region.height
 
     run_app(scenario)
@@ -1509,6 +1535,7 @@ def test_a_where_operand_that_is_typed_offers_nothing():
     # The operators themselves are offered, and `like`/`ilike` still offer values.
     operators = view_for(session, "\\where path ", "\\where path ", len("\\where path ")).labels
     assert "~" in operators and "in" in operators and "ilike" in operators
+    session.distinct_values(session.source, "events", "event_type")
     like = '\\where event_type like '
     assert view_for(session, like, like, len(like)).labels
     ilike = '\\where event_type ilike '
@@ -1652,7 +1679,7 @@ def test_fn_library_authors_and_previews_then_the_document_calls_it():
         await pilot.press("enter")
         await pilot.pause()
         screen = app.screen
-        assert isinstance(screen, FnScreen)
+        assert app.function_mode
 
         await fill_fn(
             screen,
@@ -1669,9 +1696,9 @@ def test_fn_library_authors_and_previews_then_the_document_calls_it():
         # a preview is a trial, not a run: History stays empty.
         assert app.session.history == []
 
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
-        assert not isinstance(app.screen, FnScreen)
+        assert not app.function_mode
         assert app.focused is app.editor
 
         # The saved function is now a source the document can call.
@@ -1704,22 +1731,25 @@ def test_a_bad_body_is_refused_on_the_screen_not_at_the_call():
     run_app(scenario)
 
 
-def test_fn_named_in_the_palette_opens_it_or_starts_a_new_one():
-    """`\\fn <name>` opens an existing function, or a blank form named the new one."""
+def test_fn_library_edits_saved_functions_and_palette_creates_new_ones():
+    """Editing is explicit in the library; an unknown `\\fn` name offers creation."""
 
     async def scenario(app, pilot):
         app.session.save_fn("hot", "min_amount", FN_BODY, "above a threshold")
-        await type_document(pilot, "\\fn hot")
-        assert app.palette.view.labels == ["hot"]  # the exact name leads, nothing to create
+        await type_document(pilot, "\\Functions")
         await pilot.press("enter")
         await pilot.pause()
+        listing = app.screen.query_one("#fn-list", OptionList)
+        listing.focus()
+        await pilot.press("home", "enter")
+        await pilot.pause()
         screen = app.screen
-        assert isinstance(screen, FnScreen)
+        assert app.function_mode
         assert screen.query_one("#fn-name", Input).value == "hot"
         assert screen.query_one("#fn-params", Input).value == "min_amount"
         assert screen.query_one("#fn-body", TextArea).text == FN_BODY
         assert screen.query_one("#fn-doc", Input).value == "above a threshold"
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
 
         # A name the library lacks starts a new function, prefilled with that name.
@@ -1730,7 +1760,6 @@ def test_fn_named_in_the_palette_opens_it_or_starts_a_new_one():
         screen = app.screen
         assert screen.query_one("#fn-name", Input).value == "monthly"
         assert screen.query_one("#fn-body", TextArea).text == ""  # blank body, new function
-        assert str(screen.query_one("#fn-status", Static).content) == "new function"
 
     run_app(scenario)
 
@@ -1767,8 +1796,10 @@ def test_a_function_is_deleted_from_the_library():
 
     async def scenario(app, pilot):
         app.session.save_fn("hot", "min_amount", FN_BODY, "")
-        await type_document(pilot, "\\fn hot")
-        await pilot.press("enter")
+        app.action_fn()
+        await pilot.pause()
+        app.screen.query_one("#fn-list", OptionList).focus()
+        await pilot.press("home", "enter")
         await pilot.pause()
         screen = app.screen
         await pilot.click("#fn-delete")
@@ -1777,9 +1808,9 @@ def test_a_function_is_deleted_from_the_library():
         assert list(app.session.fns) == []
         # the fields are now a blank new-function form (the name field clears)
         assert screen.query_one("#fn-name", Input).value == ""
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
-        assert not isinstance(app.screen, FnScreen)
+        assert not app.function_mode
 
     run_app(scenario)
 
@@ -1838,9 +1869,9 @@ def test_fn_target_drives_completion_save_and_preview_without_changing_workspace
         assert app.session.active_id == "mysql"
         assert app.session.dialect == "postgres"
         assert [table.name for table in app.session.schema.tables] == list(app.session.source.datasets)
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
-        assert not isinstance(app.screen, FnScreen)
+        assert not app.function_mode
         assert app.editor.text == workspace_doc
 
     run_app(scenario)
@@ -1890,9 +1921,9 @@ def test_fn_body_completion_accepts_keys_and_clicks_without_editing_workspace():
         assert app.focused is screen.query_one("#fn-args", Input)
         await pilot.press("escape")
         assert app.screen is screen  # Escape in a form field never closes the library.
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
-        assert not isinstance(app.screen, FnScreen)
+        assert not app.function_mode
         assert app.editor.text == workspace_doc
 
     run_app(scenario)
@@ -2030,7 +2061,7 @@ def test_fn_parameter_completion_respects_quotes_dismissal_and_workspace_scope()
         await type_document(pilot, " @")
         await pilot.press("escape")
         assert not palette.is_open
-        await pilot.press("ctrl+c")
+        await pilot.press("ctrl+q")
         await pilot.pause()
         app.session.intellisense = True
         app.editor.load_text("\\from events\n\\where amount > ")
@@ -2158,6 +2189,81 @@ def saved_d1_session():
     return Session()
 
 
+def test_run_reconnects_saved_d1_and_executes_once(monkeypatch, saved_d1_session):
+    from tests.test_d1_sources import live_source
+
+    session = saved_d1_session
+    target = next(key for _, key in session.source_options() if key.startswith("saved-d1:"))
+    session.restore_source(target, "sqlite")
+    calls = []
+
+    def connect(*args):
+        calls.append(args)
+        return live_source()[0]
+
+    monkeypatch.setattr(session, "build_live_source", connect)
+    saved = session.storage_path.read_bytes()
+
+    async def scenario():
+        app = D8RApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert not calls
+            app.editor.load_text("\\from orders\n\\select *\n\\limit 1")
+            app.editor.move_cursor((0, 0))
+            app.editor.move_cursor((1, len("\\select *")), select=True)
+            await pilot.press("f5")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, AddSourceModal)
+            assert session.source_key() == target
+            assert len(calls) == 1
+            assert len(session.history) == 1
+            assert session.history[0].doc == "\\from orders\n\\select *"
+            table = app.query_one("#results-table", DataTable)
+            assert table.row_count == 2
+            assert str(table.get_cell_at((0, 0))) == "1"
+            assert str(table.get_cell_at((1, 0))) == "2"
+            assert session.storage_path.read_bytes() == saved
+
+    asyncio.run(scenario())
+
+
+def test_run_connection_failure_never_executes(monkeypatch, saved_d1_session):
+    from d8r.engine import D1Error
+    from tests.test_d1_sources import SECRET
+
+    session = saved_d1_session
+    target = next(key for _, key in session.source_options() if key.startswith("saved-d1:"))
+    session.restore_source(target, "sqlite")
+
+    def reject(*args):
+        raise D1Error("Access denied for " + SECRET)
+
+    monkeypatch.setattr(session, "build_live_source", reject)
+    saved = session.storage_path.read_bytes()
+
+    async def scenario():
+        app = D8RApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            app.editor.load_text("\\from events")
+            await pilot.press("f5")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not isinstance(app.screen, AddSourceModal)
+            assert SECRET not in text_of(app, "#status")
+            assert session.source_key() == target
+            assert not session.source_connected()
+            assert not session.history
+            assert app.query_one("#results-table", DataTable).row_count == 0
+            assert app.editor.text == "\\from events"
+            assert session.storage_path.read_bytes() == saved
+
+    asyncio.run(scenario())
+
+
 def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(monkeypatch, saved_d1_session):
     from d8r.engine import D1Error
     from tests.test_d1_sources import SECRET
@@ -2179,20 +2285,17 @@ def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(m
             await pilot.press("end", "enter")
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert isinstance(app.screen, AddSourceModal)
-            assert "Access denied" in str(app.screen.query_one("#add-source-message", Static).content)
-            assert SECRET not in str(app.screen.query_one("#add-source-message", Static).content)
+            assert not isinstance(app.screen, AddSourceModal)
+            assert SECRET not in text_of(app, "#status")
             assert app.session.active_id == "demo"
             assert app.query_one("#source-select", Select).value == "demo"
             assert app.session.storage_path.read_bytes() == before
             assert not app.session.settings_path.exists()
-            await pilot.press("escape")
             await pilot.click("#source-select")
             await pilot.press("end", "enter")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert len(calls) == 2  # The saved choice remains available to retry.
-            await pilot.press("escape")
     asyncio.run(scenario())
 
 
@@ -2278,7 +2381,7 @@ def test_saved_sources_reconnect_in_secondary_pickers(monkeypatch, saved_d1_sess
                 assert any(row.value == "orders-db" for row in app.screen.rows)
             else:
                 assert app.screen is screen
-                assert screen.source_id == "orders-db"
+                assert app.function_editor.source_id == "orders-db"
                 assert screen.query_one("#fn-source", Select).value == "orders-db"
                 assert body.text == "\\from orders\n\\select id"
                 assert app.session.active_id == "demo"

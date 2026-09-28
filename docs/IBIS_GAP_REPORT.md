@@ -87,8 +87,8 @@ sources — DuckDB demo, SQLite D1, live PostgreSQL):
    pass-throughs into `asc(nulls_first=)`, `ibis.random()`, `limit(n, offset=)`,
    all verified to compile for every D8R dialect that D8R claims.
 4. **Aggregate breadth: `count_distinct`, `var`/`std`, `median`, `quantile`,
-   `approx_*`, `arbitrary`, `first`/`last`, `group_concat`, filtered
-   aggregates (`where=`)** — one table (`AGGREGATE_FNS`) plus the
+   `approx_*`, `arbitrary`, `first`/`last`, `group_concat`** — one table
+   (`AGGREGATE_FNS`) plus the
    `CAPABILITIES["aggregates"]` list; the palette and completion already read
    that list.
 5. **Window functions: `lag/lead`, `percent_rank`, `cume_dist`, `ntile`,
@@ -180,7 +180,7 @@ advertises (`d8r/tui/palette.py:316`). Verified refusals: `\select var(amount)`
 → `unknown function "var"`, `count_distinct(user_id)` likewise. Every ibis
 reduction also accepts a `where=` mask (`Filterable` in
 `ibis/expr/operations/reductions.py`; verified `t.v.sum(where=t.g)` executes)
-— D8R has no filtered-aggregate syntax at all.
+— D8R exposes this as `sum(amount \where status = 'paid')` and `count(* \where ...)`.
 
 | capability | ibis surface | D8R status | where it would hook in | effort | recommendation |
 | --- | --- | --- | --- | --- | --- |
@@ -192,7 +192,7 @@ reduction also accepts a `where=` mask (`Filterable` in
 | argmax / argmin | `col.argmax(key)`, `col.argmin(key)` | **missing** | two-arg aggregate — `_aggregate` currently assumes `arg` is one column | M | optional |
 | list / string collect | `col.collect()` (array), `col.group_concat(sep)` | **missing** | same table; `collect` needs the array story to be useful, `group_concat` is standalone | S (group_concat) | add `group_concat` |
 | all / any | `col.all()`, `col.any()`, `notall`, `notany` | **missing** | same table | S | cheap on postgres/duckdb |
-| filtered aggregates | every reduction's `where=` keyword | **missing** | aggregate spec gains `{fn, arg, where: {column, op, value}}`; `_aggregate` passes `where=_predicate(...)` — the predicate machinery already exists and is shared with case-`when` | M | clean, high value for `count(where=…)` ratio queries |
+| filtered aggregates | every reduction's `where=` keyword | **done**: nested `\where` inside the existing five aggregate calls; independent grouped filters, arithmetic leaves, windows and outer WHERE | optional aggregate `where` predicate uses the existing predicate tree and Ibis `where=`; count-star binds the predicate to the current relation | — | shipped |
 | HAVING | `Table.aggregate(metrics, by=…, having=…)` / `GroupedTable.agg(…, having=…)` — in this build it renders as an outer `WHERE` over the grouped subquery (verified) | **missing**: `\having …` → `unknown command "\having"` | new `\having <col> <op> <value>` command + payload key; `expression.build` filters after `.aggregate(...)` | M | top-3 item: grouped queries are unusable without it today |
 
 ## Window functions and frames

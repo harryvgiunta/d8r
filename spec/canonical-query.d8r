@@ -26,3 +26,5 @@
 \select concat(upper(sku), '-', string(customer_id)) as customer_sku
 \select translate(sku, "S", "X") as translated_sku, levenshtein(sku, "SKU-001") as sku_distance, url_host("https://acme.test/p") as link_host, as_date(string(placed_at), "%Y-%m-%d") as placed_date
 \distinct
+\select amount / 100 as amount_dollars, coalesce(amount / 100, 0) as safe_amount_dollars
+\select sum(amount \where status = 'paid') as paid_total

@@ -11,11 +11,16 @@ the derived output-name rules in **`d8r/query/alias.py`**; the immutable
 then `payload_from_ast`, and `d8r/tui/palette.py` reads the same AST to decide
 what `\` offers.
 
-`Session.refresh_schema()` replaces that session's context with a complete
-snapshot of tables, capabilities, column pool, and function definitions. Parsing
-and completion capture one snapshot, including nested queries; there is no
-process-global registry. Records and their nested collections are immutable,
-so an old snapshot remains coherent after source switches or function edits.
+`Session.refresh_schema()` replaces that session's context with an immutable
+snapshot of tables, capabilities, column pool, and function definitions. A remote
+schema index may be partial: `SchemaContext.tables_complete=False` keeps known
+columns available for completion but defers unknown-table rejection for `from`,
+`join`, and set operands to the engine's on-demand metadata lookup. Nested queries
+and saved-function expansion retain that same flag. Grammar, duplicate identifiers,
+and qualified-prefix validation remain unchanged. The flag defaults to `True`;
+the default empty context and canonical AST wire contract are unchanged.
+Parsing and completion capture one snapshot; there is no process-global registry.
+An old snapshot remains coherent after indexing, source switches or function edits.
 
 The canonical contract is the pair:
 
@@ -41,6 +46,7 @@ document together.
 | `\with` | `<name>` + indented body | defines a reusable sub-query (CTE), repeatable |
 | `\from` | `<dataset> \| ( <subquery> )` `[as] alias` | sets `from` (a later `\from`/`\open` replaces it) |
 | `\open` | same as `\from` | identical to `\from` — the dataset-source spelling |
+| `\name(args)` | saved function's positional arguments, optional `[as] alias` | same source relation as `\from name(args)`; runnable on its own |
 | `\join` | `<dataset> \| ( <subquery> ) [as] alias on col[ = col]` | appends to `joins` (repeatable; always INNER) |
 | `\join lateral` | `( <subquery> ) [as] alias [on col[ = col]]` | appends a lateral join / `CROSS APPLY` (repeatable) |
 | `\union` | `[all\|distinct] <dataset\|cte\|( subquery )>` | appends to `setOps` (repeatable; distinct unless `all`) |
@@ -111,7 +117,7 @@ Argument rules:
   `row_number()` — no argument), a **regex call** (`regexp_extract(path,
   "/p/([0-9]+)")`, `regexp_replace(path, "/p/[0-9]+", "/page")`), a
   **catalog scalar call** (`concat(upper(path), '-', string(user_id))`, see
-  below), or an inline **subquery** (`( … ) as peak`). Any aggregate or rank
+  below), **arithmetic** (`amount / 100`, `sum(amount) / 100`, see below), or an inline **subquery** (`( … ) as peak`). Any aggregate or rank
   call may carry a trailing **`over ( … )` window frame** (see below). Each
   item optionally ends with `as alias`, case-insensitively. Comma-separated expressions on one line
   are separate select items (`\select user_id, sum(amount) as total` yields
@@ -162,15 +168,68 @@ Constants project once per source row, including zero rows for an empty input.
 Alongside aggregates they are added to the aggregated result, never introduced
 as grouping keys: a global count over an empty input still returns one row.
 A literal cannot carry `over (...)`. A source is still required; this does not
-introduce source-free queries or general arithmetic expressions.
+introduce source-free queries.
 
 FN bodies use the same rule: `\select @tag as tag, 'x' as marker` accepts a
 quoted text or numeric argument after substitution, with its type preserved.
 
+### Numeric arithmetic
+
+Select expressions support binary `+`, `-`, `*`, `/`, unary `+`/`-`, and grouping
+parentheses. Multiplication/division bind before addition/subtraction; binary
+operators associate left to right. Unary signs bind tighter. Signed numeric
+literals and scientific notation keep their literal representation (`-2.5`,
+`1e-3`); quotes shield operators (`length('a/b') / 2`).
+
+```d8r
+\from orders
+\select total_cents / 100 as total_dollars
+\select coalesce(total_cents / 100, 0) as safe_total_dollars
+```
+
+Arithmetic operands are columns, numeric or NULL literals, catalog scalar calls,
+aggregate leaves such as `sum(amount_cents)` or `count(*)`, and nested arithmetic.
+The engine requires numeric values: strings and booleans are not coerced to numbers.
+Division is non-truncating true division on SQLite, PostgreSQL and DuckDB. A zero
+divisor becomes NULL through Ibis `nullif(0)`; other NULLs propagate normally.
+D8R constructs real Ibis expressions, not handwritten SQL.
+
+Aggregate-only math (`sum(amount_cents) / 100 as total_dollars`) is an aggregate
+projection. Mixing an aggregate and unaggregated column dependencies in the same
+expression is rejected; use a CTE. Row-dependent arithmetic becomes an implicit
+grouping key alongside separate aggregates; constant arithmetic does not introduce
+grouping keys. The existing window/aggregate and star/aggregate restrictions also
+apply when the aggregate is inside arithmetic.
+
+Aggregate arguments remain a column or `*`: `sum(amount / 100)` is not supported.
+Scalar arguments may contain arithmetic, but aggregates are forbidden anywhere
+inside scalar calls (`coalesce(sum(amount) / 100, 0)` needs a CTE). Temporal, regex,
+rank/window calls and scalar subqueries cannot be arithmetic operands. Arithmetic
+cannot carry `over (...)`. Grouping parentheses are not query subqueries; a query
+subquery starts with a command (`(\from ...)`). Grouped non-arithmetic expressions
+may simplify to their existing node kind.
+
+Both text expressions and raw engine expression payloads are bounded by
+`MAX_EXPRESSION_DEPTH = 32` and `MAX_EXPRESSION_NODES = 256`, shared in
+`d8r/query/functions.py` with `ARITHMETIC_PRECEDENCE`. These limits cover scalar-call
+arguments as well as arithmetic; malformed or oversized text reports parser errors.
+Text grouping and unary nesting also consume the depth limit.
+
+Every select item has `arithmetic: null` unless it contains an `ArithmeticExpr`.
+The AST and payload encode that node as `{"op": "/", "args": [...]}` with one
+argument for unary `+`/`-`, two for binary operators. Each operand is exactly one of
+`{"column": "amount"}`, `{"literal": {"value": 100}}`, a catalog
+`{"fn": "coalesce", "args": [...]}` call, `{"aggregate": {"fn": "sum", "arg": "amount"}}`,
+or a nested `{"op": ..., "args": [...]}`. Existing standalone aggregate nodes and
+scalar-call serialization otherwise remain unchanged. An explicit output alias
+wins; otherwise arithmetic uses its original expression text as its output name.
+Only select expressions gain arithmetic: filter/group computed values through a
+CTE, and order by a projected alias rather than an inline arithmetic expression.
+
 ### Scalar string functions
 
-Scalar calls accept bare or qualified columns, the typed literals above, and
-other catalog scalar calls. Names are case-insensitive and stored lowercase.
+Scalar calls accept bare or qualified columns, the typed literals above,
+arithmetic, and other catalog scalar calls. Names are case-insensitive and stored lowercase.
 For example:
 
 ```d8r
@@ -185,7 +244,7 @@ The complete scalar catalog is below. `text`, `separator`, `prefix`, `suffix`,
 `old`, `new`, `needle`, `pad`, `from`, `to`, `other`, `url`, and `format`
 require string values; `start`, `length`, `count`, `from_base`, and `to_base`
 require integers. Each argument can itself be a compatible column, typed
-literal, or scalar call. Brackets denote optional positional arguments;
+literal, arithmetic expression, or scalar call. Brackets denote optional positional arguments;
 `...` permits more string arguments, never empty argument slots.
 
 | signature | result / behavior |
@@ -272,8 +331,8 @@ names; compute a value in a CTE to filter or group it:
 The AST and payload always include `scalar` on select items (`null` for all
 other expression kinds). A call is `{"fn": "concat", "args": [...]}`; each
 argument is exactly `{"column": "e.path"}`, `{"literal": {"value": "-"}}`,
-or another `{"fn": ..., "args": [...]}` call. This wrapper preserves explicit
-NULL as `{"literal": {"value": null}}`. The payload always supplies the effective
+another `{"fn": ..., "args": [...]}` call, or an arithmetic `{"op": ..., "args": [...]}`.
+This wrapper preserves explicit NULL as `{"literal": {"value": null}}`. The payload always supplies the effective
 output alias; a direct engine payload without an alias defaults to the function
 name.
 
@@ -296,6 +355,47 @@ and window frames. A global count on empty input returns one row containing zero
 Other aggregates cannot take `*` and are rejected by the engine. The AST keeps
 `count(*)` as `aggregate: {"fn": "count", "arg": "*"}`. Its existing derived
 alias is `__count`; an explicit `as` alias overrides it, including for windows.
+
+### Filtered aggregates
+
+An aggregate argument may end with an inline `\where` predicate:
+
+```d8r
+\from orders
+\select customer_id
+\select sum(amount \where status = 'paid') as paid_total
+\select count(* \where status = 'pending' or status is null) as pending_rows
+\select sum(amount \where status = 'paid') / count(amount \where status = 'paid') as paid_average
+\group customer_id
+```
+
+`sum`, `avg`, `min`, `max`, and `count` accept the same predicate grammar as a
+query-level `\where`: AND/OR precedence, parenthesized groups, comparisons,
+`between`, NULL tests, pattern operators, lists and inline subqueries. Predicate
+columns resolve against the same open tables as the aggregate argument. Each
+predicate is independent: it restricts only that aggregate, not the source rows,
+other aggregates, or the set of groups. A query-level `\where` still restricts
+the input first. Ibis reductions receive `where=predicate`; no SQL is handwritten.
+
+`count(* \where ...)` counts matching rows, including rows with NULL aggregate
+values; `count(amount \where ...)` counts matching non-NULL amounts. A filter
+matching no rows yields zero for counts and the backend's ordinary NULL result
+for sums. Filtered calls also work as arithmetic leaves and with existing
+`over (...)` windows; window filters do not remove output rows. Existing limits
+on mixing windows, aggregates, scalar calls and grouping still apply. Arguments
+remain one column, or `*` for `count` only. Aliases still derive from argument and
+function, so give independently filtered calls explicit aliases to distinguish them.
+
+`AggCall.where` is an optional `WhereClause`. When present, AST JSON adds
+`"where": { ... }` inside the existing `{"fn": "sum", "arg": "amount"}`
+aggregate object, using the full where-tree AST shape. Payload conversion uses
+the ordinary where payload (without line/raw metadata), recursively lowering any
+predicate subqueries even in arithmetic leaves. Unfiltered aggregates omit this
+field, preserving their existing JSON shape. Each aggregate predicate is bounded
+by `MAX_WHERE_DEPTH = 32` grouped levels and `MAX_WHERE_NODES = 256` condition/group
+nodes, shared by parsing and raw-payload validation. Malformed predicate trees,
+operands, extra fields and oversized/cyclic raw payload trees are rejected with
+`PayloadError`, not silently ignored.
 
 ### Window frames
 
@@ -346,15 +446,16 @@ alias is `__count`; an explicit `as` alias overrides it, including for windows.
   (`\with expects a bare CTE name`).
 - A CTE is addressable by name from a later `\from`/`\join` (and as a
   `\union`/`\intersect`/`\except` operand), in document order (a *forward*
-  reference is `unknown table "x"`); nested CTEs (a `\with` inside a
-  body) are the error `nested CTEs are not supported`; a repeated name is
+  reference is `unknown table "x"`); nested CTEs (a `\with` inside a CTE
+  body or inline subquery) are the error `nested CTEs are not supported`; a repeated name is
   `duplicate CTE name "a"`; a name colliding with a *loaded* dataset is
   `CTE name "events" shadows dataset "events"` (the engine's build order would
   make the dataset unreachable).
 - A CTE body validates like the main query — same identifier/column rules,
   scoped to its own open tables, and it sees every CTE defined **before** it.
-  Body errors bubble to the document with their absolute line numbers;
-  `with_[i].body.errors` is always empty.
+  Inline subqueries inherit the CTE names visible where they occur.
+  Body errors bubble to the document with their absolute line numbers (or the
+  call's line for an expanded function); `with_[i].body.errors` is always empty.
 
 ### `\distinct` / `\unique`
 
@@ -526,6 +627,16 @@ with its argument:
 \from hot(1000) as h          # or \open, \join, \join lateral, or a set-op operand
 \select h.user_id, h.amount
 ```
+Run a saved function directly with **`\hot(1000)`**, or **`\name()`** for a
+zero-argument function. This is source-clause shorthand for `\from hot(1000)`:
+Run and Compile use the ordinary AST → payload → Ibis path, and later clauses
+can project/filter/order the result. The shorthand also works in CTEs and function
+bodies. Function names retain their declared case; arguments retain their quoted
+values. Built-in command names keep precedence, so a function named `select`, for
+example, must use `\from select(...)`. Clause navigation treats a direct call as
+the block's `\from`. The command palette offers saved calls with the caret inside
+their parentheses, then leaves argument text untouched.
+
 
 - A call is **`name(arg, …)`** at any table position `\from`/`\open`/`\join`/a set
   operation already accept. The arguments are **positional only** — bound to the
@@ -535,8 +646,8 @@ with its argument:
   function name**, exactly as a dataset's would (`hot.user_id`, or `h.user_id`
   under `as h`).
 - Expansion is **textual, at parse time** (`substitute_params`): command
-  boundaries are identified in the saved body before arguments are substituted
-  within each command. The expanded commands are parsed as a relation at the
+  boundaries and CTE indentation are identified in the saved body before
+  arguments are substituted within each command. The expanded commands are parsed as a relation at the
   call site, on the call's line. Unbalanced templates or substituted commands
   are rejected; quoted parentheses, apostrophes, and commas remain values. So
   the engine sees **literals** and **ibis never learns a function existed**: a
@@ -547,6 +658,16 @@ with its argument:
   body, doc)` in the session's immutable schema context. `parse_body` validates
   a candidate body against a context containing its replacement definition,
   before either disk or live definitions change.
+- Each function invocation owns a **flat sequential CTE scope**: root-level
+  `\with` blocks are allowed, and later blocks can read earlier ones through
+  `\from`, `\join`, set operations, and inline subqueries. Aliases, `\except`,
+  `\union all`, ordering, and limits have the same semantics as in a document.
+  Local names can match names in the caller or another invocation without
+  colliding or leaking; a function never captures the caller's CTEs. The ordinary
+  forward-reference, duplicate-name, and dataset-shadowing checks still apply.
+  A call inside a CTE body may itself define its own local CTEs, but a literal
+  `\with` nested inside another CTE body or inline subquery is still unsupported.
+  Functions remain relations: `\temp`, `\drop`, and transactions are forbidden.
 - Active function-call stacks reject direct and indirect recursion. Expansion
   is limited to 16 nested calls and 256 total calls per parse, including calls
   through inline queries, CTEs, joins, and set operations. Independent sibling
@@ -704,7 +825,7 @@ statements alone carries no query and answers with their status.
   it legitimately knows nothing. Duplicate table identifiers, duplicate CTE
   names, nested CTEs, and all grammar errors fire regardless of the registry.
 - A qualified reference is checked in `\select` (including aggregate/temporal/regex
-  arguments, recursively nested scalar arguments, and window `partition by`/`order by`), `\where`, `\group`,
+  arguments and aggregate predicates, recursively nested scalar/arithmetic arguments, and window `partition by`/`order by`), `\where`, `\group`,
   `\order`, `\case` conditions, and **both** operands of a `\join`'s `on` — a
   qualified `on` side names whichever relation it points at, so its prefix must
   be an identifier open *at* that clause: everything before it **plus the alias
@@ -750,6 +871,7 @@ statements alone carries no query and answers with their status.
     "column": null,          // plain column, else null
     "literal": null,         // { "value": "x" | 1 | 2.5 | true | null } for a constant
     "scalar": null,          // { "fn": "upper", "args": [{ "column": "path" }] } or null
+    "arithmetic": null,      // { "op": "/", "args": [{ "column": "amount" }, { "literal": { "value": 100 } }] }
     "star": false,           // \select *
     "aggregate": { "fn": "sum", "arg": "amount" },   // or null
     "temporal": null,        // { "fn": "month", "arg": "placed_at" } or null
@@ -819,7 +941,7 @@ statements alone carries no query and answers with their status.
 Each open table (the source `\from`/`\open`, then every `\join`ed dataset in
 document order) has an **identifier**: its alias if given, otherwise its
 dataset name. References in `\select` / `\where` / `\group` / `\order` (and
-aggregate/scalar arguments, window frames, and `\case` conditions) are either:
+aggregate/scalar/arithmetic arguments, window frames, and `\case` conditions) are either:
 
 - **qualified** — `u.region` / `users.region`: one dot, the prefix must match
   an open table's identifier; it resolves to exactly that table. Aliasing is

@@ -36,6 +36,7 @@ from textual.message import Message
 from textual.widgets import OptionList, TextArea
 from textual.widgets.option_list import Option
 
+from d8r.engine import DataSource
 from d8r.query import (
     AGGREGATES,
     NULL_OPS,
@@ -51,7 +52,7 @@ from d8r.query import (
     take_paren,
     where_head,
 )
-from d8r.query.functions import SCALAR_FUNCTIONS, ArgumentKind
+from d8r.query.functions import ARITHMETIC_PRECEDENCE, MAX_EXPRESSION_DEPTH, SCALAR_FUNCTIONS, ArgumentKind
 
 from .session import Session, looks_numeric
 
@@ -92,6 +93,8 @@ ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Export results", "save selected or buffered rows as CSV", "export-results"),
     ("AI", "chat and review an AI-proposed replacement", "ai"),
     ("History", "show/hide the history pane", "history"),
+    ("Pages", "show/hide the query pages pane", "toggle_pages"),
+    ("Queries", "show/hide the query pages pane", "toggle_pages"),
     ("Results", "show/hide the results pane", "toggle-results"),
     ("SQL", "show/hide the SQL pane", "toggle-sql"),
     ("Schema", "show/hide the schema pane", "toggle-schema"),
@@ -120,8 +123,8 @@ SAVEPOINT_COMMANDS = frozenset({"savepoint", "release"})
 # current block already gives that clause.
 CLAUSE_NAMES = frozenset(name for name, _ in COMMANDS)
 
-# The function-library summon. Like the pane toggles it is an action, not a
-# clause: `\fn` never becomes document text.
+# The function menu: saved entries insert calls, and explicit creation opens
+# the library. The `\fn` menu text itself never remains in the document.
 FN_COMMAND = "fn"
 
 # Fallback comparison operators; the live capability set is preferred.
@@ -170,7 +173,7 @@ class View:
     # "command": the word right after the `\\`. "argument": everything a command
     # takes. Escape's dismissal silences both; a fresh `\\` is what lifts it.
     phase: Literal["command", "argument"] = "command"
-    # Parameter completion replaces the full token even when the caret is inside it.
+    # Replace the whole token when the caret is inside an existing argument.
     end: int | None = None
 
     @property
@@ -239,7 +242,7 @@ def _split(text: str) -> tuple[str, str, str]:
     return word, text[index:gap_end], text[gap_end:]
 
 
-def _command_entries(token: str, schema: SchemaContext) -> list[Entry]:
+def _command_entries(session: Session, token: str, schema: SchemaContext) -> list[Entry]:
     """The language and the app's actions matching the word after the `\\`.
 
     What the backend advertises decides what is offered: `\\savepoint` and
@@ -258,7 +261,13 @@ def _command_entries(token: str, schema: SchemaContext) -> list[Entry]:
         (match_rank(label, token), len(COMMANDS) + index, Entry(label=label, detail=detail, action=action))
         for index, (label, detail, action) in enumerate(ACTIONS)
     ]
-    best = [row for row in (*commands, *actions) if row[0] >= 0]
+    functions = [
+        (match_rank(call, token), len(COMMANDS) + len(ACTIONS) + index,
+         Entry(label=f"\\{call}", insert=f"\\{call}", detail=detail, cursor_back=1))
+        for index, (call, detail) in enumerate(session.fn_call_rows(schema=schema))
+        if call[:-2].lower() not in CLAUSE_NAMES
+    ]
+    best = [row for row in (*commands, *actions, *functions) if row[0] >= 0]
     best.sort(key=lambda row: (row[0], row[1]))
     return [entry for _, _, entry in best]
 
@@ -270,39 +279,73 @@ def _segment(rest: str) -> tuple[str, int]:
     return raw.lstrip(), offset + (len(raw) - len(raw.lstrip()))
 
 
-def _expression_position(text: str) -> tuple[int, str | None, int] | None:
-    """Locate the current select expression or innermost call argument.
+@dataclass
+class _ExpressionPosition:
+    offset: int = 0
+    fn: str | None = None
+    argument: int = 0
+    arithmetic: bool = False
+    close: bool = True
+    numeric_result: bool = False
 
-    Commas in strings and completed nested calls never restart completion.
-    Inside a quoted literal there is nothing for the palette to insert.
-    """
-    offset = 0
-    stack: list[tuple[str, int, int]] = []
+
+def _expression_position(text: str) -> _ExpressionPosition | None:
+    """Locate an operand without treating quoted operators or exponent signs as boundaries."""
+    stack = [_ExpressionPosition()]
     quote: str | None = None
     for index, char in enumerate(text):
+        current = stack[-1]
         if quote:
             if char == quote:
                 quote = None
         elif char in "\"'":
             quote = char
         elif char == "(":
-            match = _CALL_NAME_RE.search(text[:index])
-            stack.append((match.group(1).lower() if match else "", 0, index + 1))
+            if len(stack) > MAX_EXPRESSION_DEPTH:
+                return None
+            # Dedicated calls (including aggregates) accept columns, not nested
+            # calls or grouped arithmetic. Catalog calls accept expressions.
+            if any(frame.fn and frame.fn not in SCALAR_FUNCTIONS for frame in stack):
+                return None
+            match = _CALL_NAME_RE.search(text[current.offset:index])
+            fn = match.group(1).lower() if match else None
+            if fn in AGGREGATES and any(frame.fn in SCALAR_FUNCTIONS for frame in stack):
+                return None
+            if current.arithmetic and fn and fn not in AGGREGATES:
+                spec = SCALAR_FUNCTIONS.get(fn)
+                if spec is None or spec.result not in {"integer", "any"}:
+                    return None
+            stack.append(_ExpressionPosition(
+                index + 1, fn, arithmetic=fn is None,
+                numeric_result=current.arithmetic,
+            ))
         elif char == ")":
-            if stack:
+            if len(stack) > 1:
                 stack.pop()
         elif char == ",":
-            if stack:
-                fn, argument, _ = stack[-1]
-                stack[-1] = (fn, argument + 1, index + 1)
-            else:
-                offset = index + 1
+            if len(stack) > 1 and current.fn is None:
+                return None
+            current.argument += 1
+            current.offset = index + 1
+            current.arithmetic = False
+        elif char in ARITHMETIC_PRECEDENCE:
+            if char in "+-" and re.fullmatch(
+                r"\s*(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE]", text[current.offset:index],
+            ):
+                continue
+            current.offset = index + 1
+            current.arithmetic = True
     if quote:
         return None
-    fn, argument, offset = stack[-1] if stack else (None, 0, offset)
-    while offset < len(text) and text[offset].isspace():
-        offset += 1
-    return offset, fn, argument
+    current = stack[-1]
+    owner = next((frame for frame in reversed(stack) if frame.fn is not None), stack[0])
+    while current.offset < len(text) and text[current.offset].isspace():
+        current.offset += 1
+    return _ExpressionPosition(
+        current.offset, owner.fn, owner.argument, current.arithmetic,
+        close=current is owner and not current.arithmetic,
+        numeric_result=owner.numeric_result,
+    )
 
 
 def _word(rest: str) -> tuple[str, int]:
@@ -317,20 +360,61 @@ def _word(rest: str) -> tuple[str, int]:
     return token, rest.rfind(token)
 
 
-def _group_token(rest: str, token: str, offset: int) -> tuple[str, int]:
-    """The `\where` token with group parens peeled off its ends.
+def _where_token(rest: str) -> tuple[str, int]:
+    """Locate the operand being edited without splitting quoted words or groups."""
+    start = 0
+    quote: str | None = None
+    for index, char in enumerate(rest):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char.isspace() or char in "(),":
+            start = index + 1
+    return rest[start:], start
 
-    Parens are grammar, not filter text: an opening `(` must not filter the
-    column offers it sits before, and a closing `)` ends the *previous*
-    condition, so after it nothing is being typed — the state machine reads
-    the closed group from `before` and offers the joiners.
-    """
-    while token.startswith("("):
-        token = token[1:]
-        offset += 1
-    if token.endswith(")"):
-        return "", len(rest)
-    return token, offset
+
+def _command_context(before: str) -> tuple[int, bool]:
+    """Find the live command, ignoring quoted slashes and closed inner filters."""
+    slash = -1
+    stack: list[tuple[int, str | None]] = []
+    quote: str | None = None
+    for index, char in enumerate(before):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            match = _CALL_NAME_RE.search(before, 0, index)
+            stack.append((slash, match.group(1).lower() if match else None))
+        elif char == ")" and stack:
+            slash, _ = stack.pop()
+        elif char == "\\":
+            slash = index
+    return slash, any(fn in AGGREGATES for _, fn in stack)
+
+
+def _token_end(line: str, start: int, column: int) -> int:
+    """Include a token's stale suffix, but never the next operand or punctuation."""
+    if start < column and line[start] in "\"'":
+        quote = line[start]
+        index = start + 1
+        while index < len(line):
+            if line[index] == quote:
+                if index + 1 < len(line) and line[index + 1] == quote:
+                    index += 2
+                    continue
+                return max(column, index + 1)
+            index += 1
+        return column
+    if start == column or not (line[column - 1].isalnum() or line[column - 1] in "_."):
+        return column
+    end = column
+    while end < len(line) and (line[end].isalnum() or line[end] in "_."):
+        end += 1
+    return end
 
 
 def _column_offers(session: Session, doc: str, token: str, schema: SchemaContext) -> list[Entry]:
@@ -379,6 +463,7 @@ def _scalar_detail(fn: str) -> str:
 
 
 def _accepts_type(kind: ArgumentKind, type_: str) -> bool:
+    type_ = type_.removeprefix("!")
     if kind == "any":
         return True
     if kind == "integer":
@@ -386,24 +471,39 @@ def _accepts_type(kind: ArgumentKind, type_: str) -> bool:
     return type_ == kind
 
 
-def _select_entries(session: Session, doc: str, token: str, schema: SchemaContext) -> list[Entry]:
+def _numeric_type(type_: str) -> bool:
+    type_ = type_.removeprefix("!")
+    return type_.startswith(("int", "uint", "float", "decimal")) or type_ in {"null", "unknown"}
+
+
+def _select_entries(
+    session: Session, doc: str, token: str, schema: SchemaContext, *, arithmetic: bool = False,
+) -> list[Entry]:
     """`\\select` offers fields first, then the functions that apply to them.
 
     An open call is handled one level up, where its argument's span is known;
     here the token is the whole expression segment being typed.
     """
     columns = session.column_entries(doc, schema=schema)
-    rows = [(0, name, detail, f"{name} ") for name, _, detail in columns]
+    rows = [
+        (0, name, detail, f"{name} ") for name, type_, detail in columns
+        if not arithmetic or _numeric_type(type_)
+    ]
     rows += [(1, fn, "aggregate", f"{fn}(") for fn in _aggregate_fns(schema)]
-    rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns, schema)]
-    rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns(schema)]
-    rows += [(4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns(schema)]
+    if not arithmetic:
+        rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns, schema)]
+        rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns(schema)]
+    rows += [
+        (4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns(schema)
+        if not arithmetic or SCALAR_FUNCTIONS[fn].result in {"integer", "any"}
+    ]
     return _offers(rows, token)
 
 
 def _call_argument_entries(
     session: Session, doc: str, fn: str, partial: str, argument: int = 0,
-    *, schema: SchemaContext,
+    *, schema: SchemaContext, arithmetic: bool = False, close: bool = True,
+    numeric_result: bool = False,
 ) -> list[Entry]:
     """Complete the current argument without replacing its enclosing call."""
     columns = session.column_entries(doc, schema=schema)
@@ -411,28 +511,37 @@ def _call_argument_entries(
         if fn not in _scalar_fns(schema):
             return []
         spec = SCALAR_FUNCTIONS[fn]
+        arithmetic = arithmetic or (numeric_result and spec.result == "any")
         kind = spec.argument_kind(argument)
-        if kind is None:
+        if kind is None or (arithmetic and kind == "string"):
             return []
         # Multi-argument calls stay open: the user chooses additional optional
         # or variadic arguments. Unary calls complete like existing date parts.
         suffix = ")" if len(spec.parameters) == 1 else ", " if argument + 1 < spec.minimum else ""
+        if not close:
+            suffix = ""
         rows = [
             (0, name, detail, f"{name}{suffix}")
-            for name, type_, detail in columns if _accepts_type(kind, type_)
+            for name, type_, detail in columns
+            if _accepts_type(kind, type_) and (not arithmetic or _numeric_type(type_))
         ]
         rows += [
             (1, nested, _scalar_detail(nested), f"{nested}(")
             for nested in _scalar_fns(schema)
-            if kind == "any" or SCALAR_FUNCTIONS[nested].result == kind
+            if (kind == "any" or SCALAR_FUNCTIONS[nested].result == kind)
+            and (not arithmetic or SCALAR_FUNCTIONS[nested].result in {"integer", "any"})
         ]
         return _offers(rows, partial)
-    if argument:
+    if argument or arithmetic:
         return []
     if fn in _aggregate_fns(schema):
-        rows = [(0, name, detail, f"{name})") for name, _, detail in columns]
+        suffix = ")" if close else ""
+        rows = [
+            (0, name, detail, f"{name}{suffix}") for name, type_, detail in columns
+            if not numeric_result or fn == "count" or _numeric_type(type_)
+        ]
         if fn == "count":
-            rows.append((1, "*", "every row", "*)"))
+            rows.append((1, "*", "every row", f"*{suffix}"))
         return _offers(rows, partial)
     families = {family for family, fns in schema.capabilities.functions.items() if fn in fns}
     if fn not in TEMPORAL or not families:
@@ -452,13 +561,14 @@ def _value_text(value: str) -> str:
 
 def _value_entries(
     session: Session, doc: str, column: str, token: str, schema: SchemaContext,
+    value_lookup: Callable[[str], list[str]] | None = None,
 ) -> list[Entry]:
     """That column's distinct values, searched by what is being typed."""
     rows = [
         (0, value, f"{column} value", f"{_value_text(value)} ")
-        for value in session.values_for(doc, column, schema=schema)
+        for value in (value_lookup(column) if value_lookup is not None else session.values_for(doc, column, schema=schema))
     ]
-    return _offers(rows, token.strip('"'))[:VALUE_SUGGESTIONS]
+    return _offers(rows, token.strip("\"'"))[:VALUE_SUGGESTIONS]
 
 
 def _fn_call_entries(session: Session, token: str, schema: SchemaContext) -> list[Entry]:
@@ -477,13 +587,10 @@ def _fn_call_entries(session: Session, token: str, schema: SchemaContext) -> lis
 
 
 def _fn_view(schema: SchemaContext, token: str, slash: int) -> View | None:
-    """The `\fn` library view: open an existing function, or create one.
+    """Complete saved calls; offer creation after matching functions.
 
-    Bare `\fn` offers the library (and a new function). `\fn <name>` filters
-    it to what matches and always offers to create the typed name — entering a
-    new name is how a new function begins, and entering an existing one opens
-    it. These are actions: accepting erases the whole span, so `\fn` never
-    stays in the document.
+    The Functions action opens the library for editing. Saved rows here are
+    ordinary source-clause completions, never editor-navigation actions.
     """
     entries: list[Entry] = []
     for fn in schema.fns:
@@ -493,13 +600,14 @@ def _fn_view(schema: SchemaContext, token: str, slash: int) -> View | None:
         detail = f"{', '.join(fn.params)}" if fn.params else "no arguments"
         if fn.doc:
             detail = f"{detail} · {fn.doc}"
-        entries.append(Entry(label=fn.name, detail=detail, action=f"fn-open:{fn.name}"))
+        entries.append(Entry(label=fn.name, insert=f"\\from {fn.name}()",
+                             detail=detail, cursor_back=1))
     if not token or is_identifier(token):
         exact = any(entry.label.lower() == token.lower() for entry in entries)
         if not exact:
             label = token if token else "New function…"
             detail = f"create \\fn {token}" if token else "define a new table-valued function"
-            entries.insert(0, Entry(label=label, detail=detail, action=f"fn-new:{token}"))
+            entries.append(Entry(label=label, detail=detail, action=f"fn-new:{token}"))
     return View(start=slash, token=token, entries=entries) if entries else None
 
 
@@ -517,6 +625,7 @@ def _parameter_token(before: str) -> tuple[int, str] | None:
 
 def view_for(
     session: Session, doc: str, line: str, column: int, *, parameters: Iterable[str] = (),
+    value_lookup: Callable[[str], list[str]] | None = None,
 ) -> View | None:
     """The palette view for the line text left of the caret, or `None`.
 
@@ -535,36 +644,41 @@ def view_for(
         ]
         end = next((end for begin, end, _ in param_spans(line) if begin == start), column)
         return View(start, line[start:end], entries, phase="argument", end=end) if entries else None
-    slash = before.rfind("\\")
+    slash, inline_filter = _command_context(before)
     if slash < 0:
         return None
     word, gap, rest = _split(before[slash + 1 :])
     if word.lower() == FN_COMMAND:
-        # `\fn` is a summon, not a clause: it never lands in the document. Bare
-        # it opens the library; `\fn <name>` opens (or offers to create) that
-        # one function. Accepting erases the whole `\ … ` span and fires the
-        # app's action, exactly like `Run`/`Compile`.
+        # Saved functions complete as calls; only the explicit create row
+        # opens an editor. Replace the entire `\fn ...` span on acceptance.
         return _fn_view(schema, rest.strip(), slash)
+    if inline_filter and not gap:
+        entries = [
+            Entry(label="\\where", insert="\\where ", detail="filter this aggregate's rows")
+        ] if "where".startswith(word.lower()) else []
+        return View(slash, word, entries, phase="argument", end=_token_end(line, slash, column)) if entries else None
     if not gap:
-        entries = _command_entries(word, schema)
-        return View(start=slash, token=word, entries=entries) if entries else None
+        if "(" in word:
+            return None  # The name is complete; leave typed arguments untouched.
+        entries = _command_entries(session, word, schema)
+        return View(start=slash, token=word, entries=entries,
+                    end=_token_end(line, slash, column)) if entries else None
 
     command = word.lower()
     arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where", "drop"}
     if command in arguments:
-        token, offset = _word(rest)
-        if command == "where":
-            token, offset = _group_token(rest, token, offset)
+        token, offset = _where_token(rest) if command == "where" else _word(rest)
     elif command == "select":
         position = _expression_position(rest)
         if position is None:
             return None
-        offset, fn, argument = position
+        offset, fn, argument = position.offset, position.fn, position.argument
         token = rest[offset:].strip()
     else:
         segment, offset = _segment(rest)
         token = segment.strip()
     start = slash + 1 + len(word) + len(gap) + offset
+    end = _token_end(line, start, column)
 
     if command == "temp":
         # A temp table's name is new text, not a choice — nothing to offer.
@@ -594,20 +708,27 @@ def view_for(
         entries = _offers(rows, token) + _fn_call_entries(session, token, schema)
     elif command == "select":
         if fn is not None:
-            entries = _call_argument_entries(session, doc, fn, token, argument, schema=schema)
+            entries = _call_argument_entries(
+                session, doc, fn, token, argument, schema=schema,
+                arithmetic=position.arithmetic,
+                close=position.close and not line[end:].lstrip().startswith((")", ",", "\\where", *ARITHMETIC_PRECEDENCE)),
+                numeric_result=position.numeric_result,
+            )
         else:
-            entries = _select_entries(session, doc, token, schema)
+            entries = _select_entries(session, doc, token, schema, arithmetic=position.arithmetic)
     elif command in COLUMN_COMMANDS:
         entries = _column_offers(session, doc, token, schema)
     elif command == "where":
-        entries = _where_entries(session, doc, rest[:offset], token, schema)
+        entries = _where_entries(session, doc, rest[:offset], token, schema, value_lookup)
     else:
         return None
-    return View(start=start, token=token, entries=entries, phase="argument") if entries else None
+    return View(start=start, token=token, entries=entries, phase="argument",
+                end=end) if entries else None
 
 
 def _where_entries(
     session: Session, doc: str, before: str, token: str, schema: SchemaContext,
+    value_lookup: Callable[[str], list[str]] | None = None,
 ) -> list[Entry]:
     """`\\where` completion over a condition tree of `and`/`or`.
 
@@ -620,25 +741,17 @@ def _where_entries(
     and `and`/`or` after a complete condition.
     """
     ops = operators(schema)
-    last_or = split_logic(before, "or")[-1]
-    piece = split_logic(last_or, "and")[-1]
-    # Inside a `( ... )` group the machine reads on inside the parens: peel
-    # them and re-split, so `(a or b` offers columns where `b` is being typed
-    # and a closed `(a = 1)` offers the joiners, exactly as the parser's
-    # `_where_tree` descends.
-    core = piece.strip()
-    peeled = False
-    while core.startswith("("):
-        closed = take_paren(core)
-        if closed is None:
-            core = core[1:].strip()
-        else:
-            core = f"{closed[0]} {closed[1]}".strip()
-        peeled = True
-    if peeled:
-        core = split_logic(core, "or")[-1]
-        core = split_logic(core, "and")[-1]
-        piece = core
+    piece = before
+    for _ in range(MAX_EXPRESSION_DEPTH + 1):
+        piece = split_logic(split_logic(piece, "or")[-1], "and")[-1].strip()
+        if not piece.startswith("("):
+            break
+        if take_paren(piece) is not None:
+            return _joiners(token)
+        # Descend and re-split at every open group, not only the outermost one.
+        piece = piece[1:]
+    else:
+        return []
     words = piece.split()
     if not words:
         # Either nothing is typed yet, or a joining `and`/`or` just landed
@@ -660,12 +773,11 @@ def _where_entries(
         ]
         return _offers(rows, token)
     column, op, tail = head
-    col = column.split(".")[-1]
     if op in NULL_OPS:
         # `is [not] null` needs no operand: the condition is complete.
         return _joiners(token)
     if op == "between":
-        return _between_entries(session, doc, col, tail, token, schema)
+        return _between_entries(session, doc, column, tail, token, schema, value_lookup)
     if op in REGEX_OPS:
         # A regex pattern is typed, never offered from the value pool.
         return _joiners(token) if tail and _closed_operand(tail) else []
@@ -673,11 +785,11 @@ def _where_entries(
         # An `in` takes a `( … )` — a list or a subquery — which is typed.
         return _joiners(token) if tail.endswith(")") else []
     if not tail:
-        return _value_entries(session, doc, col, token, schema)
+        return _value_entries(session, doc, column, token, schema, value_lookup)
     if _closed_operand(tail):
         return _joiners(token)
-    if tail.startswith('"'):
-        return _value_entries(session, doc, col, token, schema)
+    if tail.startswith(('"', "'")):
+        return _value_entries(session, doc, column, token, schema, value_lookup)
     return []
 
 
@@ -691,16 +803,17 @@ def _joiners(token: str) -> list[Entry]:
 
 def _between_entries(
     session: Session, doc: str, col: str, tail: str, token: str, schema: SchemaContext,
+    value_lookup: Callable[[str], list[str]] | None = None,
 ) -> list[Entry]:
     """`between`'s low, its `and`, then its high — each an offer in turn."""
     bounds = [bound.strip() for bound in split_logic(tail, "and")]
     if len(bounds) == 1:
         if not bounds[0] or not _closed_operand(bounds[0]):
-            return _value_entries(session, doc, col, token, schema)
+            return _value_entries(session, doc, col, token, schema, value_lookup)
         return _offers([(0, "and", "between's high bound", "and ")], token)
     high = bounds[1]
     if not high or not _closed_operand(high):
-        return _value_entries(session, doc, col, token, schema)
+        return _value_entries(session, doc, col, token, schema, value_lookup)
     return _joiners(token)
 
 
@@ -723,6 +836,18 @@ class CommandPalette(OptionList):
         def __init__(self, action: str) -> None:
             self.action = action
             super().__init__()
+    class ValuesRequested(Message):
+        """An on-demand read; the app owns connection sharing and background work."""
+
+        def __init__(self, palette: CommandPalette, source: DataSource, dataset: str, column: str,
+                     key: tuple[int, str, str, int]) -> None:
+            super().__init__()
+            self.palette = palette
+            self.source = source
+            self.dataset = dataset
+            self.column = column
+            self.key = key
+
 
     def __init__(
         self, session: Session, *, source_id: str | None = None,
@@ -739,6 +864,8 @@ class CommandPalette(OptionList):
         self._labels: list[str] = []
         # True after Escape: the offers stay shut until a `\` (or Escape) lifts it.
         self._dismissed = False
+        self._value_key: tuple[int, str, str, int] | None = None
+        self._value_result: list[str] | None = None
 
     @property
     def is_open(self) -> bool:
@@ -752,6 +879,23 @@ class CommandPalette(OptionList):
     def attach(self, editor) -> None:
         """Bind this palette to the editor whose text and caret it follows."""
         self.editor = editor
+
+    def reset_values(self) -> None:
+        """Drop the current transient response after cache settings/clear change."""
+        self._value_key = None
+        self._value_result = None
+        self.close()
+
+    def needs_values(self, key: tuple[int, str, str, int]) -> bool:
+        return (self.is_mounted and self._value_key == key and self._value_result is None
+                and key[-1] == self.session.value_cache_epoch
+                and self.session.intellisense and not self._dismissed)
+
+    def values_received(self, key: tuple[int, str, str, int], values: list[object]) -> None:
+        if not self.needs_values(key):
+            return
+        self._value_result = [str(value) for value in values if value is not None]
+        self.sync(respect_dismissal=True)
 
     # -- opening / closing --------------------------------------------------
 
@@ -775,6 +919,9 @@ class CommandPalette(OptionList):
             return
         if editor is None:
             return
+        if editor.read_only or editor.selection.start != editor.selection.end:
+            self.close()
+            return
         row, column = editor.cursor_location
         line = editor.document[row]
         if column > 0 and (
@@ -783,15 +930,44 @@ class CommandPalette(OptionList):
         ):
             # An explicit `\` or function parameter `@` lifts Escape's dismissal.
             self._dismissed = False
+        request: CommandPalette.ValuesRequested | None = None
+        value_key: tuple[int, str, str, int] | None = None
+        value_result: list[str] | None = None
+
+        def value_lookup(column_name: str) -> list[str]:
+            nonlocal request, value_key, value_result
+            source = self.session.source
+            dataset = self.session.dataset_of(editor.text, column_name)
+            if dataset is None:
+                return []
+            name = column_name.rsplit(".", 1)[-1]
+            value_key = (id(source), dataset, name, self.session.value_cache_epoch)
+            if value_key == self._value_key and self._value_result is not None:
+                value_result = self._value_result
+                return value_result
+            cached = self.session.cached_values(source, dataset, name)
+            if cached is not None:
+                value_result = [str(value) for value in cached[0] if value is not None]
+                return value_result
+            if value_key != self._value_key:
+                request = self.ValuesRequested(self, source, dataset, name, value_key)
+            return []
+
         with self.session.target_source(self.source_id):
             view = (
                 view_for(
                     self.session, editor.text, line, column,
                     parameters=self.parameters() if self.parameters is not None else (),
+                    value_lookup=value_lookup,
                 )
                 if self.session.intellisense and not self._dismissed
                 else None
             )
+        if value_key != self._value_key or value_result is not None:
+            self._value_key = value_key
+            self._value_result = value_result
+        if request is not None:
+            self.post_message(request.set_sender(self))
         if view is not None and not self.workspace_actions:
             view = View(view.start, view.token, [e for e in view.entries if not e.action], view.phase, view.end)
             if not view.entries:
@@ -840,11 +1016,13 @@ class CommandPalette(OptionList):
         Open (or offering something), it closes and stays shut while the user
         keeps typing; closed, it lifts that dismissal and offers again.
         """
-        if self.is_open:
+        if self.is_open or (self._value_key is not None and self._value_result is None and not self._dismissed):
             self.close()
             self._dismissed = True
             return
         self._dismissed = False
+        self._value_key = None
+        self._value_result = None
         self.sync()
 
     def move(self, delta: int) -> None:
@@ -872,30 +1050,41 @@ class CommandPalette(OptionList):
         there — `\\sel` completes to `\\select ` with the fields the new clause
         takes, and `sum(` keeps offering its argument.
         """
+        self.sync(respect_dismissal=True)
         view = self._view
         editor = self.editor
-        if view is None or editor is None or not 0 <= index < len(view.entries):
+        if (view is None or editor is None or editor.read_only
+                or editor.selection.start != editor.selection.end
+                or not 0 <= index < len(view.entries)):
             return False
         entry = view.entries[index]
-        if not entry.action and view.highlighted_is_typed(index):
-            return False
         row, column = editor.cursor_location
+        if (not entry.action and view.highlighted_is_typed(index)
+                and (view.end is None or view.end == column)):
+            return False
         if entry.action:
             editor.replace("", (row, view.start), (row, column))
             editor.cursor_location = (row, view.start)
             self.post_message(self.ActionPerformed(entry.action))
         else:
             command = entry.insert.strip()
-            if command.startswith("\\") and command[1:].lower() in CLAUSE_NAMES:
-                self._take_clause(editor, row, column, view, command[1:].lower())
+            if command.startswith("\\") and view.phase == "command":
+                name = command[1:].lower()
+                # Saved call offers are source clauses, just like \from.
+                self._take_clause(editor, row, column, view,
+                                  name if name in CLAUSE_NAMES else "from", entry)
             else:
                 end = column if view.end is None else view.end
-                editor.replace(entry.insert, (row, view.start), (row, end))
-                editor.cursor_location = (row, view.start + len(entry.insert) - entry.cursor_back)
+                insert = entry.insert
+                after = editor.document[row][end:]
+                if after and (after[0].isspace() or after[0] in "),"):
+                    insert = insert.rstrip()
+                editor.replace(insert, (row, view.start), (row, end))
+                editor.cursor_location = (row, view.start + len(insert) - entry.cursor_back)
         self.sync()
         return True
 
-    def _take_clause(self, editor, row: int, column: int, view: View, name: str) -> None:
+    def _take_clause(self, editor, row: int, column: int, view: View, name: str, entry: Entry) -> None:
         """A clause command takes its own line — or the line its clause has.
 
         The lookup runs in the block the caret is editing (`clause_line`), so a
@@ -904,20 +1093,23 @@ class CommandPalette(OptionList):
         the command breaks the line first, so it never lands after whatever the
         caret happened to be sitting in.
         """
+        end = column if view.end is None else view.end
         target = clause_line(editor.text, row + 1, name)
         if target is not None and target != row + 1:
-            editor.replace("", (row, view.start), (row, column))
+            editor.replace("", (row, view.start), (row, end))
             editor.cursor_location = (target - 1, len(editor.document[target - 1]))
             return
         before = editor.document[row][: view.start]
-        after = editor.document[row][column:]
+        after = editor.document[row][end:]
         indent = before[: len(before) - len(before.lstrip())]
         prefix = f"\n{indent}" if before.strip() else ""
-        suffix = f"\n{indent}" if after.strip() else ""
-        command = f"\\{name} "
-        editor.replace(f"{prefix}{command}{suffix}", (row, view.start), (row, column))
+        suffix = f"\n{indent}" if before.strip() and after.strip() else ""
+        command = entry.insert
+        if not suffix and after and after[0].isspace():
+            command = command.rstrip()
+        editor.replace(f"{prefix}{command}{suffix}", (row, view.start), (row, end))
         line, start = (row + 1, len(indent)) if prefix else (row, view.start)
-        editor.cursor_location = (line, start + len(command))
+        editor.cursor_location = (line, start + len(command) - entry.cursor_back)
 
 
 class EditorPane(Vertical):
@@ -1007,7 +1199,6 @@ class EditorPane(Vertical):
         """`ctrl+a` selects the whole document (TextArea would go to line start)."""
         self.editor.select_all()
 
-    def action_palette_tab(self) -> None:
-        """`tab` accepts the highlighted suggestion — it never moves focus."""
-        if self.palette.is_open:
-            self.palette.accept_highlighted()
+    def action_palette_tab(self) -> bool:
+        """Accept an offer without moving focus; report whether it changed the document."""
+        return self.palette.is_open and self.palette.accept_highlighted()

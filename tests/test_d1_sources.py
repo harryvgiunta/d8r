@@ -200,15 +200,10 @@ def test_snapshot_generation_replaces_old_pages_deterministically(tmp_path):
 # fails the tests that scan for it.
 SECRET = "super-secret-token-xyz"
 
-# orders(id, customer_id, amount REAL, paid TEXT); customers(id, region).
-SCHEMA_ROWS = [
-    {"source_table": "customers", "cid": 0, "name": "id", "type": "INTEGER", "notnull": 1},
-    {"source_table": "customers", "cid": 1, "name": "region", "type": "TEXT", "notnull": 0},
-    {"source_table": "orders", "cid": 0, "name": "id", "type": "INTEGER", "notnull": 1},
-    {"source_table": "orders", "cid": 1, "name": "customer_id", "type": "INTEGER", "notnull": 1},
-    {"source_table": "orders", "cid": 2, "name": "amount", "type": "REAL", "notnull": 0},
-    {"source_table": "orders", "cid": 3, "name": "paid", "type": "TEXT", "notnull": 0},
-]
+SCHEMA_SQL = """
+    create table customers (id integer not null, region text);
+    create table orders (id integer not null, customer_id integer not null, amount real, paid text);
+"""
 
 LIVE_ARGS = {"account_id": "acct-1", "database": "orders-db", "api_token": SECRET}
 
@@ -233,10 +228,19 @@ def fake_cloudflare(exec_rows: dict | None = None, bad_token: bool = False):
             return httpx.Response(200, json=_envelope([{"uuid": "11111111-2222-3333-4444-555555555555", "name": "orders-db"}]))
         sql = json.loads(request.content)["sql"]
         sent.append(sql)
-        if "sqlite_schema" in sql:  # schemas(): correlated pragma
-            return httpx.Response(200, json=_envelope([{"success": True, "results": SCHEMA_ROWS}]))
-        if "count(*)" in sql:  # row_counts(): UNION ALL
-            return httpx.Response(200, json=_envelope([{"success": True, "results": [{"dataset": "customers", "n": 2}, {"dataset": "orders", "n": 3}]}]))
+        if request.url.path.endswith("/query"):
+            if sql.strip().rstrip(";").upper() == "SELECT 1":
+                rows = [{"1": 1}]
+            else:
+                assert "sqlite_schema" in sql
+                # Execute both full and selective metadata queries: never return
+                # every table merely because the request mentions sqlite_schema.
+                with closing(sqlite3.connect(":memory:")) as database:
+                    database.row_factory = sqlite3.Row
+                    database.executescript(SCHEMA_SQL)
+                    rows = [dict(row) for row in database.execute(sql).fetchall()]
+            return httpx.Response(200, json=_envelope([{"success": True, "results": rows}]))
+        assert request.url.path.endswith("/raw")
         # raw(): run the compiled query/where/values SQL.
         return httpx.Response(200, json=_envelope([{"success": True, "results": exec_rows}]))
 
@@ -261,7 +265,6 @@ def test_live_source_requires_all_credentials():
 def test_live_source_registers_without_leaking_the_token():
     source, _ = live_source()
     assert source.kind == "d1-live" and source.dialect == "sqlite"
-    assert {name: e["rows"] for name, e in source.datasets.items()} == {"customers": 2, "orders": 3}
     # Nothing the UI may render carries the token.
     rendered = {
         "id": source.id,
@@ -322,11 +325,16 @@ def test_live_capabilities_refuse_udf_backed_functions_and_regex():
     assert caps["supports"]["unnest"] is False
 
 
-def test_live_probe_counts_tables():
-    source, _ = live_source()
-    assert source.kind == "d1-live"
-    assert len(source.datasets) == 2
-    source.d1.close()  # a probe's connection is released, never kept
+def test_live_connection_defers_schema_discovery():
+    source, sent = live_source()
+    try:
+        assert source.datasets == {}
+        assert source.con.list_tables() == []
+        assert not source.schema_indexed
+        assert len(sent) == 1
+        assert sent[0].strip().rstrip(";").upper() == "SELECT 1"
+    finally:
+        source.d1.close()
 
 
 def test_live_execute_runs_sqlite_sql_on_the_api():
@@ -346,8 +354,15 @@ def test_live_execute_runs_sqlite_sql_on_the_api():
     assert result["sql"].strip().upper().startswith("SELECT")
 
 
-def test_live_column_values_map_through_the_api():
+def test_indexed_live_column_values_map_through_the_api():
     source, sent = live_source(exec_rows={"columns": ["region"], "rows": [["amer"], ["emea"]]})
+    schemas = source.d1.schemas()
+    source.con.seed(schemas)
+    source.datasets = {
+        name: {"table": source.con.table(name), "doc": name, "rows": None}
+        for name in schemas
+    }
+    source.schema_indexed = True
     assert column_values(source, "customers", "region") == ["amer", "emea"]
     assert any("DISTINCT" in s.upper() and "region" in s for s in sent)
 
@@ -358,8 +373,9 @@ def test_live_bad_token_surfaces_message():
         add_d1_live_source("orders-db", client=client, **LIVE_ARGS)
 
 
-def test_live_compile_renders_without_executing():
+def test_live_compile_from_indexed_schema_renders_without_executing():
     source, sent = live_source()
+    source.con.seed(source.d1.schemas())
     sent.clear()
     payload = {"dataset": "orders", "select": [{"column": "id"}], "where": None, "joins": [], "group": None, "order": None, "limit": 3, "case": None, "with": []}
     compiled = expression.compile_sql(expression.build(source.con, payload), dialect="postgres")
@@ -384,7 +400,7 @@ def test_live_join_and_aggregate_build_on_unbound_schema():
     }
     result = execute_remote(source.d1, source.con, payload, source.dialect)
     assert result["rows"] == [["amer", 15.0], ["emea", 7.5]]
-    joined = [s for s in sent if "JOIN" in s.upper()]
+    joined = [s for s in sent if "JOIN" in s.upper() and "sqlite_schema" not in s]
     assert joined, "the compiled SQLite SQL must carry the join"
     assert all('"customers"' in s and '"orders"' in s for s in joined)
 
@@ -400,7 +416,12 @@ def sqlite_cloudflare():
     def handler(request: httpx.Request) -> httpx.Response:
         sql = json.loads(request.content)["sql"]
         sent.append(sql)
-        rows = [dict(row) for row in database.execute(sql).fetchall()]
+        try:
+            rows = [dict(row) for row in database.execute(sql).fetchall()]
+        except sqlite3.Error as exc:
+            return httpx.Response(200, json=_envelope([
+                {"success": False, "errors": [{"message": str(exc)}]},
+            ]))
         return httpx.Response(200, json=_envelope([{"success": True, "results": rows}]))
 
     client = CloudflareD1(
@@ -424,32 +445,120 @@ def test_live_discovery_executes_valid_sqlite_sql(sqlite_cloudflare):
         create view "public view" as select * from "order details";
     ''')
     source = add_d1_live_source("live", client=client, **LIVE_ARGS)
-    assert set(source.datasets) == {"order details", "public view"}
+    schemas = client.schemas()
+    assert set(schemas) == {"order details", "public view"}
+    assert source.con.list_tables() == []
+    source.con.seed(schemas)
+    assert set(source.con.list_tables()) == {"order details", "public view"}
     schema = source.con.table("order details").schema()
     assert schema.names == ("notnull", 'quoted"name')
     assert not schema["notnull"].nullable
     assert schema['quoted"name'].nullable
-    assert {name: table["rows"] for name, table in source.datasets.items()} == {
-        "order details": 2, "public view": 2,
-    }
 
 
-def test_live_discovery_counts_all_tables_across_compound_limit(sqlite_cloudflare):
+def test_live_connection_does_not_read_table_or_view_data(sqlite_cloudflare):
     database, client, _ = sqlite_cloudflare
-    expected = {}
-    for index in range(12):
-        name = f'''table {index:02d} ' "'''
-        quoted = '"' + name.replace('"', '""') + '"'
-        database.execute(f"create table {quoted} (id integer)")
-        database.executemany(f"insert into {quoted} values (?)", [(n,) for n in range(index)])
-        expected[name] = index
-    database.execute('create view "last view" as select 1 as id')
-    expected["last view"] = 1
+    database.executescript('''
+        create table records (id integer);
+        create view report as select * from records;
+    ''')
 
-    source = add_d1_live_source("many-tables", client=client, **LIVE_ARGS)
+    def authorize(action, table, column, schema, trigger):
+        if action == sqlite3.SQLITE_READ and table in {"records", "report"}:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
 
-    assert {name: entry["rows"] for name, entry in source.datasets.items()} == expected
-    assert set(source.con.list_tables()) == set(expected)
+    database.set_authorizer(authorize)
+    source = add_d1_live_source("metadata-only", client=client, **LIVE_ARGS)
+    assert source.datasets == {}
+    assert source.con.list_tables() == []
+    assert not source.schema_indexed
+
+
+def test_live_connection_and_query_survive_unrelated_discovery_failure(sqlite_cloudflare):
+    database, client, _ = sqlite_cloudflare
+    database.executescript('''
+        create table records (id integer);
+        create view broken as select * from missing;
+    ''')
+    source = add_d1_live_source("partially-indexable", client=client, **LIVE_ARGS)
+    expr = expression.build(source.con, {"dataset": "records"})
+    assert expr.schema().names == ("id",)
+    with pytest.raises(D1Error, match="missing"):
+        client.schemas()
+    # A failed background discovery neither closes the client nor invalidates
+    # the metadata already fetched for a queryable table.
+    assert source.con.table("records").schema().names == ("id",)
+    assert not client._client.is_closed
+
+
+def test_lazy_metadata_is_selective_quoted_and_cached(sqlite_cloudflare):
+    database, client, sent = sqlite_cloudflare
+    database.executescript('''
+        create table "order's ""details" (id integer primary key autoincrement, amount real);
+        create table other (name text);
+        create table _cf_meta (internal text);
+        create view "public view" as select name from other;
+        create view broken as select * from missing;
+    ''')
+    source = add_d1_live_source("selective", client=client, **LIVE_ARGS)
+    name = 'order\'s "details'
+    sent.clear()
+    assert source.con.table(name).schema().names == ("id", "amount")
+    assert len(sent) == 1
+    assert source.con.list_tables() == [name]
+    sent.clear()
+    assert source.con.table(name).schema().names == ("id", "amount")
+    assert sent == []
+
+    # A literal containing an SQL injection attempt must remain one name, not
+    # broaden discovery to the unrelated (and deliberately broken) view.
+    schemas = client.schemas([name, "public view", "_cf_meta", "sqlite_sequence", "x') OR 1=1 --"])
+    assert set(schemas) == {name, "public view"}
+    assert source.con.list_tables() == [name]
+    source.con.seed(schemas)
+    assert set(source.con.list_tables()) == {name, "public view"}
+    sent.clear()
+    assert client.schemas([]) == {}
+    assert source.con.table("public view").schema().names == ("name",)
+    assert sent == []
+    for hidden in ("_cf_meta", "sqlite_sequence", "absent"):
+        with pytest.raises(KeyError):
+            source.con.table(hidden)
+
+
+@pytest.mark.parametrize("failure", ["auth", "transport"])
+@pytest.mark.parametrize("lookup", ["root", "join"])
+def test_lazy_lookup_failures_propagate_through_build(failure, lookup):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/query")
+        sql = json.loads(request.content)["sql"]
+        if sql.strip().rstrip(";").upper() == "SELECT 1":
+            return httpx.Response(200, json=_envelope([{"success": True, "results": [{"1": 1}]}]))
+        if failure == "transport":
+            raise httpx.ConnectError("network unavailable", request=request)
+        return httpx.Response(401, json={"success": False, "errors": [{"message": "Invalid API Token"}]})
+
+    client = CloudflareD1(
+        account_id=LIVE_ARGS["account_id"], api_token=SECRET,
+        database="11111111-2222-3333-4444-555555555555",
+        _client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    try:
+        source = add_d1_live_source("credentials-expired", client=client, **LIVE_ARGS)
+        payload = {"dataset": "customers"}
+        if lookup == "join":
+            # An indexed left table must not hide a failed lookup of its join.
+            source.con.seed({"orders": {"customer_id": "int64"}})
+            payload = {
+                "dataset": "orders",
+                "joins": [{"dataset": "customers", "left": "customer_id", "right": "id"}],
+            }
+        message = "Invalid API Token" if failure == "auth" else "Could not reach Cloudflare"
+        with pytest.raises(D1Error, match=message):
+            expression.build(source.con, payload, tables={})
+    finally:
+        client.close()
 
 
 def test_empty_live_database_connects_without_count_queries(sqlite_cloudflare):
@@ -529,7 +638,7 @@ def test_token_is_redacted_from_client_repr_and_failures(failure):
         client.close()
 
 
-def test_failed_discovery_releases_client_even_for_non_d1_errors():
+def test_failed_connection_probe_releases_client_even_for_non_d1_errors():
     def handler(request: httpx.Request) -> httpx.Response:
         raise RuntimeError("transport failed before responding")
 

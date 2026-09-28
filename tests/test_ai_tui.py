@@ -13,7 +13,6 @@ from d8r.ai.client import AIConfig
 from d8r.ai.context import AIContext
 from d8r.tui.ai import AIPanel
 from d8r.tui.app import D8RApp
-from d8r.tui.fn import FnScreen
 from d8r.tui.session import Session
 from d8r.tui.settings import AIProviderScreen, SettingsScreen
 
@@ -514,7 +513,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
                 assert not panel.messages
             finally:
                 release.set()
-                await asyncio.gather(*panel._context_tasks)
+                await asyncio.gather(*panel.manager.context_tasks)
 
     asyncio.run(scenario())
 
@@ -522,7 +521,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
 def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
     requests = []
     body = "\\from products\n\\where category = @category\n\\select category\n\\limit 2"
-    metadata = {"name": "categories", "description": "Return two product categories",
+    metadata = {"kind": "function", "original_name": None, "name": "categories", "description": "Return two product categories",
                 "parameters": ["category"], "arguments": '"electronics"'}
 
     def provider(request):
@@ -538,8 +537,8 @@ def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
         async with app.run_test(size=(100, 35)) as pilot:
             app.action_fn()
             await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, FnScreen)
+            screen = app.function_editor
+            assert app.function_mode
             await click(pilot, screen.query_one("#fn-ai", Button))
             panel = screen.ai_panel
             assert not requests  # Opening the helper must not send anything.
@@ -568,7 +567,7 @@ def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
             assert len(requests) == 2
             assert not panel.query_one("#ai-apply", Button).disabled
             await click(pilot, panel.query_one("#ai-apply", Button))
-            assert not panel.display
+            assert panel.display
             assert screen.query_one("#fn-name", Input).value == "categories"
             assert screen.query_one("#fn-params", Input).value == "category"
             assert screen.query_one("#fn-args", Input).value == '"electronics"'
@@ -615,7 +614,7 @@ def test_complete_function_proposals_reject_invalid_or_conflicting_definitions()
     context = AIContext(session, "demo", "", parameters=())
 
     def proposal(name="generated", parameters=None, body=PROPOSAL):
-        metadata = {"name": name, "description": "Example", "parameters": parameters or [], "arguments": ""}
+        metadata = {"kind": "function", "original_name": None, "name": name, "description": "Example", "parameters": parameters or [], "arguments": ""}
         return context.read_proposal("```json\n" + json.dumps(metadata) + "\n```\n```d8r\n" + body + "\n```")
 
     assert context.validate_replacement(proposal()) is None
@@ -626,3 +625,28 @@ def test_complete_function_proposals_reject_invalid_or_conflicting_definitions()
     assert context.validate_replacement(proposal(body="\\from events\n\\temp kept")) is not None
     assert list(session.fns) == ["existing"]
     assert not session.history
+
+
+def test_auto_accept_menu_persists_only_successful_toggles():
+    async def scenario():
+        app = D8RApp()
+        async with app.run_test(size=(100, 35)) as pilot:
+            await pilot.press("ctrl+comma")
+            screen = app.screen
+            sidebar = screen.query_one("#settings-sidebar", OptionList)
+            sidebar.highlighted = sidebar.get_option_index("ai")
+            await pilot.pause()
+            await pilot.press("enter")
+            menu = screen.query_one("#settings-menu", OptionList)
+            menu.highlighted = next(index for index, row in enumerate(screen.rows)
+                                    if row.action == "ai-auto-accept")
+            await pilot.press("enter")
+            assert app.session.ai_auto_accept
+            restored = Session()
+            assert restored.ai_auto_accept
+            # Another session's write must not silently change consent in this UI.
+            restored.update_settings(intellisense=False)
+            await pilot.press("enter")
+            assert app.session.ai_auto_accept
+            assert Session().ai_auto_accept
+    asyncio.run(scenario())

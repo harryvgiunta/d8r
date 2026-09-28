@@ -60,7 +60,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 
 ```
 ┌ D8R   [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ]  duckdb ───────────┐
-│ Schema              │ Document                                               │
+│ Schema | Pages      │ Document                                               │
 │  events  100 rows   │  \from events                                          │
 │   ▸ timestamp       │  \select event_type                                    │
 │   ▸ user_id         │  \select sum(amount) as total                          │
@@ -69,17 +69,22 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 │                     │  event_type · string          total · float64          │
 │                     │  click                        …                        │
 └─────────────────────────────────────────────────────────────────────────────┘
-  ctrl+enter run · ctrl+k compile · ctrl+o data source · \ palette · tab panes · ctrl+q quit
+  ctrl+enter run · ctrl+k compile · ctrl+o data source · \ palette · tab accept · ctrl+q quit
 ```
 
 - **Header** — the datasource picker, the dialect picker, and a pill naming the
   backend actually in use (`duckdb`, `postgres (mock)`, `sqlite (D1 snapshot)`,
   `sqlite (Cloudflare D1)`, `postgres (live)`). Switching either picker re-points the whole app:
   the tree, the parser's schema seam, and the palette's offers.
-- **Schema pane** — the active source's datasets with their row counts (PostgreSQL
-  counts are not loaded, avoiding full-table scans during connection). Expand a
-  dataset to load its columns (name + dtype) and select one to insert its name
-  into the document.
+- **Schema / Pages explorer** — Schema lists the active source's datasets and
+  column types. Expand a column to inspect up to 1,000 distinct values, including
+  NULL, without changing the document or execution history. Enter on a column
+  still inserts its name. PostgreSQL row counts remain unloaded to avoid scans.
+  **Pages** keeps editable query drafts: create, duplicate, rename, or reopen a
+  page with its caret, source, dialect and chat identity intact. Existing successful
+  history seeds pages when upgrading. `\pages` and `\queries` reveal Pages; using
+  either again while Pages is visible hides the explorer. Switching pages never runs
+  a query or connects a database.
 - **Document pane** — the editor (line numbers on), with the `\` palette
   floating under the caret.
 - **Results / SQL / History tabs** — Results shows the executed rows, or the
@@ -89,6 +94,35 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   source target and dialect without executing it or reconnecting automatically.
 - **Footer** — the key hints, and a status line that reports what just happened
   (rows, milliseconds, source, dialect).
+
+Query and function editing share these slots. **Functions** (or `\fn`) replaces
+the schema explorer with the function library, the document with the function
+form, and query results with a function preview. **Query** or `ctrl+q` returns to
+the unchanged document. **Ask AI** opens the same assistant on the right in either
+mode; it never takes over the form.
+
+Drag the separators to resize the explorer, assistant, and editor/output split.
+Click a separator and use Left/Right or Up/Down for one-cell adjustments; hold
+Shift for five cells. Escape cancels a drag. Sizes stay put when changing modes
+and persist in `settings.json` as `pane_sizes` (`explorer`, `ai`, `editor`, in
+terminal cells). Smaller terminals temporarily clamp panes; enlarging restores
+your preferred sizes.
+
+IntelliSense continues after `AND`/`OR`, including nested conditions and inline
+aggregate filters. Tab accepts the current suggestion only; with no suggestion it
+does not insert indentation or move focus in the query editor.
+
+Filtered aggregates keep the query's input rows while filtering each reduction:
+
+```d8r
+\from events
+\select user_id, sum(amount \where event_type = 'purchase') as purchases, count(* \where event_type = 'click') as clicks
+\group user_id
+```
+
+Each aggregate has its own predicate; ordinary `\where` still filters the entire
+query before grouping. See [the AST contract](docs/AST.md) for predicates, arithmetic
+and window support.
 
 ### Settings
 
@@ -117,19 +151,27 @@ The results pane's independent 10,000-row preview buffer still applies.
 
 ### Workspace recovery
 
-The editor document/caret, selected source/dialect, last workspace or function
-view, unsaved function draft/target, query history, and target-scoped AI chats
-are autosaved to `workspace.json`. Editing is debounced and the latest widget
+The named query pages (document/caret/stable identity/source/dialect), selected
+explorer tab, last workspace or function view, unsaved function draft/target,
+query history, and target-scoped AI chats are autosaved to `workspace.json`. Editing is debounced and the latest widget
 contents are flushed on exit, including an unsent AI message. Function drafts
-remain drafts: only **Save**/**Run preview** changes the function library.
+remain drafts: the form's **Save**/**Run preview**, an explicit **Save function** on
+a workspace AI preview proposal, or a user-requested direct save from main chat
+changes the function library. Autosave alone never promotes a draft.
 
 Startup restores this state without running queries, sending AI requests, or
-opening database connections. A saved D1 database or SQLite snapshot remains
-visibly **disconnected** until explicitly reconnected; its draft never silently
-runs against demo data. Local snapshot paths are remembered for reconnection.
-Use the header's **Reconnect** button or select the saved source in Settings to
-reconnect deliberately. `ctrl+o` still opens the add-source form without making
-a live connection just by opening it; a restored snapshot path is prefilled.
+opening database connections. Saved PostgreSQL, D1 and SQLite snapshot targets
+remain visibly **disconnected** until used. Press **Run** (`ctrl+enter` or `f5`)
+to reconnect automatically and execute the submitted document against that same
+target. Saved credentials and snapshot paths connect in the background with a
+compact spinner and elapsed-time bar. The bar's endpoint is a **30-second timeout**,
+not estimated database progress. Cancel, timeout, or a target change prevents late
+registration or execution. Missing credentials open the connection form; connection
+failures report in the status line. The draft never silently runs against demo data.
+Changing connection details to another target requires a fresh Run.
+The header's **Reconnect** button and source pickers still connect without running
+a query. `ctrl+o` opens the add-source form without connecting just by opening it;
+a restored snapshot path is prefilled.
 Result grids, temporary tables, transaction state, diagnostic logs, in-flight
 requests, and applicable AI proposals are not restored. A restored conversation
 can continue on Send, using freshly captured context and validation.
@@ -158,27 +200,50 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   Responses stream into the conversation; **Cancel** aborts a pending request,
   and Escape/**Close** hides the assistant and returns focus to the editor.
   Tab/Shift+Tab navigate chat controls while focus is inside the assistant.
-- An edit response appears as a read-only **full replacement** proposal.
-  **Apply** updates the editor only: it does not run a query or save a function.
+  Hiding chat, switching chats, or closing the function editor does not cancel work.
+- Sending again while a response is in flight **interrupts and steers** that chat.
+  D8R restarts the provider turn with the original request, completed exchanges,
+  and your new instruction. Partial replies/tool batches are discarded, not applied.
+  A context read already running finishes before the replacement turn starts;
+  completed function saves remain saved and are reported.
+- A query edit or function-form edit response appears as a read-only **full
+  replacement** proposal. **Apply** updates the editor only: it does not run a
+  query or save a function.
   Invalid, incomplete, cancelled, or stale proposals cannot be applied. Changing
-  the document or function draft invalidates its pending proposal; switching
-  sources or targets switches to that target's own saved conversation.
-- In `\fn`, click **Make with AI** at the top of the form. Nothing is sent until
-  you describe what you want and press Enter or **Generate**. No name, parameters,
-  or body need to be filled in first. The helper takes over the editor area;
-  the source picker stays available above it.
-- Review the proposed name, description, parameters, example call, and body.
-  Ask for changes in the same input, or **Apply** the complete draft to the form.
-  Apply returns you to the editor without defining a function or executing it;
-  the draft is autosaved. Use **Save** or **Run preview** when ready. The helper refuses proposals that would
-  overwrite a different saved function. **Back**/Escape leaves the draft alone;
-  **Start over** clears the conversation. Controls stay visible on small terminals,
-  with a scrollable draft review.
-- **Settings** in the function helper (or **AI settings** in workspace chat)
-  opens provider configuration directly and returns to your unsent request.
-- **New chat** durably clears the current target's conversation, not other
-  targets. Completed chat exchanges and the composer draft survive exit;
-  incomplete replies never enter replayable history. **Save** in AI settings
+  the document or function draft makes its proposal stale without losing the reply;
+  switching sources or targets selects that target's saved chat.
+- **Settings → AI provider → Auto accept AI updates** is off by default. Enabling
+  it persists immediately and applies complete, validated proposals only while
+  their target draft is unchanged. It never executes queries or saves functions.
+- Ask the main assistant to create, edit, save, or apply a saved function by name.
+  It calls `save_function` to validate and persist the requested definition
+  directly; “apply it” after a function proposal also authorizes this save.
+  No **Apply**/**Save function** click, function-form switch, or auto-accept toggle
+  is required. The query and current mode stay unchanged, and nothing executes.
+  Questions and requests to preview or draft a change do not authorize saving:
+  review the proposed signature, description, example call, and body, then use
+  **Save function** or ask the assistant to apply it.
+  A stale source/target, cancelled or superseded request, changed/deleted original,
+  or newly occupied name blocks saving; ask again with fresh context. AI edits
+  preserve saved names. A save that already completed remains saved and is reported
+  in chat/status even if the provider's subsequent response fails or is cancelled.
+- In the function form, **Ask AI** opens that same right-side panel. Nothing is
+  sent until Enter/**Send**. No fields need filling first. **Apply** fills the
+  draft without saving or executing, keeps the chat open, and leaves the form
+  visible. Use the form's **Save** or **Run preview** when ready.
+- **New chat** starts another conversation without deleting the current one.
+  **Close**/Escape hides the panel without changing the draft.
+- **Settings** in the shared chat panel opens provider configuration directly and
+  returns to your unsent request. The auto-accept toggle is in the main Settings menu.
+- **New chat** preserves previous conversations and lets multiple requests run
+  concurrently, even for the same target. **Agents** (`ctrl+j`) opens chat history
+  and the agent-status window; the workspace sidebar also lists agents. Select a
+  chat to reopen it. Status distinguishes working, awaiting read, error, cancelled,
+  and idle. Each chat keeps its own composer; **Cancel** stops its request and a
+  follow-up **Send** replaces it with a steered turn.
+  Completed exchanges, composer drafts, and unread states survive exit. Exiting
+  cancels in-flight requests; restart never resumes them or restores applicable
+  proposals. Incomplete replies never enter replayable history. **Save** in AI settings
   persists the provider URL, model, key, tool-round/call/sample limits, attempts,
   and timeout. The key input stays masked; provider errors do not echo response
   bodies or credentials. Protect the local JSON files and their backups.
@@ -188,9 +253,13 @@ The assistant can request read-only schema and backend capabilities, bounded
 sample rows from a registered table (5 by default; at most 20 columns, with long
 string cells truncated),
 the active target source's latest ten matching successful queries, and saved
-function definitions. These context tools also expose parser-only validation.
-They cannot execute arbitrary model-generated queries, modify data, read files,
-or run shell commands. Treat proposed changes as suggestions to review.
+function definitions. These read-only context tools also expose parser-only
+validation. The separate `save_function` tool is available only to main workspace
+chat for explicit user-requested function mutations, never instructions embedded
+in schema, samples, history, or function bodies. It saves a local definition, not
+database data. No tool executes arbitrary model-generated queries, runs shell
+commands, grants general file access, or expands the existing network boundaries.
+Ask for a preview when you want suggestions to review before saving.
 
 The existing `httpx` dependency handles SSE streaming directly. Transient HTTP
 408/429/5xx and connection failures receive bounded backoff; Settings defaults
@@ -203,7 +272,8 @@ insufficient, the assistant is instructed to explain what is missing instead of
 inventing a query. A provider that ignores disabled tools still fails safely.
 Responses and tool payloads have size limits. The request timeout also bounds
 each streaming request and context-tool call. Authentication errors, truncation,
-and malformed streams remain visible errors, not successful edits.
+and malformed streams remain visible errors; they neither turn partial proposals
+into edits nor roll back a function save that already completed.
 Editor instructions and request-local tool-budget guidance share one initial
 system message, including on retries and follow-up requests, for providers with
 strict chat templates such as Yolo. The guidance never accumulates in chat history.
@@ -219,8 +289,9 @@ Provider limits are independent and saved together only on **Save**:
 | Request timeout | 60 seconds | >0–300 seconds | Time bound for each provider request or context-tool call |
 
 A tool round is not another chat message: it may batch schema reads, sample
-reads, history, function lookups, and validation calls. Those calls share the
-round and per-round call budgets; sampled records do not count as extra turns.
+reads, history, function lookups, validation calls, and an authorized workspace
+function save. Those calls share the round and per-round call budgets; sampled
+records do not count as extra turns.
 Retries do not consume additional tool rounds or reset their budget. Increasing
 rounds or samples can increase latency, provider usage, and data sent. The
 existing 20-column, 500-character string-cell, and 256-KiB tool-result limits
@@ -256,18 +327,20 @@ copies the displayed trace, and Escape/**Close** returns to the assistant.
 The trace includes UTC timestamps, model/request settings (not credentials or
 endpoint URLs), the submitted prompt and editor context, tool-round counts,
 HTTP status/retries, model output, requested and executed tool calls with their
-arguments/results, parser validation, failures, cancellation, and explicit Apply.
+arguments/results, parser validation, failures, cancellation, and manual or automatic Apply.
 Incomplete output is labeled and never becomes an applicable proposal. Internal
 failures include the exception type and code locations, not exception text or
 locals. Raw provider error bodies, HTTP headers, and hidden model reasoning are
 not logged. Known AI-provider keys and saved/connected D1 tokens are redacted.
 
-Failed attempts remain inspectable after another message, but are **not** added
-to the AI conversation. Diagnostics are never sent back to the model. Retention
-is bounded to 256 entries / 262,144 characters, with at most 65,536 characters
-per entry; truncation and eviction are marked. Logs are in memory only: New chat,
-Start over, a target/source switch, or exiting discards them. Copy anything needed
-before doing so. Logs can contain schema, sample values, and query text; review
+Failed provider attempts remain inspectable after another message, but their
+partial replies are **not** added to the AI conversation. Successful function
+saves are recorded separately even when the rest of the turn fails. Diagnostics
+are never sent back to the model. Retention is bounded to 256 entries / 262,144
+characters, with at most 65,536 characters
+per entry; truncation and eviction are marked. Logs stay with each chat in memory,
+including after switching targets or starting another chat; exiting discards them.
+Logs can contain schema, sample values, and query text; review
 them before sharing. There is no automatic log file.
 
 For capability investigations, inspect the attempted `validate_d8r` text and
@@ -281,7 +354,7 @@ the AI diagnostic log does not execute proposals to diagnose them.
 
 | Keys | Effect |
 | --- | --- |
-| `ctrl+enter` (or `f5`) | Run: execute the document, render Results, append History |
+| `ctrl+enter` (or `f5`) | Run: execute highlighted text, or the whole document when nothing is selected; render Results and append History |
 | `ctrl+k` (or `f6`) | Compile: render the document as SQL for the active dialect, execute nothing |
 | `ctrl+o` | Add a data source |
 | `\` | Open the command palette at the caret |
@@ -346,6 +419,36 @@ compares the entire projected row, including computed columns, after any set
 operations and before `\order`/`\limit`. Both commands take no arguments and
 work in function bodies, CTEs, and inline subqueries.
 
+## Arithmetic and cents-to-dollars conversion
+
+Use numeric `+`, `-`, `*`, and `/` in `\select`, with ordinary precedence,
+parentheses, and unary signs:
+
+```d8r
+\from payments
+\select total_cents / 100 as total_dollars
+```
+
+For an aggregate, use `\select sum(amount_cents) / 100 as total_dollars`.
+The names above are examples; use your source's table and columns. Integer cents
+produce fractional dollars (`199 / 100` is `1.99`), including on SQLite/D1.
+This changes the numeric value, not just its label. It does not round or format
+currency; trailing zeroes are a display concern.
+
+NULL operands stay NULL; division by zero returns NULL. Strings and booleans
+are not numeric operands. Scalar calls can contain row arithmetic, such as
+`coalesce(total_cents / 100, 0)`. Aggregate arguments still take columns: use
+`sum(amount_cents) / 100`, not `sum(amount_cents / 100)`.
+
+If `total_cents` is an alias you are defining in the same select, repeat the
+aggregate expression or put that select in a CTE and divide in the outer query.
+Use a CTE likewise to filter a computed dollar amount, to combine aggregate and
+row-level values, or to perform arithmetic on window/subquery outputs. `\where`
+and `\group` still take columns; `\order` can use the resulting select alias.
+
+The AI knows these expressions and validates them through the same parser.
+Saved function bodies support them too, including declared `@parameters`.
+
 ## String expressions
 
 Use Ibis string operations in `\select`, including nested calls and quoted
@@ -384,14 +487,27 @@ or select **Query to function** from the palette. A new draft opens with the
 document copied into its body and the current source selected. Give it a name,
 optionally replace constants with declared `@parameters`, then choose **Save**.
 Nothing runs or persists merely by opening the draft, and the workspace document
-is unchanged. A function with no parameters is called with `\from name()`.
+is unchanged. A function with no parameters can be run with `\name()`.
+
+Run a saved parameterized query directly in the document, then press **Ctrl+Enter**:
+
+```d8r
+\fn_top_n_free(25)
+```
+
+This is equivalent to `\from fn_top_n_free(25)`; no `\select *` is required.
+**Ctrl+K** compiles the same call without executing it. The `\` palette offers
+saved function names and inserts `\name()` with the caret ready for arguments.
+Use the saved name's exact case. Built-in command names are reserved for shorthand;
+a function named `select`, for example, remains callable as `\from select(...)`.
 
 The body uses the document editor's command, table, column, function, operator,
 and value suggestions, respecting the Settings IntelliSense switch. Enter or
 Tab accepts a suggestion; clicking a row works too. Escape toggles IntelliSense
-in the body and never leaves the library. **Ctrl+C closes the FN screen** from
-any field. Tab without a popup moves to the next form field. Workspace actions
-are not offered inside a body.
+in the body and never leaves the library. **Ctrl+C copies selected text**;
+**Ctrl+Q returns from function editing to the query** without quitting
+the app. Tab/Shift+Tab move between form fields when no completion is accepted,
+including an already-complete offer. Workspace actions are not offered inside a body.
 
 Type `@` in the body to offer the current **Parameters** names, or `@min` to
 filter them. Suggestions follow unsaved declaration edits and stay local to
@@ -409,8 +525,14 @@ IntelliSense at the existing caret, so newly saved calls appear without retyping
 disabled or Escape-dismissed completion stays closed.
 
 Functions are shared across sources: the selected target is an authoring/preview
-context, not a permanent binding. A later `\from name(args)` runs against that
+context, not a permanent binding. A later `\name(args)` or `\from name(args)` runs against that
 document's active source. Reconnect your D1 source before calling its functions.
+
+Function bodies support flat, sequential `\with` chains, including joins and set
+operations. Each call has its own CTE scope: local names do not collide with a
+caller or another invocation, and caller CTEs are not visible inside a function.
+Indent each CTE's body; put later `\with` headers and the final query at the root.
+A literal CTE nested inside another CTE body is still unsupported.
 
 The library's **How parameters work** panel gives a complete example. On the
 `demo` target, set **Name** to `events_above`, **Parameters** to `min_amount`
@@ -423,7 +545,7 @@ The library's **How parameters work** panel gives a complete example. On the
 ```
 
 Set **Preview arguments** to `10` and run the preview. From the document, call
-it with `\from events_above(10)` followed by `\select *`.
+it with `\events_above(10)` (or `\from events_above(10)`).
 
 Parameters bind by position: `min_amount, event_kind` takes arguments such as
 `10, "purchase"`, in that order. Supply one value per parameter, not
@@ -472,8 +594,8 @@ schemas work, and connection discovery does not count all rows or install extens
 
 Use **Test connection** before **Add**. Only Add saves the profile and password
 in local `memory.json`; Test and Cancel save nothing. Password whitespace is
-preserved. Saved profiles appear as disconnected after restart and reconnect only
-when explicitly selected. Changing the SQL dialect affects rendering, not the
+preserved. Saved profiles appear as disconnected after restart and reconnect
+when explicitly selected or when you press Run. Changing the SQL dialect affects rendering, not the
 database on which Run executes.
 
 For production, use a least-privileged read-only role and the TLS mode required by
@@ -542,9 +664,10 @@ Press `ctrl+o`, or open Settings (`ctrl+comma`) → **Data source** →
 
 On later launches, saved D1 profiles remain in the main **datasource dropdown**,
 Settings → **Data source**, and the function editor's source picker, marked
-**disconnected**. Selecting one opens the connection dialog and immediately
-connects using its saved credentials. Startup and merely opening the dropdown
-do not contact Cloudflare. The active source stays unchanged until connection
+**disconnected**. Selecting one, or pressing Run with it active, opens the connection
+dialog and immediately connects using its saved credentials. Run then executes
+the submitted query. Startup and merely opening the dropdown do not contact
+Cloudflare. The active source stays unchanged until connection
 succeeds; failure or Cancel leaves the saved choice available for another attempt.
 Once connected, it appears as a normal source, without a duplicate saved entry.
 Reconnecting an unchanged profile does not rewrite its credentials. Connecting
@@ -584,7 +707,7 @@ An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 
 | File | Saved contents |
 | --- | --- |
-| `settings.json` | Intellisense, pane visibility, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout |
+| `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout |
 | `memory.json` | Custom functions; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
 | `workspace.json` | Document/caret and stable target identity, last view, function draft, query history, completed AI conversations/composer drafts, source references and snapshot paths |
 
@@ -592,10 +715,12 @@ These files are versioned, editable JSON. Toggle preferences save immediately;
 the provider and default-row forms require **Save**. Import only fills the
 provider form, and Cancel discards it. D1/PostgreSQL credentials save on **Add** or after
 edited fields are submitted with **Connect**; function definitions persist on
-**Save**/**Run preview** or Delete. Workspace drafts and histories autosave
-independently. Loading never connects, executes, or saves a function definition.
+**Save**/**Run preview** or Delete, explicit user-requested main-chat saves, or
+manual **Save function** on workspace preview proposals. Workspace drafts and
+histories autosave independently. Loading never connects, executes, or saves a
+function definition.
 Unavailable workspace targets restore as disconnected, preserving their identity
-and drafts until explicitly reconnected or replaced with another source.
+and drafts until Run reconnects them, they are explicitly reconnected, or another source is selected.
 
 A `settings.json` example (omitted keys use defaults):
 

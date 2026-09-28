@@ -9,7 +9,7 @@ from textual.widgets import Input, OptionList, Select, TextArea
 
 from d8r.engine import add_sqlite_source
 from d8r.tui.app import D8RApp
-from d8r.tui.fn import FnScreen, NEW
+from d8r.tui.fn import NEW
 from d8r.tui.session import Session
 
 
@@ -40,7 +40,7 @@ def test_query_draft_saves_explicitly_and_calls_on_the_captured_source(tmp_path)
             app.action_query_to_fn()
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, FnScreen)
+            assert app.function_mode
             assert screen.query_one("#fn-body", TextArea).text == document
             assert screen.query_one("#fn-source", Select).value == "readings"
             assert app.focused is screen.query_one("#fn-name", Input)
@@ -56,7 +56,7 @@ def test_query_draft_saves_explicitly_and_calls_on_the_captured_source(tmp_path)
             assert session.storage_path.exists()
             assert session.history == history
             assert session.active_id == "readings"
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert app.editor.text == document
             assert session.history == history
@@ -84,7 +84,7 @@ def test_button_draft_neither_infers_parameters_nor_saves_invalid_body_on_cancel
             await pilot.click("#query-to-fn")
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, FnScreen)
+            assert app.function_mode
             assert screen.query_one("#fn-body", TextArea).text == document
             assert screen.query_one("#fn-params", Input).value == ""
             screen.query_one("#fn-name", Input).value = "threshold"
@@ -92,7 +92,7 @@ def test_button_draft_neither_infers_parameters_nor_saves_invalid_body_on_cancel
             await pilot.pause()
             assert not session.fns
             assert not session.storage_path.exists()
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert app.editor.text == document
             assert session.history == history
@@ -117,9 +117,9 @@ def test_palette_action_copies_the_query_not_its_invocation():
             await pilot.press("enter")
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, FnScreen)
+            assert app.function_mode
             assert screen.query_one("#fn-body", TextArea).text == document
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert app.editor.text == document
             assert app.session.history == []
@@ -149,16 +149,16 @@ def test_prefill_never_overwrites_saved_entries_or_later_new_drafts():
             await pick_function(screen, pilot, NEW)
             assert screen.query_one("#fn-body", TextArea).text == ""
             assert screen.query_one("#fn-name", Input).value == ""
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
 
-            app.push_screen(FnScreen(app, focus="saved_events", new_body=document))
+            app._open_fn(focus="saved_events", new_body=document)
             await pilot.pause()
             screen = app.screen
             assert screen.query_one("#fn-body", TextArea).text == saved_body
             await pick_function(screen, pilot, NEW)
             assert screen.query_one("#fn-body", TextArea).text == ""
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert app.editor.text == document
             assert session.fns["saved_events"].body == saved_body

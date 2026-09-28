@@ -144,6 +144,7 @@
             "column": "customer_id",
             "literal": null,
             "scalar": null,
+            "arithmetic": null,
             "star": false,
             "aggregate": null,
             "temporal": null,
@@ -195,6 +196,7 @@
             "column": "customer_id",
             "literal": null,
             "scalar": null,
+            "arithmetic": null,
             "star": false,
             "aggregate": null,
             "temporal": null,
@@ -225,6 +227,7 @@
       "column": "customer_id",
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -240,6 +243,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": {
@@ -258,6 +262,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": {
         "fn": "sum",
@@ -282,6 +287,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": {
         "fn": "sum",
@@ -311,6 +317,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -335,6 +342,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -356,6 +364,7 @@
       "column": null,
       "literal": null,
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -379,6 +388,7 @@
             "column": null,
             "literal": null,
             "scalar": null,
+            "arithmetic": null,
             "star": false,
             "aggregate": {
               "fn": "max",
@@ -413,6 +423,7 @@
         "value": "1"
       },
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -430,6 +441,7 @@
         "value": 1
       },
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -447,6 +459,7 @@
         "value": "x"
       },
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -464,6 +477,7 @@
         "value": null
       },
       "scalar": null,
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -504,6 +518,7 @@
           }
         ]
       },
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -536,6 +551,7 @@
           }
         ]
       },
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -563,6 +579,7 @@
           }
         ]
       },
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -587,6 +604,7 @@
           }
         ]
       },
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -619,6 +637,7 @@
           }
         ]
       },
+      "arithmetic": null,
       "star": false,
       "aggregate": null,
       "temporal": null,
@@ -627,6 +646,99 @@
       "regex": null,
       "subquery": null,
       "alias": "placed_date"
+    },
+    {
+      "line": 29,
+      "raw": "amount / 100 as amount_dollars",
+      "column": null,
+      "literal": null,
+      "scalar": null,
+      "arithmetic": {
+        "op": "/",
+        "args": [
+          {
+            "column": "amount"
+          },
+          {
+            "literal": {
+              "value": 100
+            }
+          }
+        ]
+      },
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "amount_dollars"
+    },
+    {
+      "line": 29,
+      "raw": "coalesce(amount / 100, 0) as safe_amount_dollars",
+      "column": null,
+      "literal": null,
+      "scalar": {
+        "fn": "coalesce",
+        "args": [
+          {
+            "op": "/",
+            "args": [
+              {
+                "column": "amount"
+              },
+              {
+                "literal": {
+                  "value": 100
+                }
+              }
+            ]
+          },
+          {
+            "literal": {
+              "value": 0
+            }
+          }
+        ]
+      },
+      "arithmetic": null,
+      "star": false,
+      "aggregate": null,
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "safe_amount_dollars"
+    },
+    {
+      "line": 30,
+      "raw": "sum(amount \\where status = 'paid') as paid_total",
+      "column": null,
+      "literal": null,
+      "scalar": null,
+      "arithmetic": null,
+      "star": false,
+      "aggregate": {
+        "fn": "sum",
+        "arg": "amount",
+        "where": {
+          "line": 30,
+          "raw": "status = 'paid'",
+          "column": "status",
+          "op": "=",
+          "value": "paid",
+          "subquery": null
+        }
+      },
+      "temporal": null,
+      "rank": null,
+      "window": null,
+      "regex": null,
+      "subquery": null,
+      "alias": "paid_total"
     }
   ],
   "distinct": true,
@@ -653,6 +765,7 @@
           "column": "customer_id",
           "literal": null,
           "scalar": null,
+          "arithmetic": null,
           "star": false,
           "aggregate": null,
           "temporal": null,

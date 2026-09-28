@@ -10,7 +10,6 @@ from textual.widgets import DataTable, Input, Select, Static, TextArea
 
 from d8r.tui.add_source import AddSourceModal
 from d8r.tui.app import D8RApp
-from d8r.tui.fn import FnScreen
 from d8r.tui.session import Session
 
 
@@ -73,7 +72,7 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
     asyncio.run(restore())
 
 
-def test_history_restores_recorded_snapshot_without_connecting_and_reconnects_explicitly(tmp_path, monkeypatch):
+def test_history_restores_snapshot_offline_and_run_reconnects_automatically(tmp_path, monkeypatch):
     data_dir = tmp_path / "state"
     first = Session(data_dir=data_dir)
     source, path = _snapshot(first, tmp_path)
@@ -126,32 +125,27 @@ def test_history_restores_recorded_snapshot_without_connecting_and_reconnects_ex
             assert len(reopened.session.history) == 1
             reopened.action_compile()
             assert "disconnected" in str(reopened.query_one("#status", Static).content).lower()
-            reopened.action_run()
-            await reopened.workers.wait_for_complete()
-            await pilot.pause()
-            assert "disconnected" in str(reopened.query_one("#results-error", Static).content).lower()
-            assert reopened.query_one("#results-table", DataTable).row_count == 0
             identity = reopened._ai_target().identity
-            reopened.action_add_source()
+            await pilot.press("f5")
             await pilot.pause()
-            modal = reopened.screen
-            assert isinstance(modal, AddSourceModal)
-            assert modal.query_one("#snapshot-path", Input).value == str(path.resolve())
-            assert not connections
-            modal.query_one("#display-name", Input).value = "Changed display slug"
-            modal.action_add()
             await reopened.workers.wait_for_complete()
             await pilot.pause()
+            assert not isinstance(reopened.screen, AddSourceModal)
             assert connections == [str(path.resolve())]
             assert reopened.session.source_connected()
             assert reopened.session.source_key() == target
             assert reopened._ai_target().identity == identity
-            assert reopened.session.active_id != source.id
+            assert reopened.query_one("#source-select", Select).value == reopened.session.active_id
+            assert "disconnected" not in str(reopened.query_one("#backend-pill", Static).content)
+            assert str(reopened.query_one("#results-table", DataTable).get_cell_at((0, 0))) == "123"
+            assert len(reopened.session.history) == 2
             assert reopened.query_one("#schema-tree").root.children
             reopened.action_run()
             await reopened.workers.wait_for_complete()
             await pilot.pause()
             assert str(reopened.query_one("#results-table", DataTable).get_cell_at((0, 0))) == "123"
+            assert connections == [str(path.resolve())]
+            assert len(reopened.session.history) == 3
 
     asyncio.run(restore_history())
 
@@ -172,7 +166,7 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
             await pilot.pause()
             app._open_fn(focus="saved_events")
             await pilot.pause()
-            screen = app.screen
+            screen = app.function_editor
             screen.query_one("#fn-source", Select).value = source.id
             await pilot.pause()
             screen.query_one("#fn-name", Input).value = "draft_events"
@@ -193,8 +187,8 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
     async def restore_and_close():
         async with reopened.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            screen = reopened.screen
-            assert isinstance(screen, FnScreen)
+            screen = reopened.function_editor
+            assert reopened.function_mode
             assert screen.query_one("#fn-name", Input).value == "draft_events"
             assert screen.query_one("#fn-doc", Input).value == "Unpublished description"
             assert screen.query_one("#fn-params", Input).value == "minimum"
@@ -208,10 +202,10 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
             assert reopened.session.fns["saved_events"].body == original
             assert "draft_events" not in reopened.session.fns
             assert not reopened.session.history
-            assert screen.query_one("#fn-grid", DataTable).row_count == 0
-            await pilot.press("ctrl+c")
+            assert screen.preview_grid.row_count == 0
+            await pilot.press("ctrl+q")
             await pilot.pause()
-            assert not isinstance(reopened.screen, FnScreen)
+            assert not reopened.function_mode
 
     asyncio.run(restore_and_close())
     third = D8RApp(Session(data_dir=data_dir))
@@ -219,12 +213,12 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
     async def workspace_then_new_draft():
         async with third.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            assert not isinstance(third.screen, FnScreen)
+            assert not third.function_mode
             third.editor.load_text("")
             third.action_query_to_fn()
             await pilot.pause()
-            screen = third.screen
-            assert isinstance(screen, FnScreen)
+            screen = third.function_editor
+            assert third.function_mode
             assert screen.query_one("#fn-name", Input).value == ""
             assert screen.query_one("#fn-body", TextArea).text == ""
             assert screen._ai_target().identity != identity
@@ -284,7 +278,7 @@ def test_saved_function_is_offered_at_unchanged_workspace_caret(tmp_path):
             screen.query_one("#fn-body", TextArea).load_text("\\from events\n\\limit 1")
             await pilot.click("#fn-save")
             await pilot.pause()
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert app.editor.text == prefix
             assert app.editor.cursor_location == (0, len(prefix))
@@ -324,7 +318,7 @@ def test_returning_from_function_editor_respects_suppressed_completion(tmp_path,
             screen.query_one("#fn-body", TextArea).load_text("\\from events\n\\limit 1")
             await pilot.click("#fn-save")
             await pilot.pause()
-            await pilot.press("ctrl+c")
+            await pilot.press("ctrl+q")
             await pilot.pause()
             assert not app.palette.is_open
             assert app.editor.text == line

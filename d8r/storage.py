@@ -128,8 +128,12 @@ def _settings(value: object) -> dict:
     defaults = {
         "version": 1, "intellisense": True,
         "panes": {"results": True, "sql": True, "history": True, "schema": True},
+        "pane_sizes": {"explorer": 36, "ai": 44, "editor": 18},
         "source": "demo", "dialect": "duckdb",
         "default_rows": 50,
+        "value_cache_enabled": True,
+        "value_cache_limit": 1000,
+        "ai_auto_accept": False,
         "ai": asdict(AIConfig()),
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
@@ -139,13 +143,21 @@ def _settings(value: object) -> dict:
         raise ValueError("unsupported settings version (expected 1)")
     if type(document["intellisense"]) is not bool:
         raise ValueError("intellisense must be a boolean")
-    for field in ("panes", "ai"):
+    if type(document["ai_auto_accept"]) is not bool:
+        raise ValueError("ai_auto_accept must be a boolean")
+    if type(document["value_cache_enabled"]) is not bool:
+        raise ValueError("Cache column values must be a boolean.")
+    if type(document["value_cache_limit"]) is not int or not 1 <= document["value_cache_limit"] <= 10_000:
+        raise ValueError("Values per column must be an integer between 1 and 10000.")
+    for field in ("panes", "pane_sizes", "ai"):
         provided = document[field]
         if not isinstance(provided, dict) or not provided.keys() <= defaults[field].keys():
             raise ValueError(f"invalid {field} settings fields")
         document[field] = defaults[field] | provided
     if any(type(visible) is not bool for visible in document["panes"].values()):
         raise ValueError("pane visibility must be a boolean")
+    if any(type(size) is not int or not 1 <= size <= 1000 for size in document["pane_sizes"].values()):
+        raise ValueError("Pane sizes must be integers between 1 and 1000 terminal cells.")
     _text(document["source"], "source", nonempty=True)
     _text(document["dialect"], "dialect", nonempty=True)
     if document["dialect"] not in DIALECT_BY_NAME:
@@ -371,9 +383,11 @@ def _chat_messages(messages: object) -> None:
 
 
 def _workspace_document(value: object) -> dict:
+    if isinstance(value, dict):
+        value = {"pages": [], "explorer_tab": "schema", **value}
     document = _record(value, {
         "version", "document", "document_id", "cursor", "source", "dialect", "sources",
-        "active_view", "function_draft", "chats", "history",
+        "active_view", "function_draft", "chats", "history", "pages", "explorer_tab",
     }, "workspace")
     if type(document["version"]) is not int or document["version"] != 1:
         raise ValueError("unsupported workspace version (expected 1)")
@@ -383,6 +397,21 @@ def _workspace_document(value: object) -> dict:
         _text(document[name], f"workspace {name}")
     if document["dialect"] and document["dialect"] not in DIALECT_BY_NAME:
         raise ValueError("unsupported workspace dialect")
+    if document["explorer_tab"] not in ("schema", "pages"):
+        raise ValueError("invalid explorer tab")
+    if not isinstance(document["pages"], list):
+        raise ValueError("invalid query pages")
+    page_ids: set[str] = set()
+    for page in document["pages"]:
+        _record(page, {"id", "title", "document", "cursor", "source", "dialect"}, "query page")
+        for name in ("id", "title", "document", "source", "dialect"):
+            _text(page[name], f"query page {name}", nonempty=name == "id")
+        if page["id"] in page_ids:
+            raise ValueError("duplicate query page identity")
+        page_ids.add(page["id"])
+        if page["dialect"] and page["dialect"] not in DIALECT_BY_NAME:
+            raise ValueError("unsupported query page dialect")
+        _cursor(page["cursor"])
     _cursor(document["cursor"])
     if document["active_view"] not in ("workspace", "function"):
         raise ValueError("invalid workspace view")
@@ -405,11 +434,24 @@ def _workspace_document(value: object) -> dict:
         raise ValueError("invalid saved chats")
     for key, chat in document["chats"].items():
         _text(key, "chat key", nonempty=True)
-        _record(chat, {"messages", "transcript", "input", "turns", "visible"}, "chat")
+        legacy = {"messages", "transcript", "input", "turns", "visible"}
+        if isinstance(chat, dict) and chat.keys() == legacy:
+            _chat_messages(chat["messages"])
+            # The old target key remains a stable chat id; subsequent chats use
+            # UUIDs. Migration adds only inert metadata, never a runnable job.
+            chat = {**chat, "target_key": key, "title": next(
+                (message["content"][:80] for message in chat["messages"]
+                 if isinstance(message, dict) and message.get("role") == "user"), "New chat"),
+                "status": "idle", "status_text": "Conversation restored; send for a fresh proposal.",
+                "unread": False, "selected": True}
+            document["chats"][key] = chat
+        _record(chat, legacy | {"target_key", "title", "status", "status_text", "unread", "selected"}, "chat")
         _chat_messages(chat["messages"])
-        for field in ("transcript", "input"):
+        for field in ("transcript", "input", "target_key", "title", "status_text"):
             _text(chat[field], f"chat {field}")
-        if type(chat["turns"]) is not int or chat["turns"] < 0 or type(chat["visible"]) is not bool:
+        if (type(chat["turns"]) is not int or chat["turns"] < 0
+                or any(type(chat[field]) is not bool for field in ("visible", "unread", "selected"))
+                or chat["status"] not in ("idle", "working", "error", "cancelled")):
             raise ValueError("invalid saved chat state")
     if not isinstance(document["history"], list):
         raise ValueError("invalid query history")
@@ -432,6 +474,7 @@ class WorkspaceStore(_JSONStore):
             "version": 1, "document": None, "document_id": "", "cursor": [0, 0],
             "source": "", "dialect": "", "sources": {}, "active_view": "workspace",
             "function_draft": None, "chats": {}, "history": [],
+            "pages": [], "explorer_tab": "schema",
         }, _workspace_document)
 
     def save(self, document: dict) -> None:

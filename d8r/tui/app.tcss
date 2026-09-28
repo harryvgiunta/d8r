@@ -49,9 +49,14 @@ Screen {
     height: 1fr;
 }
 
-#schema-pane {
+#explorer-slot {
     width: 36;
-    border-right: solid $panel-lighten-2;
+    min-width: 0;
+}
+
+#schema-pane, #fn-list-pane {
+    width: 1fr;
+    height: 1fr;
 }
 
 #schema-pane Tree {
@@ -59,18 +64,75 @@ Screen {
     background: $surface;
 }
 
+#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages {
+    height: 1fr;
+    padding: 0;
+}
+
+#schema-hint {
+    height: 2;
+    color: $text-muted;
+}
+
+#schema-index {
+    display: none;
+    height: auto;
+    color: $text-muted;
+}
+
+#schema-index-dots {
+    width: 4;
+    height: 1;
+}
+
+#schema-index-label {
+    width: 1fr;
+    height: auto;
+}
+
+#page-actions {
+    height: 1;
+}
+
+#page-actions Button {
+    height: 1;
+    min-width: 0;
+    margin-right: 1;
+}
+
+#page-title {
+    height: 3;
+}
+
+#pages-list {
+    height: 1fr;
+    border: none;
+}
+
 #work-bench {
     width: 1fr;
+    min-width: 0;
     layers: base overlay;
 }
 
-/* Every result tab hidden: the strip goes and the document takes the bench. */
-#work-bench.no-tabs #result-tabs {
+#editor-slot {
+    height: 18;
+    min-height: 0;
+    layers: base overlay;
+}
+
+#output-slot {
+    height: 1fr;
+    min-height: 0;
+}
+
+#function-editor, #function-output, #fn-list-pane {
     display: none;
 }
 
-#work-bench.no-tabs #editor-pane {
+#function-editor, #function-output {
     height: 1fr;
+    min-width: 0;
 }
 
 .pane-title {
@@ -84,23 +146,28 @@ Screen {
 /* -- editor + palette --------------------------------------------------- */
 
 #editor-pane {
-    height: 45%;
+    height: 1fr;
     layers: base overlay;
 }
 
-#document-actions {
+#document-actions, #fn-actions {
     height: 1;
     background: $panel-darken-1;
 }
 
-#document-actions .pane-title {
+#fn-actions .pane-title {
     width: 1fr;
 }
 
-#document-actions Button, #results-actions Button {
+#document-actions Button, #results-actions Button, #fn-actions Button {
     height: 1;
-    min-width: 12;
+    min-width: 8;
     margin: 0 1 0 0;
+}
+
+#document-actions Button {
+    min-width: 0;
+    padding: 0;
 }
 
 #editor {
@@ -329,29 +396,6 @@ SettingsScreen {
 
 /* -- function library (\\fn) -------------------------------------------- */
 
-FnScreen {
-    align: center middle;
-    background: $background;
-}
-
-#fn {
-    width: 100%;
-    height: 100%;
-    padding: 1 2;
-}
-
-#fn-list-pane {
-    width: 42;
-    height: 1fr;
-    border-right: solid $panel-lighten-2;
-}
-
-#fn-title {
-    height: 1;
-    text-style: bold;
-    color: $accent;
-}
-
 #fn-list {
     height: 1fr;
     background: $surface;
@@ -359,8 +403,8 @@ FnScreen {
 }
 
 #fn-param-guide {
-    height: 32;
-    max-height: 70%;
+    height: 40%;
+    min-height: 0;
     padding: 1;
     background: $panel;
     color: $text-muted;
@@ -372,31 +416,6 @@ FnScreen {
     margin-bottom: 1;
 }
 
-#fn-hint {
-    height: auto;
-    padding: 1 0 0 0;
-    color: $text-muted;
-}
-
-#fn-content {
-    width: 1fr;
-    height: 1fr;
-    padding-left: 2;
-}
-
-#fn.ai-open #fn-list-pane, #fn.ai-open #fn-editor, #fn.ai-open #fn-buttons {
-    display: none;
-}
-
-#fn.ai-open #fn-content {
-    padding: 0;
-}
-
-#fn-ai-panel {
-    width: 100%;
-    min-width: 0;
-    border: none;
-}
 
 #fn-editor {
     width: 1fr;
@@ -405,12 +424,29 @@ FnScreen {
 }
 
 #fn-editor .field-label {
-    padding: 1 0 0 0;
+    padding: 0;
     color: $text-muted;
 }
 
-#fn-status {
+.fn-field {
     height: 1;
+}
+
+.fn-field Static {
+    width: 15;
+    color: $text-muted;
+}
+
+.fn-field Input {
+    width: 1fr;
+    height: 1;
+    border: none;
+    padding: 0 1;
+}
+
+#fn-status {
+    height: auto;
+    max-height: 3;
     color: $text-muted;
 }
 
@@ -419,7 +455,7 @@ FnScreen {
 }
 
 #fn-body-pane {
-    height: 12;
+    height: 8;
     layers: base overlay;
 }
 
@@ -431,24 +467,26 @@ FnScreen {
 
 #fn-buttons {
     height: auto;
-    padding: 1 0 0 0;
+    padding: 0;
 }
 
 #fn-buttons Button {
+    height: 1;
+    min-width: 6;
+    width: 1fr;
     margin: 0 1 0 0;
 }
 
 #fn-grid {
     height: 1fr;
-    min-height: 8;
-    margin-top: 1;
+    min-height: 0;
 }
 
 /* -- in-layout AI assistant --------------------------------------------- */
 
 AIPanel {
-    width: 44%;
-    min-width: 38;
+    width: 44;
+    min-width: 0;
     height: 1fr;
     border-left: solid $accent;
     padding: 0 1;
@@ -466,7 +504,8 @@ AIPanel #ai-review {
 }
 
 AIPanel #ai-conversation {
-    height: 1fr;
+    height: auto;
+    max-height: 50%;
     min-height: 3;
     margin-top: 1;
 }
@@ -479,11 +518,10 @@ AIPanel #ai-status {
     height: auto;
     max-height: 4;
     color: $text-muted;
-    margin: 1 0;
+    margin: 0;
 }
 
 AIPanel #ai-proposal {
-    height: 35%;
     min-height: 4;
     border: round $accent;
 }
@@ -498,12 +536,17 @@ AIPanel #ai-input {
 }
 
 AIPanel .ai-buttons {
-    height: 3;
+    height: 1;
 }
 
 AIPanel Button {
-    min-width: 8;
+    min-width: 6;
     width: 1fr;
+    padding: 0;
+}
+
+AIPanel #ai-apply {
+    width: 2fr;
 }
 
 AIPanel #ai-function-details {
@@ -511,24 +554,6 @@ AIPanel #ai-function-details {
     color: $accent;
 }
 
-#fn-ai-panel #ai-status {
-    margin: 0;
-}
-
-#fn-ai-panel #ai-conversation {
-    height: auto;
-    max-height: 3;
-    margin-top: 0;
-    min-height: 1;
-}
-
-#fn-ai-panel #ai-proposal {
-    height: 10;
-}
-
-#fn-ai-panel #ai-input {
-    margin-top: 0;
-}
 
 /* -- AI diagnostic snapshot --------------------------------------------- */
 
@@ -559,4 +584,45 @@ AIDiagnosticsScreen {
 
 #ai-log-buttons Button {
     margin-right: 1;
+}
+
+/* -- independently running AI chats ------------------------------------ */
+
+#open-agents {
+    width: auto;
+    min-width: 8;
+    margin: 1 0 0 1;
+}
+
+AgentsPane {
+    height: 1fr;
+    min-height: 5;
+}
+
+AgentsPane OptionList {
+    height: 1fr;
+    border: none;
+    background: $surface;
+}
+
+#workspace-agents {
+    height: 40%;
+    border-top: solid $panel-lighten-2;
+}
+
+AgentsScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#agents-screen {
+    width: 80%;
+    height: 85%;
+    background: $surface;
+    border: round $accent;
+    padding: 1;
+}
+
+#agents-close {
+    height: 3;
 }

@@ -1,11 +1,11 @@
-"""The `\\fn` page: the function library, and the editor for one function.
+"""Function explorer and form components for the shared workspace.
 
 A table-valued function here is a named D8R document with a positional
 signature: the body is an ordinary query whose `@params` are filled with the
 arguments of each call (the engine sees literals; ibis never learns a function
-exists). This screen is where those definitions are authored — a list of what
-the session holds, and, on the right, the fields for the selected (or new)
-function: name, description, parameter signature, body, and the arguments for a
+exists). The explorer occupies the workspace's left slot; the form occupies
+the same middle slot as the query editor, with the shared AI panel on the right.
+The form has a name, description, parameter signature, body, and arguments for a
 trial call. `Run preview` saves, then calls it through the same path a
 document's `\\from name(args)` takes, so the grid shows what the editor gets.
 
@@ -22,10 +22,8 @@ from typing import TYPE_CHECKING
 
 from textual import on
 from textual.app import ComposeResult
-from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Text
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
@@ -41,7 +39,7 @@ if TYPE_CHECKING:
 
 NEW = "＋ New function…"
 
-HINT = "select a function · ctrl+r preview · ctrl+d delete · escape intellisense · ctrl+c back"
+HINT = "select a function · ctrl+r preview · ctrl+d delete · escape intellisense · ctrl+c copy · ctrl+q back"
 
 PARAMETER_GUIDE = r"""1. Declare names, not values
 Parameters: min_amount
@@ -77,43 +75,42 @@ blank and call name()."""
 
 
 class FnBodyPane(EditorPane):
-    """Keep form navigation when no completion is being accepted."""
+    """Inherit the pane's priority Tab binding; navigate only without an acceptance."""
 
-    def action_palette_tab(self) -> None:
-        if self.palette.is_open:
-            self.palette.accept_highlighted()
-        else:
-            self.screen.focus_next()
+    def action_palette_tab(self) -> bool:
+        if super().action_palette_tab():
+            return True
+        self.palette.close()
+        self.screen.focus_next()
+        return True
 
 
-class FnScreen(ModalScreen[None]):
-    """The function library: `\\fn` opens it; every save lands at once."""
+class FnExplorer(Vertical):
+    """The function-mode contents of the workspace explorer slot."""
 
-    BINDINGS = [
-        Binding("ctrl+c", "back", "Back", priority=True),
-        Binding("ctrl+r", "preview", "Preview"),
-        Binding("ctrl+d", "delete", "Delete"),
-    ]
+    def compose(self) -> ComposeResult:
+        yield Static("Functions", classes="pane-title")
+        yield OptionList(id="fn-list")
+        with VerticalScroll(id="fn-param-guide"):
+            yield Static("How parameters work", classes="guide-title")
+            yield Static(PARAMETER_GUIDE, markup=False)
 
-    def __init__(
-        self, ide: "D8RApp", focus: str = "", new_name: str = "", new_body: str = "",
-        *, restore_draft: bool = True, **kwargs,
-    ) -> None:
+
+class FnEditor(Vertical):
+    """A persistent function draft in the workspace's middle editor slot."""
+
+
+    def __init__(self, ide: "D8RApp", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
-        draft = ide.session.workspace.get("function_draft") if restore_draft and not (focus or new_name or new_body) else None
-        self.selected = draft["selected"] if draft else focus if focus in ide.session.fns else ""
+        draft = ide.session.workspace.get("function_draft")
+        self.selected = draft["selected"] if draft else ""
         self.source_id = ide.session.restore_source(draft["source"], activate=False) if draft else ide.session.active_id
         self._draft_identity = draft["identity"] if draft else str(uuid4())
-        fn = ide.session.fns.get(self.selected)
         self._initial_fields = draft if draft else {
-            "name": fn.name if fn else new_name if not focus else "",
-            "description": fn.doc if fn else "",
-            "parameters": ", ".join(fn.params) if fn else "",
-            "body": fn.body if fn else new_body if not focus else "",
+            "name": "", "description": "", "parameters": "", "body": "",
             "arguments": "", "cursor": [0, 0],
         }
-        self._focus_name = bool(new_body) and not focus
         self._draft_ready = False
         self._draft_timer = None
         self._draft_body: TextArea | None = None
@@ -126,61 +123,45 @@ class FnScreen(ModalScreen[None]):
         return self.ide.session
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="fn"):
-            with Vertical(id="fn-list-pane"):
-                yield Static("Functions", id="fn-title")
-                yield OptionList(id="fn-list")
-                with VerticalScroll(id="fn-param-guide"):
-                    yield Static("How parameters work", classes="guide-title")
-                    yield Static(PARAMETER_GUIDE, markup=False)
-                yield Static(HINT, id="fn-hint")
-                yield Static(
-                    f"Save and Run preview persist locally to {self.session.storage_path}. "
-                    "Drafts are autosaved separately; restoring never saves a definition.",
-                    markup=False,
+        with Horizontal(id="fn-actions"):
+            yield Static("Function", classes="pane-title")
+            yield Button("Ask AI", id="fn-ai", compact=True)
+            yield Button("Query", id="fn-back", compact=True)
+        with VerticalScroll(id="fn-editor"):
+            yield Select(
+                self.session.source_options(),
+                value=self.source_id, allow_blank=False, id="fn-source",
+            )
+            yield Button("Reconnect target", id="fn-reconnect", disabled=self.session.source_connected(self.source_id), compact=True)
+            with Horizontal(classes="fn-field"):
+                yield Static("Name")
+                yield Input(self._initial_fields["name"], placeholder="monthly", id="fn-name")
+            with Horizontal(classes="fn-field"):
+                yield Static("Description")
+                yield Input(self._initial_fields["description"], placeholder="one line on what it returns", id="fn-doc")
+            with Horizontal(classes="fn-field"):
+                yield Static("Parameters")
+                yield Input(self._initial_fields["parameters"], placeholder="min_amount (names in order, no @)", id="fn-params")
+            with FnBodyPane(id="fn-body-pane"):
+                yield TextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
+                yield CommandPalette(
+                    self.session, source_id=self.source_id, workspace_actions=False,
+                    parameters=self._parameter_names, id="fn-palette", markup=False,
                 )
-            with Vertical(id="fn-content"):
-                yield Static("Source — the data this function uses", classes="field-label")
-                yield Select(
-                    self.session.source_options(),
-                    value=self.source_id, allow_blank=False, id="fn-source",
-                )
-                yield Button("Reconnect target", id="fn-reconnect", disabled=self.session.source_connected(self.source_id), compact=True)
-                with VerticalScroll(id="fn-editor"):
-                    yield Static("", id="fn-status", markup=False)
-                    yield Button("Make with AI", id="fn-ai", variant="primary")
-                    yield Static("Describe what you need, or edit the fields below.", markup=False)
-                    yield Static("Name", classes="field-label")
-                    yield Input(self._initial_fields["name"], placeholder="monthly", id="fn-name")
-                    yield Static("Description", classes="field-label")
-                    yield Input(self._initial_fields["description"], placeholder="one line on what it returns", id="fn-doc")
-                    yield Static("Parameters — names in argument order (no @)", classes="field-label")
-                    yield Input(self._initial_fields["parameters"], placeholder="min_amount", id="fn-params")
-                    yield Static(
-                        "Body — an D8R document; `@param` binds an argument",
-                        classes="field-label",
-                    )
-                    with FnBodyPane(id="fn-body-pane"):
-                        yield TextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
-                        yield CommandPalette(
-                            self.session, source_id=self.source_id, workspace_actions=False,
-                            parameters=self._parameter_names, id="fn-palette", markup=False,
-                        )
-                    yield Static("Preview arguments — values in the same order; quote text", classes="field-label")
-                    yield Input(self._initial_fields["arguments"], placeholder='10 (or 10, "purchase" for two parameters)', id="fn-args")
-                    yield DataTable(id="fn-grid")
-                with Horizontal(id="fn-buttons"):
-                    yield Button("Save", id="fn-save", variant="primary")
-                    yield Button("Run preview", id="fn-preview")
-                    yield Button("Delete", id="fn-delete", variant="error")
-                yield AIPanel(
-                    self.session, self._ai_target, self._apply_ai_draft,
-                    self._return_from_ai, function_mode=True, id="fn-ai-panel",
-                )
+            with Horizontal(classes="fn-field"):
+                yield Static("Preview values")
+                yield Input(self._initial_fields["arguments"], placeholder='10 (quote text; values in parameter order)', id="fn-args")
+        with Horizontal(id="fn-buttons"):
+            yield Button("Save", id="fn-save", variant="primary", compact=True)
+            yield Button("Run preview", id="fn-preview", compact=True)
+            yield Button("Delete", id="fn-delete", variant="error", compact=True)
+        yield Static("", id="fn-status", markup=False)
 
     def on_mount(self) -> None:
-        self.query_one("#fn-grid", DataTable).cursor_type = "cell"
+        self.preview_grid.cursor_type = "cell"
+        self.query_one("#fn-reconnect").display = not self.session.source_connected(self.source_id)
         self._draft_body = self.query_one("#fn-body", TextArea)
+        self._draft_body.border_title = "Body · @param binds an argument"
         self._draft_inputs = {
             key: self.query_one(selector, Input) for key, selector in (
                 ("name", "#fn-name"), ("description", "#fn-doc"),
@@ -195,10 +176,23 @@ class FnScreen(ModalScreen[None]):
                      else f"{self.selected} · saved locally" if self.selected else "new function")
         self._draft_ready = True
         self._target_changed()
-        self.ide.save_workspace(active_view="function")
         self._queue_draft_save()
-        if self._focus_name:
-            self.query_one("#fn-name", Input).focus()
+
+    def start_draft(self, *, focus: str = "", new_name: str = "", new_body: str = "") -> None:
+        """Explicit New/To function starts a fresh draft on the workspace source."""
+        self.flush_draft()
+        self.source_id = self.session.active_id
+        with self.prevent(Select.Changed):
+            source = self.query_one("#fn-source", Select)
+            source.set_options(self.session.source_options())
+            source.value = self.source_id
+        self._select(focus)
+        if not focus:
+            with self.prevent(Input.Changed, TextArea.Changed):
+                self.query_one("#fn-name", Input).value = new_name
+                self.query_one("#fn-body", TextArea).load_text(new_body)
+        self._select_target(self.source_id)
+        self._queue_draft_save()
 
     def on_unmount(self) -> None:
         self._leaving = True
@@ -216,7 +210,7 @@ class FnScreen(ModalScreen[None]):
             }
 
     def _queue_draft_save(self) -> None:
-        if not self._draft_ready or self._leaving:
+        if not self._draft_ready or self._leaving or not self.ide._function_started:
             return
         self._capture_draft()
         if self._draft_timer is not None:
@@ -224,6 +218,8 @@ class FnScreen(ModalScreen[None]):
         self._draft_timer = self.set_timer(0.2, self.flush_draft)
 
     def flush_draft(self) -> None:
+        if not self.ide._function_started:
+            return
         if self._draft_timer is not None:
             self._draft_timer.stop()
             self._draft_timer = None
@@ -233,8 +229,8 @@ class FnScreen(ModalScreen[None]):
                 self._status(self.session.workspace_error, error=True)
 
     def _target_changed(self) -> None:
-        self.ai_panel.target_changed()
-        self.query_one("#fn").set_class(self.ai_panel.display, "ai-open")
+        if self.ide.function_mode:
+            self.ai_panel.target_changed()
 
     @on(TextArea.SelectionChanged, "#fn-body")
     def _body_caret_changed(self) -> None:
@@ -253,14 +249,16 @@ class FnScreen(ModalScreen[None]):
         self._select_target(event.value)
 
     def _select_target(self, source_id: str) -> None:
+        self.ide._cancel_connection()
         self.source_id = source_id
         self.query_one("#fn-reconnect", Button).disabled = self.session.source_connected(source_id)
+        self.query_one("#fn-reconnect").display = not self.session.source_connected(source_id)
         self._target_changed()
         palette = self.query_one(CommandPalette)
         palette.source_id = self.source_id
         palette.close()
         palette.sync()
-        self.query_one("#fn-grid", DataTable).clear(columns=True)
+        self.preview_grid.clear(columns=True)
         self._status(f"target · {self.session.sources[self.source_id].display}")
         self._queue_draft_save()
 
@@ -290,7 +288,7 @@ class FnScreen(ModalScreen[None]):
 
     @property
     def ai_panel(self) -> AIPanel:
-        return self.query_one("#fn-ai-panel", AIPanel)
+        return self.ide.ai_panel
 
     def _ai_target(self) -> AITarget:
         name, params, body, doc = self._fields()
@@ -311,12 +309,9 @@ class FnScreen(ModalScreen[None]):
         self.query_one("#fn-args", Input).value = proposal.arguments
         self.query_one("#fn-body", TextArea).load_text(proposal.body)
         self.query_one(CommandPalette).close()
-        self.query_one("#fn-grid", DataTable).clear(columns=True)
+        self.preview_grid.clear(columns=True)
         self._status("AI draft applied · review, then Save or Run preview")
 
-    def _return_from_ai(self) -> None:
-        self.query_one("#fn").remove_class("ai-open")
-        self.query_one("#fn-name", Input).focus()
 
     @on(Input.Changed, "#fn-name")
     @on(Input.Changed, "#fn-doc")
@@ -332,12 +327,20 @@ class FnScreen(ModalScreen[None]):
     def _make_with_ai(self, event: Button.Pressed) -> None:
         event.stop()
         self.query_one(CommandPalette).close()
-        self.query_one("#fn").add_class("ai-open")
-        self.ai_panel.open()
+        self.ide.action_ai()
+
+    @on(Button.Pressed, "#fn-back")
+    def _back_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.action_back()
+
+    @property
+    def preview_grid(self) -> DataTable:
+        return self.ide.query_one("#fn-grid", DataTable)
 
     # -- drawing -------------------------------------------------------------
 
-    def _draw_list(self, highlight: int = 0) -> None:
+    def _draw_list(self, highlight: int | None = None) -> None:
         """Redraw the library list from live state, with one row highlighted."""
         rows: list[tuple[str, str]] = []
         for fn in self.session.fns.values():
@@ -345,7 +348,9 @@ class FnScreen(ModalScreen[None]):
             detail = f"{signature} · {fn.doc}" if fn.doc else f"{signature} · {len(fn.body.splitlines())} lines"
             rows.append((fn.name, detail))
         rows.append((NEW, "define a new function"))
-        listing = self.query_one("#fn-list", OptionList)
+        if highlight is None:
+            highlight = next((index for index, (name, _) in enumerate(rows) if name == self.selected), len(rows) - 1)
+        listing = self.ide.query_one("#fn-list", OptionList)
         listing.clear_options()
         listing.add_options([Option(prompt(name, detail), id=name) for name, detail in rows])
         listing.highlighted = max(0, min(highlight, len(rows) - 1))
@@ -370,6 +375,7 @@ class FnScreen(ModalScreen[None]):
             self.query_one("#fn-params", Input).value = ", ".join(fn.params) if fn else ""
             self.query_one("#fn-args", Input).value = ""
             self.query_one("#fn-body", TextArea).load_text(fn.body if fn else "")
+        self.preview_grid.clear(columns=True)
         self._target_changed()
         self._queue_draft_save()
         self._status(f"{fn.name} · saved locally" if fn else "new function")
@@ -381,9 +387,7 @@ class FnScreen(ModalScreen[None]):
 
     # -- acting --------------------------------------------------------------
 
-    @on(OptionList.OptionSelected, "#fn-list")
-    def _picked(self, event: OptionList.OptionSelected) -> None:
-        name = str(event.option_id or "")
+    def select_function(self, name: str) -> None:
         if name == NEW:
             self._select("")
             self.query_one("#fn-name", Input).focus()
@@ -439,7 +443,7 @@ class FnScreen(ModalScreen[None]):
         args_text = self.query_one("#fn-args", Input).value
         with self.session.target_source(self.source_id):
             outcome = self.session.fn_preview(name, args_text)
-        grid = self.query_one("#fn-grid", DataTable)
+        grid = self.preview_grid
         grid.clear(columns=True)
         if outcome.error:
             self._status(f"preview failed · {outcome.error}", error=True)
@@ -473,12 +477,8 @@ class FnScreen(ModalScreen[None]):
         self._status(f'function "{name}" deleted from local memory')
 
     def action_back(self) -> None:
-        """Ctrl+C leaves the library; the schema seam already reflects the saves."""
-        self.ai_panel.action_cancel()
-        self.flush_draft()
-        self.ide.save_workspace(active_view="workspace")
-        self._leaving = True
-        self.dismiss(None)
+        """Return to the query without unmounting editors or cancelling chats."""
+        self.ide.action_workspace()
 
 
 def _cell(value: object) -> str:

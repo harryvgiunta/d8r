@@ -152,6 +152,8 @@ class SchemaContext:
     tables: tuple[TableDef, ...] = ()
     capabilities: Capabilities = DEFAULT_CAPABILITIES
     fns: tuple[FnDef, ...] = ()
+    # Partial remote indexes offer known columns without rejecting unseen tables.
+    tables_complete: bool = True
     pool: tuple[PoolColumn, ...] = field(init=False)
     _fns_by_name: Mapping[str, FnDef] = field(init=False, repr=False, compare=False)
 

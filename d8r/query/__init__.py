@@ -3,6 +3,7 @@
 from .alias import auto_alias, effective_alias
 from .ast import (
     AggCall,
+    ArithmeticExpr,
     CaseBranch,
     CaseClause,
     ClauseKind,
@@ -76,6 +77,7 @@ __all__ = [
     "NULL_OPS",
     "TEMPORAL",
     "AggCall",
+    "ArithmeticExpr",
     "Capabilities",
     "CaseBranch",
     "CaseClause",

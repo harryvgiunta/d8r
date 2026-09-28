@@ -1,4 +1,4 @@
-"""Bounded streaming chat, with no provider SDK, persistence, or executable tools."""
+"""Bounded streaming chat; tool capabilities are supplied by the editor context."""
 
 from __future__ import annotations
 
@@ -371,16 +371,16 @@ async def run_turn(
                 remaining = config.max_tool_rounds - rounds
                 if remaining:
                     guidance = (
-                        f"You have {remaining} context-tool rounds remaining for this turn. "
+                        f"You have {remaining} tool rounds remaining for this turn. "
                         f"Request at most {config.max_tool_calls} tool calls per round. "
-                        "Reuse context already collected and batch independent context calls "
-                        "in one response. Request only information needed to answer; provide "
-                        "the final answer as soon as you have enough context."
+                        "Reuse context already collected and batch independent lookups. "
+                        "Reserve a tool round for save_function when the user requests a function edit; "
+                        "returning code is not saving. Complete the requested action before the final answer."
                     )
                 else:
                     payload["tool_choice"] = "none"
                     guidance = (
-                        "You have 0 context-tool rounds remaining. Tools are disabled; do not "
+                        "You have 0 tool rounds remaining. Tools are disabled; do not "
                         "request any more tools. Provide your final answer using the context "
                         "already collected. If that context is insufficient or the requested "
                         "operation is unsupported, explain the concrete missing information "
@@ -459,7 +459,7 @@ async def run_turn(
                 return
             if rounds >= config.max_tool_rounds:
                 raise AIError("The AI requested context tools after they were disabled; no final answer is available.")
-            yield AIEvent("status", "Reading requested AI context…")
+            yield AIEvent("status", "Processing requested AI tools…")
             results = []
             for tool_call, (name, arguments) in zip(message["tool_calls"], requests):
                 yield AIEvent("diagnostic", f"Executing tool {tool_call['id']} ({name}).")

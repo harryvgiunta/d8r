@@ -120,3 +120,20 @@ def test_snapshot_records_and_nested_containers_reject_mutation():
         context.capabilities.functions["string"] = ("injected",)
     with pytest.raises(TypeError):
         context.capabilities.supports["regex"] = False
+
+
+@pytest.mark.parametrize("document", [
+    "\\from unindexed\n\\select id",
+    "\\from events\n\\join unindexed on id = id\n\\select events.id",
+    "\\from events\n\\union unindexed\n\\select id",
+    "\\with recent\n  \\from unindexed\n  \\select id\n\\from recent\n\\select id",
+    "\\from ( \\from unindexed \\select id ) as nested\n\\select id",
+])
+def test_partial_index_does_not_reject_unindexed_relations(document):
+    known = (TableDef("events", columns=(ColumnDef("id", "int64"),)),)
+    partial = SchemaContext(tables=known, tables_complete=False)
+    complete = SchemaContext(tables=known)
+    assert parse_query(document, schema=partial, settled=True).errors == []
+    assert any('unknown table "unindexed"' in error.message
+               for error in parse_query(document, schema=complete, settled=True).errors)
+    assert partial.column_by_name("id").tables == ("events",)

@@ -16,14 +16,17 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
 from d8r.engine import D1Error, DataSource, PayloadError
+from d8r.tui.connection import CONNECTION_TIMEOUT, ConnectionStatus, build_connection, release_source
 
 
 class AddSourceModal(ModalScreen):
     """The credential form; network work never blocks Textual's event loop."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    CONNECTION_TIMEOUT = CONNECTION_TIMEOUT
 
-    def __init__(self, session, *, profile: dict[str, str] | None = None, snapshot_path: str | None = None, **kwargs) -> None:
+    def __init__(self, session, *, profile: dict[str, str] | None = None, snapshot_path: str | None = None,
+                 auto_connect: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self._built: tuple[tuple[str, ...], DataSource] | None = None
@@ -36,6 +39,7 @@ class AddSourceModal(ModalScreen):
         self._postgres_profiles = list(session.postgres_profiles)
         self._initial_profile = dict(profile) if profile is not None else None
         self._snapshot_path = snapshot_path
+        self._auto_connect = auto_connect
         self._reconnect_fields: tuple[str, ...] | None = None
         self._shown_backend: str | None = None
 
@@ -125,6 +129,9 @@ class AddSourceModal(ModalScreen):
                 yield Button("Test connection", id="test")
                 yield Button("Connect" if self._initial_profile is not None or self._snapshot_path else "Add", variant="primary", id="add")
                 yield Button("Cancel", id="cancel")
+        progress = ConnectionStatus(id="source-connection-progress")
+        progress.display = False
+        yield progress
 
     def on_mount(self) -> None:
         self._show_backend()
@@ -148,6 +155,8 @@ class AddSourceModal(ModalScreen):
                 self.query_one("#api-token", Input).focus()
         elif self._snapshot_path:
             self.query_one("#snapshot-path", Input).focus()
+            if self._auto_connect:
+                self.call_after_refresh(self.action_add)
 
     def _show_backend(self) -> None:
         backend = str(self.query_one("#source-backend", Select).value)
@@ -185,24 +194,20 @@ class AddSourceModal(ModalScreen):
         self._busy = busy
         for name in ("test", "add"):
             self.query_one(f"#{name}", Button).disabled = busy
+        self.query_one("#add-source").display = not busy
+        progress = self.query_one(ConnectionStatus)
+        progress.display = busy
+        if busy:
+            fields = self._fields()
+            target = fields[8] if fields[5] == "postgres" else fields[3] or fields[1]
+            for secret in (fields[2], fields[10]):
+                if secret:
+                    target = target.replace(secret, "[redacted]")
+            progress.start(target or "data source")
+            progress.query_one(Button).focus()
+        else:
+            self.query_one("#add", Button).focus()
 
-    @staticmethod
-    def _release(source: DataSource) -> None:
-        """Release only sources still owned by this modal, never registered ones."""
-        if source.d1 is not None:
-            source.d1.close()
-        elif source.con is not None:
-            source.con.disconnect()
-
-    @classmethod
-    def _release_finished(cls, task: asyncio.Task) -> None:
-        # to_thread cannot stop a running connection attempt. A cancelled screen
-        # must still claim and close its eventual result, including completion races.
-        try:
-            source = task.result()
-        except (asyncio.CancelledError, Exception):
-            return
-        cls._release(source)
 
     def _invalidate(self) -> None:
         self._generation += 1
@@ -210,7 +215,7 @@ class AddSourceModal(ModalScreen):
             self._worker.cancel()
             self._worker = None
         if self._built is not None:
-            self._release(self._built[1])
+            release_source(self._built[1])
             self._built = None
         if not self._connection_form_closed:
             self._set_busy(False)
@@ -301,7 +306,7 @@ class AddSourceModal(ModalScreen):
             self._invalidate()
             self._observed_fields = fields
         self._set_busy(True)
-        self._message("Connecting… You can edit fields or Cancel while this runs.")
+        self._message("Connecting… Cancel to return without saving.")
         self._worker = self.run_worker(
             self._connect(fields, self._generation, add),
             name="Source connection", group="source-connect", exit_on_error=False,
@@ -312,14 +317,9 @@ class AddSourceModal(ModalScreen):
             if self._built is not None and self._built[0] == fields:
                 source = self._built[1]
             else:
-                task = asyncio.create_task(asyncio.to_thread(self._build, fields))
-                try:
-                    source = await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    task.add_done_callback(self._release_finished)
-                    raise
+                source = await build_connection(lambda: self._build(fields), timeout=self.CONNECTION_TIMEOUT)
                 if self._connection_form_closed or generation != self._generation or fields != self._fields():
-                    self._release(source)
+                    release_source(source)
                     return
                 self._built = (fields, source)
             if add:
@@ -338,10 +338,16 @@ class AddSourceModal(ModalScreen):
                 self._connection_form_closed = True
                 self.dismiss(source)
             else:
-                tables = ", ".join(source.datasets) or "no user tables"
-                self._message(f"{source.display} · {len(source.datasets)} tables · {tables}")
+                if source.schema_indexed:
+                    tables = ", ".join(source.datasets) or "no user tables"
+                    self._message(f"{source.display} · {len(source.datasets)} tables · {tables}")
+                else:
+                    self._message(f"{source.display} · Connection successful. Add to query and index schema in the background.")
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            if not self._connection_form_closed and generation == self._generation and fields == self._fields():
+                self._message(f"Connection timed out after {self.CONNECTION_TIMEOUT:g}s. Retry to connect.", error=True)
         except (D1Error, PayloadError, OSError, RuntimeError, ValueError) as exc:
             if not self._connection_form_closed and generation == self._generation and fields == self._fields():
                 self._message(self._connection_error(fields) if fields[5] == "postgres" else str(exc), error=True)
@@ -371,6 +377,11 @@ class AddSourceModal(ModalScreen):
     def on_unmount(self) -> None:
         self._connection_form_closed = True
         self._invalidate()
+
+    @on(Button.Pressed, ".connection-cancel")
+    def _cancel_connection(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.action_cancel()
 
     def action_test(self) -> None:
         self._begin(add=False)

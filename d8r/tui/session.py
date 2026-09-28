@@ -33,7 +33,6 @@ from d8r.engine import (
     build,
     commit,
     capabilities_for,
-    column_values,
     compile_sql,
     dialect_for,
     drop_temp,
@@ -48,6 +47,7 @@ from d8r.engine import (
     temp_handle,
     type_name,
 )
+from d8r.engine.d1api import schema_connection
 from d8r.query import (
     Capabilities,
     ColumnDef,
@@ -68,14 +68,6 @@ PREVIEW_ROW_CAP = 10000
 
 This UI cap is independent of the user-configured default query limit. It does
 not rewrite the query; the reported total describes the executed expression.
-"""
-
-VALUE_POOL_LIMIT = 1000
-"""Distinct values fetched per column for the `\\where` value search.
-
-The palette shows `palette.VALUE_SUGGESTIONS` of them at a time; the pool is
-what the typing searches, so a value that sorts past the first page is still
-found by typing part of it. One fetch per (source, dataset, column), cached.
 """
 
 
@@ -254,7 +246,9 @@ class Session:
         # Temp tables a `\drop` removed, per source: a rollback undoes the
         # drop on the engine, and this is what puts the registry back in step.
         self._dropped: dict[str, dict[str, dict]] = {}
-        self._values: dict[tuple[str, str, str], list[str]] = {}
+        self._value_cache: dict[tuple[int, str, str], tuple[DataSource, tuple[list[object], bool]]] = {}
+        self._value_cache_lock = RLock()
+        self.value_cache_epoch = 0
         # Definitions load without schema-dependent validation: a D1 function
         # remains available even while the bundled demo is the active source.
         self._memory = MemoryStore(data_dir)
@@ -273,7 +267,10 @@ class Session:
             self.dialect = settings["dialect"]
         self.intellisense: bool = settings["intellisense"]
         self.default_rows: int = settings["default_rows"]
+        self.value_cache_enabled: bool = settings["value_cache_enabled"]
+        self.value_cache_limit: int = settings["value_cache_limit"]
         self.pane_visibility: dict[str, bool] = dict(settings["panes"])
+        self.pane_sizes: dict[str, int] = dict(settings["pane_sizes"])
         self.ai_config = AIConfig(**settings["ai"])
         self._workspace = WorkspaceStore(self._memory.path.parent)
         self._workspace_lock = RLock()
@@ -281,6 +278,19 @@ class Session:
         self.workspace_error = self._workspace.error
         self.workspace["document_id"] = self.workspace["document_id"] or uuid4().hex
         self.history = [HistoryEntry(**entry) for entry in self.workspace["history"]]
+        if not self.workspace["pages"]:
+            seen: set[tuple[str, str, str]] = set()
+            for entry in reversed(self.history):
+                identity = (entry.doc, entry.target or entry.source, entry.dialect)
+                if identity in seen or identity == (
+                    self.workspace["document"], self.workspace["source"], self.workspace["dialect"],
+                ):
+                    continue
+                seen.add(identity)
+                self.workspace["pages"].append({
+                    "id": uuid4().hex, "title": "", "document": entry.doc,
+                    "cursor": [0, 0], "source": identity[1], "dialect": entry.dialect,
+                })
         if self.workspace["source"]:
             self.restore_source(self.workspace["source"], self.workspace["dialect"] or None)
         else:
@@ -303,11 +313,19 @@ class Session:
         """An actionable startup read error, or an empty string."""
         return "\n".join(error for error in (self._memory.error, self._settings.error, self.workspace_error) if error)
 
+    @property
+    def ai_auto_accept(self) -> bool:
+        """Whether complete, validated AI proposals may update unchanged drafts."""
+        return self._settings.document["ai_auto_accept"]
+
     def update_settings(
         self, *, intellisense: bool | None = None,
         panes: dict[str, bool] | None = None, source: str | None = None,
         dialect: str | None = None, ai: AIConfig | None = None,
-        default_rows: int | None = None,
+        default_rows: int | None = None, ai_auto_accept: bool | None = None,
+        pane_sizes: dict[str, int] | None = None,
+        value_cache_enabled: bool | None = None,
+        value_cache_limit: int | None = None,
     ) -> None:
         """Save explicit preference changes before applying them to the session.
 
@@ -319,6 +337,8 @@ class Session:
             document["intellisense"] = intellisense
         if panes is not None:
             document["panes"] = {**document["panes"], **panes}
+        if pane_sizes is not None:
+            document["pane_sizes"] = {**document["pane_sizes"], **pane_sizes}
         if source is not None:
             if source not in self.sources:
                 raise ValueError("The selected data source is not registered.")
@@ -331,11 +351,25 @@ class Session:
             document["ai"] = asdict(ai)
         if default_rows is not None:
             document["default_rows"] = default_rows
+        if ai_auto_accept is not None:
+            document["ai_auto_accept"] = ai_auto_accept
+        if value_cache_enabled is not None:
+            document["value_cache_enabled"] = value_cache_enabled
+        if value_cache_limit is not None:
+            document["value_cache_limit"] = value_cache_limit
         self._settings.save(document)
+        with self._value_cache_lock:
+            enabled = self._settings.document["value_cache_enabled"]
+            limit = self._settings.document["value_cache_limit"]
+            if (enabled, limit) != (self.value_cache_enabled, self.value_cache_limit):
+                self.value_cache_enabled, self.value_cache_limit = enabled, limit
+                self.clear_value_cache()
         if intellisense is not None:
             self.intellisense = intellisense
         if panes is not None:
             self.pane_visibility = dict(self._settings.document["panes"])
+        if pane_sizes is not None:
+            self.pane_sizes = dict(self._settings.document["pane_sizes"])
         if source is not None:
             self.set_active(source)
         if dialect is not None:
@@ -353,6 +387,16 @@ class Session:
         """Merge owned fields under one lock; failures preserve the live draft."""
         with self._workspace_lock:
             document = {**self.workspace, **deepcopy(changes)}
+            if document["document"] is not None:
+                page = next((page for page in document["pages"]
+                             if page["id"] == document["document_id"]), None)
+                snapshot = {"id": document["document_id"], "title": page["title"] if page else "",
+                            **{key: deepcopy(document[key]) for key in
+                               ("document", "cursor", "source", "dialect")}}
+                document["pages"] = [snapshot if item["id"] == snapshot["id"] else item
+                                     for item in document["pages"]]
+                if page is None:
+                    document["pages"].append(snapshot)
             sources = dict(document["sources"])
             for source in self.sources.values():
                 if source.con is not None:
@@ -370,6 +414,11 @@ class Session:
                 self.workspace_error = str(exc)
                 raise
             self.workspace_error = ""
+
+    def load_chats(self) -> dict[str, dict]:
+        """Return independent saved conversations, never executable request state."""
+        with self._workspace_lock:
+            return deepcopy(self.workspace["chats"])
 
     def load_chat(self, key: str) -> dict | None:
         with self._workspace_lock:
@@ -556,9 +605,14 @@ class Session:
                self._postgres_profile_id(source.postgres) if source.kind == "postgres-live" else source.id)
         placeholders = [name for name, item in self.sources.items() if item.con is None and self.source_key(name) == key]
         was_active = self.active_id in placeholders
-        for name in placeholders:
-            del self.sources[name]
-        self.sources[source.id] = source
+        with self._value_cache_lock:
+            for name in placeholders:
+                self.clear_value_cache(name)
+                del self.sources[name]
+            previous = self.sources.get(source.id)
+            if previous is not None and previous is not source:
+                self.clear_value_cache(source.id)
+            self.sources[source.id] = source
         if activate:
             self.set_active(source.id)
         elif was_active:
@@ -574,7 +628,30 @@ class Session:
         self.schema = SchemaContext(
             tables=tables_of(source), capabilities=capabilities_object(source),
             fns=tuple(self.fns.values()),
+            tables_complete=source.schema_indexed,
         )
+
+    def sync_d1_schema(
+        self, source: DataSource, schemas: dict[str, dict[str, str]] | None = None,
+    ) -> bool:
+        """Publish cached metadata on the owner thread, never issue a request.
+
+        A full index may finish after a source switch; update only its original
+        registry object. Foreground lookups and indexing merge in the connection
+        cache, so publishing either cannot drop the other's discovered tables.
+        """
+        if source.d1 is None or self.sources.get(source.id) is not source:
+            return False
+        if schemas is not None:
+            source.con.seed(schemas)
+            source.schema_indexed = True
+        source.datasets = {
+            name: {"table": source.con.table(name), "doc": f"{name} · {source.display}", "rows": None}
+            for name in source.con.list_tables()
+        }
+        if self.source is source:
+            self.refresh_schema()
+        return True
 
     # -- palette data -------------------------------------------------------
 
@@ -670,6 +747,7 @@ class Session:
         candidate = SchemaContext(
             tables=schema.tables, capabilities=schema.capabilities,
             fns=tuple(functions.values()),
+            tables_complete=schema.tables_complete,
         )
         messages = parse_body(body, fn.params, schema=candidate, function_name=name)
         if messages:
@@ -718,38 +796,88 @@ class Session:
         doc = f"\\from {name}({args_text.strip()})\n\\select *"
         return self.run(doc, record=False)
 
+    @property
+    def cached_value_columns(self) -> int:
+        """The number of successful column reads retained only in memory."""
+        with self._value_cache_lock:
+            return len(self._value_cache)
+
+    def clear_value_cache(self, source_id: str | None = None) -> None:
+        """Forget values and prevent reads already in flight from republishing them."""
+        with self._value_cache_lock:
+            if source_id is None:
+                self._value_cache.clear()
+            else:
+                self._value_cache = {
+                    key: entry for key, entry in self._value_cache.items()
+                    if entry[0].id != source_id
+                }
+            self.value_cache_epoch += 1
+
+    def cached_values(
+        self, source: DataSource, dataset: str, column: str,
+    ) -> tuple[list[object], bool] | None:
+        """Read the shared typed value cache without touching a connection."""
+        with self._value_cache_lock:
+            if not self.value_cache_enabled:
+                return None
+            entry = self._value_cache.get((id(source), dataset, column))
+            return None if entry is None else entry[1]
+
+    def distinct_values(
+        self, source: DataSource, dataset: str, column: str, *, epoch: int | None = None,
+    ) -> tuple[list[object], bool]:
+        """Inspect one bounded, typed distinct projection, reusing successful reads."""
+        with self._value_cache_lock:
+            if epoch is not None and epoch != self.value_cache_epoch:
+                raise PayloadError("Value cache changed before this read started.")
+            cached = self.cached_values(source, dataset, column)
+            if cached is not None:
+                return cached
+            limit = self.value_cache_limit
+            epoch = self.value_cache_epoch
+            enabled = self.value_cache_enabled
+        if source.con is None:
+            raise PayloadError("Reconnect this source before inspecting values.")
+        payload = {"dataset": dataset, "select": [{"column": column}], "distinct": True,
+                   "orderBy": [{"target": column, "direction": "asc"}],
+                   "limit": limit + 1}
+        tables = {name: entry["table"] for name, entry in source.datasets.items()}
+        dialect = dialect_for(source, default_dialect(source))
+        if source.d1 is not None:
+            result = execute_remote(source.d1, source.con, payload, dialect, tables=tables)
+        else:
+            result = execute(source.con, payload, dialect, tables=tables)
+        rows = result["rows"]
+        values = ([row[0] for row in rows[:limit]], len(rows) > limit)
+        with self._value_cache_lock:
+            if enabled and self.value_cache_enabled and epoch == self.value_cache_epoch:
+                # Keep the object alive as well as its id: ids can be reused after GC.
+                self._value_cache[(id(source), dataset, column)] = (source, values)
+        return values
+
     def values_for(
         self, doc: str, column: str, *, schema: SchemaContext | None = None,
     ) -> list[str]:
-        """A column's distinct values, for the `\\where` value search.
-
-        Cached per (source, dataset, column) and fetched up to
-        `VALUE_POOL_LIMIT`, so typing can search past the first sorted page. A
-        value fetch is best-effort, so a failure (a live D1 hiccup, a column with
-        no value source) means no suggestions rather than an error to dismiss.
-        """
-        schema = self.schema if schema is None else schema
+        """Cached non-null strings for autocomplete; a miss never performs IO."""
         source = self.source
-        source_id = self.active_id
         dataset = self.dataset_of(doc, column, schema=schema)
         if dataset is None:
             return []
-        key = (source_id, dataset, column)
-        if key not in self._values:
-            try:
-                self._values[key] = column_values(
-                    source, dataset, column, limit=VALUE_POOL_LIMIT
-                )
-            except (PayloadError, D1Error, OSError, ValueError, KeyError):
-                self._values[key] = []
-        return self._values[key]
+        cached = self.cached_values(source, dataset, column.rsplit(".", 1)[-1])
+        return [] if cached is None else [str(value) for value in cached[0] if value is not None]
 
     def dataset_of(
         self, doc: str, column: str, *, schema: SchemaContext | None = None,
     ) -> str | None:
         """The dataset a column reference resolves to, if any."""
         schema = self.schema if schema is None else schema
-        resolved = schema.resolve_column(column, self.open_tables(doc, schema=schema))
+        open_tables = self.open_tables(doc, schema=schema)
+        prefix, separator, name = column.rpartition(".")
+        if separator:
+            resolved, dataset = schema.resolve_qualified(prefix, name, open_tables)
+            return dataset if resolved is not None else None
+        resolved = schema.resolve_column(column, open_tables)
         if resolved is not None and resolved.tables:
             return resolved.tables[0]
         pooled = schema.column_by_name(column)
@@ -848,6 +976,7 @@ class Session:
             state.open = False
             state.savepoints.clear()
             if kind == "rollback":
+                self.clear_value_cache(self.active_id)
                 self._prune_temp()
             return message
         if not state.open:
@@ -868,6 +997,7 @@ class Session:
             return f'savepoint "{name}" released'
         rollback_to(con, name or "")
         state.savepoints = [*kept, name]
+        self.clear_value_cache(self.active_id)
         self._prune_temp()
         return f'rolled back to savepoint "{name}"'
 
@@ -919,7 +1049,14 @@ class Session:
         table by name: SQLite reads a table's schema inside a transaction of its
         own, which would commit the session's open one.
         """
-        return {name: entry["table"] for name, entry in self.source.datasets.items()}
+        source = self.source
+        tables = {name: entry["table"] for name, entry in source.datasets.items()}
+        if source.d1 is not None:
+            # Include metadata learned by a headless run before UI publication.
+            for name in source.con.list_tables():
+                if name not in tables:
+                    tables[name] = source.con.table(name)
+        return tables
 
     def materialize_temp(
         self,
@@ -952,7 +1089,7 @@ class Session:
             "temp": True,
         }
         # A fresh table means fresh values: nothing cached for this source still holds.
-        self._values = {key: value for key, value in self._values.items() if key[0] != self.active_id}
+        self.clear_value_cache(self.active_id)
         self.refresh_schema()
         return result
 
@@ -967,7 +1104,7 @@ class Session:
         # back on the engine: what it was — its handle, its row count — is kept
         # so the registry can follow.
         self._dropped.setdefault(self.active_id, {})[name] = entry
-        self._values = {key: value for key, value in self._values.items() if key[0] != self.active_id}
+        self.clear_value_cache(self.active_id)
         self.refresh_schema()
 
     # -- running ------------------------------------------------------------
@@ -1108,7 +1245,9 @@ class Session:
             if not has_query(ast):
                 return None, "nothing to compile — this document carries statements only"
             dialect = dialect_for(self.source, self.dialect)
-            sql = compile_sql(build(self.source.con, payload, tables=self.tables()), dialect)
+            # Compile stays offline even while a remote source is indexing.
+            con = schema_connection({}) if self.source.d1 is not None else self.source.con
+            sql = compile_sql(build(con, payload, tables=self.tables()), dialect)
         except (PayloadError, D1Error) as exc:
             return None, str(exc)
         except Exception as exc:  # last-resort guard: a UI may not crash or exit

@@ -49,9 +49,13 @@ TxKind = Literal["begin", "commit", "rollback", "rollback_to", "savepoint", "rel
 class AggCall:
     fn: AggregateFn
     arg: str
+    where: WhereClause | None = None
 
     def to_json(self) -> dict:
-        return {"fn": self.fn, "arg": self.arg}
+        data = {"fn": self.fn, "arg": self.arg}
+        if self.where is not None:
+            data["where"] = self.where.to_json()
+        return data
 
 
 @dataclass
@@ -159,10 +163,10 @@ class ColumnRef:
 
 @dataclass
 class ScalarCall:
-    """A catalog function whose arguments are columns, constants, or scalar calls."""
+    """A catalog function over columns, constants, scalar calls, or arithmetic."""
 
     fn: str
-    args: list[ColumnRef | LiteralValue | ScalarCall]
+    args: list[ColumnRef | LiteralValue | ScalarCall | ArithmeticExpr]
 
     def to_json(self) -> dict:
         return {
@@ -175,12 +179,32 @@ class ScalarCall:
 
 
 @dataclass
+class ArithmeticExpr:
+    """Numeric unary or binary arithmetic with explicitly tagged operands."""
+
+    op: str
+    args: list[ColumnRef | LiteralValue | ScalarCall | AggCall | ArithmeticExpr]
+
+    def to_json(self) -> dict:
+        return {
+            "op": self.op,
+            "args": [
+                {"literal": arg.to_json()} if isinstance(arg, LiteralValue)
+                else {"aggregate": arg.to_json()} if isinstance(arg, AggCall)
+                else arg.to_json()
+                for arg in self.args
+            ],
+        }
+
+
+@dataclass
 class SelectItem:
     line: int  # 1-based document line the command lives on.
     raw: str  # Raw argument text as typed, e.g. `sum(amount) as revenue`.
     column: str | None = None  # Set when the item is a plain column reference.
     literal: LiteralValue | None = None
     scalar: ScalarCall | None = None
+    arithmetic: ArithmeticExpr | None = None
     # `\select *` — expands to every column of the open tables (leftmost-first dedup).
     star: bool = False
     aggregate: AggCall | None = None  # Aggregate call (windowless unless `window` is set).
@@ -199,6 +223,7 @@ class SelectItem:
             "column": self.column,
             "literal": self.literal.to_json() if self.literal is not None else None,
             "scalar": self.scalar.to_json() if self.scalar else None,
+            "arithmetic": self.arithmetic.to_json() if self.arithmetic else None,
             "star": self.star,
             "aggregate": self.aggregate.to_json() if self.aggregate else None,
             "temporal": self.temporal.to_json() if self.temporal else None,

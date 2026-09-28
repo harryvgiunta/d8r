@@ -8,6 +8,12 @@ from typing import Literal
 ArgumentKind = Literal["string", "integer", "any"]
 ResultKind = Literal["string", "integer", "boolean", "date", "time", "timestamp", "any"]
 
+ARITHMETIC_PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2}
+MAX_EXPRESSION_DEPTH = 32
+MAX_EXPRESSION_NODES = 256
+MAX_WHERE_DEPTH = 32
+MAX_WHERE_NODES = 256
+
 
 @dataclass(frozen=True)
 class ScalarFunction:

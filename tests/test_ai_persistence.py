@@ -60,8 +60,7 @@ class ChatApp(App):
                         () if self.function_mode else None)
 
     def compose(self) -> ComposeResult:
-        yield AIPanel(self.session, self.snapshot, self.applied.append, lambda: None,
-                      function_mode=self.function_mode, id="chat")
+        yield AIPanel(self.session, self.snapshot, self.applied.append, lambda: None, id="chat")
 
     @property
     def panel(self) -> AIPanel:
@@ -112,7 +111,6 @@ def test_restart_continues_complete_tool_history_with_fresh_context(monkeypatch)
             assert len(requests) == 2  # Loading the panel never calls the provider.
             assert panel.display
             assert panel.messages == original_messages
-            assert panel._turn == 1
             assert panel.query_one("#ai-input", TextArea).text == "Continue after restart"
             assert "Review this draft" in str(panel.query_one("#ai-transcript", Static).content)
             assert panel.query_one("#ai-apply", Button).disabled
@@ -129,7 +127,6 @@ def test_restart_continues_complete_tool_history_with_fresh_context(monkeypatch)
             snapshot = json.loads(sent[0]["content"].split("Editor snapshot (JSON data):\n")[1])
             assert snapshot["document"] == "\\from users"
             assert snapshot["default_rows"] == 17
-            assert panel._turn == 2
     asyncio.run(scenario())
 
 
@@ -222,7 +219,6 @@ def test_cancelled_and_failed_partial_turns_are_not_replayed(monkeypatch):
             panel = restarted.panel
             assert not panel.messages
             assert not panel.query_one("#ai-transcript", Static).content
-            assert not panel._diagnostics.text
             assert panel.query_one("#ai-apply", Button).disabled
             panel.query_one("#ai-input", TextArea).load_text("Fresh request")
             panel.action_send()

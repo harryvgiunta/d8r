@@ -10,6 +10,8 @@ document. No terminal and no network: the `Session` seams its own schema.
 
 from __future__ import annotations
 
+
+import pytest
 from d8r.query import parse_body, parse_query
 from d8r.tui.palette import view_for
 from d8r.tui.session import Session
@@ -160,21 +162,6 @@ def test_the_preview_calls_without_touching_history():
 # -- the palette, so a function is callable ---------------------------------
 
 
-def test_bare_fn_opens_the_library_and_offers_a_new_function():
-    ns = session_with_functions()
-    view = view_for(ns, "\\fn", "\\fn", len("\\fn"))
-    assert [entry.action for entry in view.entries] == ["fn-new:", "fn-open:hot", "fn-open:all_events"]
-
-
-def test_fn_with_a_name_opens_it_or_offers_to_create_it():
-    ns = session_with_functions()
-    matched = view_for(ns, "\\fn ho", "\\fn ho", len("\\fn ho"))
-    assert [entry.action for entry in matched.entries] == ["fn-new:ho", "fn-open:hot"]
-
-    fresh = view_for(ns, "\\fn zzz", "\\fn zzz", len("\\fn zzz"))
-    assert [entry.action for entry in fresh.entries] == ["fn-new:zzz"]
-
-
 def test_a_dataset_clause_completes_a_call_with_the_caret_inside():
     """`\from ho` offers `hot()`, and accepting leaves the caret between the parens."""
     ns = session_with_functions()
@@ -200,3 +187,47 @@ def test_fn_projects_literal_arguments_without_converting_numeric_text():
         assert preview.columns == ["tag", "marker"]
         assert preview.rows == [[value, "x"], [value, "x"]]
     assert ns.history == []
+
+
+def test_direct_parameterized_function_runs_saved_cte_body_after_restart():
+    ns = Session()
+    ns.save_fn("fn_top_n_free", "n", "\\with eligible\n  \\from users\n"
+               "  \\where user_id > 0\n  \\select user_id\n"
+               "\\from eligible\n\\order user_id\n\\limit @n", "Top users")
+    restored = Session()
+    document = "\\fn_top_n_free(25)"
+    result = restored.run(document)
+    assert result.error == ""
+    assert result.rows == [[i] for i in range(1, 26)]
+    assert restored.history[0].doc == document
+    sql, message = restored.compile(document)
+    assert sql is not None, message
+    empty = restored.run("\\fn_top_n_free(0)")
+    assert empty.error == "" and empty.rows == []
+
+
+def test_direct_calls_preserve_case_quoted_arguments_and_relation_scope():
+    ns = Session()
+    ns.save_fn("Tagged", "tag", "\\from events\n\\select @tag as tag\n\\limit 1", "")
+    ns.save_fn("Wrapped", "tag", "\\Tagged(@tag)", "")
+    result = ns.run("\\with tagged\n  \\Wrapped('a,b (value)') as t\n  \\select t.tag\n"
+                    "\\from tagged")
+    assert result.error == ""
+    assert result.rows == [["a,b (value)"]]
+    ns.save_fn("ready", "", "\\Tagged('ready')", "")
+    assert ns.run("\\ready()").rows == [["ready"]]
+
+
+def test_direct_calls_keep_argument_errors_and_expansion_safety():
+    ns = session_with_functions()
+    for document, message in (
+        ("\\hot()", "got none"),
+        ("\\hot(1, 2)", "got 2"),
+        ("\\hot(1", "closing"),
+        ("\\missing(1)", 'unknown function "missing"'),
+        ("\\hot(1\\drop events)", "cannot contain"),
+    ):
+        assert message in ns.run(document).error
+    assert ns.history == []
+    with pytest.raises(ValueError, match="recursive function call"):
+        ns.save_fn("recursive", "n", "\\recursive(@n)", "")

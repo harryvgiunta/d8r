@@ -9,13 +9,23 @@ from __future__ import annotations
 import functools
 import operator
 import re
+from collections.abc import Callable
 from operator import eq, ge, gt, le, lt, ne
 
 import ibis
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisError
 
-from d8r.query.functions import SCALAR_FUNCTIONS
+from d8r.query.functions import (
+    ARITHMETIC_PRECEDENCE,
+    MAX_EXPRESSION_DEPTH,
+    MAX_EXPRESSION_NODES,
+    MAX_WHERE_DEPTH,
+    MAX_WHERE_NODES,
+    SCALAR_FUNCTIONS,
+)
+
+from .d1api import D1Error
 
 __all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql"]
 
@@ -82,6 +92,8 @@ def get_table(
         return tables[dataset]
     try:
         return con.table(dataset)
+    except D1Error:
+        raise
     except Exception as exc:  # backend raises IbisError/KeyError for unknown names
         raise PayloadError(f"unknown dataset: {dataset}") from exc
 
@@ -461,25 +473,103 @@ def _coerce(value: object, dtype) -> object:
 
 
 def _aggregate(
-    expr: ir.Table, frames: list[tuple[str, ir.Table]], fn: object, arg: object
+    con, expr: ir.Table, frames: list[tuple[str, ir.Table]], spec: object,
+    ctes: dict[str, ir.Table] | None, tables: dict[str, ir.Table] | None,
 ) -> ir.Scalar:
-    """Count `*` on the current relation; column counts retain NULL semantics."""
-    if fn not in AGGREGATE_FNS:
+    """Apply an optional predicate to this reduction, never to the input relation."""
+    if not isinstance(spec, dict) or not {"fn", "arg"} <= set(spec) or set(spec) - {"fn", "arg", "where"}:
+        raise PayloadError("aggregate must contain fn, arg and optional where")
+    fn, arg = spec["fn"], spec["arg"]
+    if not isinstance(fn, str) or fn not in AGGREGATE_FNS:
         raise PayloadError(f"unknown aggregate: {fn!r}")
+    if not isinstance(arg, str):
+        raise PayloadError("aggregate arguments must be a column or count(*)")
+    predicate = spec.get("where")
+    if predicate is not None:
+        _validate_aggregate_where(predicate)
+        predicate = _where_expr(con, frames, predicate, ctes, tables)
     if arg == "*":
         if fn != "count":
             raise PayloadError(f"{fn}(*) is not supported — only count accepts '*'")
-        return expr.count()
+        if predicate is not None:
+            # Table.count's lightweight binding does not rewrite ancestor fields.
+            # Dereference onto the joined/filtered relation before CountStar owns it.
+            (predicate,) = expr.bind(predicate)
+        return expr.count(where=predicate)
     column = col(frames, arg)
-    # Resolve by name: a string column can count without touching numeric methods.
-    method = {
-        "sum": "sum",
-        "avg": "mean",
-        "count": "count",
-        "min": "min",
-        "max": "max",
-    }[fn]
-    return getattr(column, method)()
+    method = "mean" if fn == "avg" else fn
+    try:
+        return getattr(column, method)(where=predicate)
+    except (IbisError, AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise PayloadError(f"invalid {fn} operand: {exc}") from exc
+
+
+def _validate_aggregate_where(predicate: object) -> None:
+    """Reject malformed/ambiguous raw predicate trees before Ibis sees them."""
+    pending = [(predicate, 0, True)]
+    nodes = 0
+    leaf_fields = {"column", "op", "value", "subquery", "low", "high", "values", "group"}
+    scalar_types = (str, int, float, bool)
+    while pending:
+        condition, depth, tree = pending.pop()
+        nodes += 1
+        if depth > MAX_WHERE_DEPTH or nodes > MAX_WHERE_NODES:
+            raise PayloadError("aggregate where exceeds maximum depth or nodes")
+        allowed = leaf_fields | {"ands", "ors"} if tree else leaf_fields
+        if not isinstance(condition, dict) or set(condition) - allowed:
+            raise PayloadError("aggregate where conditions must be predicate objects")
+        for key in ("ands", "ors"):
+            if key not in condition:
+                continue
+            children = condition[key]
+            if not isinstance(children, list) or not children:
+                raise PayloadError(f"aggregate where {key} must be a non-empty array")
+            if key == "ands":
+                pending.extend((child, depth, False) for child in children)
+            else:
+                for group in children:
+                    if not isinstance(group, list) or not group:
+                        raise PayloadError("aggregate where or-groups must be non-empty arrays")
+                    pending.extend((child, depth, False) for child in group)
+        if "group" in condition:
+            if any(condition.get(key) not in (None, "") for key in ("column", "op", "value", "subquery")) or any(key in condition for key in ("low", "high", "values")):
+                raise PayloadError("aggregate where group cannot carry a predicate operand")
+            pending.append((condition["group"], depth + 1, True))
+            continue
+        op = condition.get("op")
+        if not isinstance(op, str) or op not in OPERATORS:
+            raise PayloadError(f"unknown operator: {op!r}")
+        if not isinstance(condition.get("column"), str):
+            raise PayloadError("aggregate where needs a column")
+        subquery = condition.get("subquery")
+        if subquery is not None:
+            if not isinstance(subquery, dict) or op not in SUBQUERY_OPS | COMPARISONS.keys():
+                raise PayloadError("aggregate where has an invalid subquery operand")
+            operands = set()
+        elif op in NULL_OPS:
+            operands = set()
+        elif op in BETWEEN_OPS:
+            operands = {"low", "high"}
+        elif op in SUBQUERY_OPS:
+            operands = {"values"}
+        else:
+            operands = {"value"}
+        if (set(condition) & {"low", "high", "values"}) != operands - {"value"}:
+            raise PayloadError("aggregate where has invalid predicate operands")
+        if "value" not in operands and condition.get("value") not in (None, ""):
+            raise PayloadError("aggregate where operator takes no value operand")
+        for key in operands:
+            if key not in condition:
+                raise PayloadError(f"aggregate where needs {key}")
+            value = condition[key]
+            if key == "values":
+                if not isinstance(value, list) or not value:
+                    raise PayloadError("aggregate where values must be a non-empty array")
+                values = value
+            else:
+                values = [value]
+            if any(value is not None and not isinstance(value, scalar_types) for value in values):
+                raise PayloadError("aggregate where operands must be scalar values")
 
 
 def _predicate(frames: list[tuple[str, ir.Table]], condition: dict) -> ir.BooleanValue:
@@ -755,7 +845,8 @@ def _window_frame(expr: ir.Table, frames: list[tuple[str, ir.Table]], spec: obje
 
 
 def _windowed_column(
-    expr: ir.Table, frames: list[tuple[str, ir.Table]], item: dict, name: str
+    con, expr: ir.Table, frames: list[tuple[str, ir.Table]], item: dict, name: str,
+    ctes: dict[str, ir.Table] | None, tables: dict[str, ir.Table] | None,
 ) -> ir.Column:
     """A windowed select item -> `<fn> OVER ( … ) AS name`.
 
@@ -777,7 +868,7 @@ def _windowed_column(
     if not isinstance(aggregate, dict):
         raise PayloadError("over (...) needs an aggregate or rank function")
     (aggregate_expr,) = expr.bind(
-        _aggregate(expr, frames, aggregate.get("fn"), aggregate.get("arg"))
+        _aggregate(con, expr, frames, aggregate, ctes, tables)
     )
     return aggregate_expr.over(window).name(name)
 
@@ -876,30 +967,98 @@ def _regex_column(frames: list[tuple[str, ir.Table]], spec: dict, name: str) -> 
     raise PayloadError(f"unknown regex function: {fn!r}")
 
 
-def _scalar_argument(frames: list[tuple[str, ir.Table]], node: object) -> ir.Value:
-    """Resolve exactly one scalar argument form, without implicit coercion."""
-    if not isinstance(node, dict):
-        raise PayloadError("scalar arguments must be objects")
-    if set(node) == {"column"}:
-        return col(frames, node["column"], "scalar argument")
-    if set(node) == {"literal"}:
-        literal = node["literal"]
-        if not isinstance(literal, dict) or set(literal) != {"value"}:
-            raise PayloadError("scalar literal must be an object with only a value")
-        value = literal["value"]
-        if value is not None and not isinstance(value, (str, int, float, bool)):
-            raise PayloadError("literal value must be a string, number, boolean, or null")
+def _select_expression(
+    con, expr: ir.Table, frames: list[tuple[str, ir.Table]], spec: object, kind: str,
+    ctes: dict[str, ir.Table] | None, tables: dict[str, ir.Table] | None,
+) -> tuple[ir.Value, str]:
+    """Build a bounded expression and track its constant/row/aggregate dependency.
+
+    Aggregate leaves are permitted only outside catalog scalar calls. Tracking
+    dependencies explicitly prevents Ibis from turning mixed row/reduction math
+    into an implicit window expression.
+    """
+    expected = {"op", "args"} if kind == "arithmetic" else {"fn", "args"}
+    if not isinstance(spec, dict) or set(spec) != expected:
+        raise PayloadError(f"{kind} must be an object with only {' and '.join(sorted(expected))}")
+    nodes = 0
+
+    def visit(node: object, depth: int, allow_aggregate: bool) -> tuple[ir.Value, str]:
+        nonlocal nodes
+        nodes += 1
+        if depth > MAX_EXPRESSION_DEPTH:
+            raise PayloadError(f"expression exceeds maximum depth {MAX_EXPRESSION_DEPTH}")
+        if nodes > MAX_EXPRESSION_NODES:
+            raise PayloadError(f"expression exceeds maximum nodes {MAX_EXPRESSION_NODES}")
+        if not isinstance(node, dict):
+            raise PayloadError("expression operands must be objects")
+        fields = set(node)
+        if fields == {"column"}:
+            return col(frames, node["column"], "expression operand"), "row"
+        if fields == {"literal"}:
+            literal = node["literal"]
+            if not isinstance(literal, dict) or set(literal) != {"value"}:
+                raise PayloadError("expression literal must be an object with only a value")
+            value = literal["value"]
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise PayloadError("literal value must be a string, number, boolean, or null")
+            try:
+                return ibis.literal(value), "constant"
+            except (IbisError, TypeError, ValueError, OverflowError) as exc:
+                raise PayloadError(f"invalid expression literal: {exc}") from exc
+        if fields == {"fn", "args"}:
+            value = _scalar_call(node, lambda child: visit(child, depth + 1, False)[0])
+            return value, "row" if isinstance(value, ir.Column) else "constant"
+        if fields == {"aggregate"}:
+            if not allow_aggregate:
+                raise PayloadError("aggregate operands are not supported inside scalar calls; use a CTE")
+            return _aggregate(con, expr, frames, node["aggregate"], ctes, tables), "aggregate"
+        if fields != {"op", "args"}:
+            raise PayloadError("expression operand must contain only column, literal, aggregate, fn and args, or op and args")
+        op, args = node["op"], node["args"]
+        if not isinstance(op, str) or op not in ARITHMETIC_PRECEDENCE:
+            raise PayloadError(f"unknown arithmetic operator: {op!r}")
+        if not isinstance(args, list):
+            raise PayloadError("arithmetic args must be an array")
+        if len(args) != 2 and not (len(args) == 1 and op in ("+", "-")):
+            raise PayloadError(f"arithmetic {op!r} needs two operands (unary + and - accept one)")
+        values = []
+        dependencies = set()
+        for arg in args:
+            value, dependency = visit(arg, depth + 1, allow_aggregate)
+            dtype = value.type()
+            if dtype.is_null():
+                value = value.cast("int64")
+            elif not dtype.is_numeric() or dtype.is_boolean():
+                raise PayloadError(f"arithmetic {op!r} needs numeric operands, got {dtype}")
+            values.append(value)
+            dependencies.add(dependency)
+        if "aggregate" in dependencies and "row" in dependencies:
+            raise PayloadError("arithmetic cannot mix aggregates and unaggregated columns; use a CTE")
+        dependency = "aggregate" if "aggregate" in dependencies else "row" if "row" in dependencies else "constant"
         try:
-            return ibis.literal(value)
+            if len(values) == 1:
+                value = values[0] if op == "+" else -values[0]
+            else:
+                left, right = values
+                if op == "/":
+                    # Ibis true division casts integer operands where required;
+                    # NULLIF makes zero divisors consistent across SQL backends.
+                    value = left / right.nullif(0)
+                elif op == "+":
+                    value = left + right
+                elif op == "-":
+                    value = left - right
+                else:
+                    value = left * right
         except (IbisError, TypeError, ValueError, OverflowError) as exc:
-            raise PayloadError(f"invalid scalar literal: {exc}") from exc
-    if set(node) == {"fn", "args"}:
-        return _scalar_call(frames, node)
-    raise PayloadError("scalar argument must contain only column, literal, or fn and args")
+            raise PayloadError(f"invalid arithmetic {op!r}: {exc}") from exc
+        return value, dependency
+
+    return visit(spec, 1, True)
 
 
-def _scalar_call(frames: list[tuple[str, ir.Table]], spec: object) -> ir.Value:
-    """Build a catalog-whitelisted call using Ibis' own string semantics."""
+def _scalar_call(spec: object, resolve: Callable[[object], ir.Value]) -> ir.Value:
+    """Build a catalog-whitelisted call using Ibis' own scalar semantics."""
     if not isinstance(spec, dict) or set(spec) != {"fn", "args"}:
         raise PayloadError("scalar must be an object with only fn and args")
     fn = spec["fn"]
@@ -920,7 +1079,7 @@ def _scalar_call(frames: list[tuple[str, ir.Table]], spec: object) -> ir.Value:
         raise PayloadError(f"{fn} expects {expected} arguments, got {len(nodes)}")
     args = []
     for index, node in enumerate(nodes):
-        value = _scalar_argument(frames, node)
+        value = resolve(node)
         kind = signature.argument_kind(index)
         dtype = value.type()
         if kind != "any":
@@ -1041,7 +1200,7 @@ def build(
 
     plain: list[ir.Value] = []
     constants: list[ir.Scalar] = []
-    aggregates: list[ir.Column] = []
+    aggregates: list[ir.Scalar] = []
     windowed: list[ir.Column] = []
     scalar_subqueries: list[ir.Column] = []
     # Output names already projected as plain columns; a star expansion skips
@@ -1054,6 +1213,7 @@ def build(
         column_name = item.get("column")
         literal = item.get("literal")
         scalar = item.get("scalar")
+        arithmetic = item.get("arithmetic")
         aggregate = item.get("aggregate")
         temporal = item.get("temporal")
         rank = item.get("rank")
@@ -1064,9 +1224,14 @@ def build(
         star = bool(item.get("star"))
         if scalar is not None and any(
             value is not None
-            for value in (column_name, literal, aggregate, temporal, rank, regex, subquery)
+            for value in (column_name, literal, arithmetic, aggregate, temporal, rank, regex, subquery)
         ):
             raise PayloadError("a scalar select item carries only one expression")
+        if arithmetic is not None and any(
+            value is not None
+            for value in (column_name, literal, aggregate, temporal, rank, regex, subquery)
+        ):
+            raise PayloadError("an arithmetic select item carries only one expression")
         if star:
             if item.get("window") is not None:
                 raise PayloadError("a star select cannot carry over (...)")
@@ -1081,6 +1246,7 @@ def build(
                 or subquery is not None
                 or literal is not None
                 or scalar is not None
+                or arithmetic is not None
             ):
                 raise PayloadError("a star select item carries no expression")
             star_seen = True
@@ -1091,23 +1257,30 @@ def build(
         elif item.get("window") is not None:
             if scalar is not None:
                 raise PayloadError("a scalar call cannot carry over (...)")
+            if arithmetic is not None:
+                raise PayloadError("arithmetic cannot carry over (...); use a CTE")
             if rank is not None:
                 fn = rank.get("fn") if isinstance(rank, dict) else None
-                windowed.append(_windowed_column(expr, frames, item, named or str(fn)))
+                windowed.append(_windowed_column(con, expr, frames, item, named or str(fn), cte_tables, tables))
             elif isinstance(aggregate, dict):
                 fn = aggregate.get("fn")
                 windowed.append(
-                    _windowed_column(expr, frames, item, named or _derived_alias(fn, aggregate.get("arg")))
+                    _windowed_column(con, expr, frames, item, named or _derived_alias(fn, aggregate.get("arg")), cte_tables, tables)
                 )
             else:
                 raise PayloadError("over (...) needs an aggregate or rank function")
-        elif scalar is not None:
-            out = _scalar_call(frames, scalar)
-            out = out.name(named or scalar["fn"])
-            plain.append(out)
-            projected.add(out.get_name())
-            if isinstance(out, ir.Scalar):
-                constants.append(out)
+        elif scalar is not None or arithmetic is not None:
+            kind = "arithmetic" if arithmetic is not None else "scalar"
+            spec = arithmetic if arithmetic is not None else scalar
+            out, dependency = _select_expression(con, expr, frames, spec, kind, cte_tables, tables)
+            out = out.name(named or ("arithmetic" if arithmetic is not None else scalar["fn"]))
+            if dependency == "aggregate":
+                aggregates.append(out)
+            else:
+                plain.append(out)
+                projected.add(out.get_name())
+                if dependency == "constant":
+                    constants.append(out)
         elif literal is not None:
             if not isinstance(literal, dict) or "value" not in literal:
                 raise PayloadError("literal must be an object with a value")
@@ -1135,7 +1308,7 @@ def build(
             if not isinstance(aggregate, dict):
                 raise PayloadError("aggregate must be an object")
             fn = aggregate.get("fn")
-            out = _aggregate(expr, frames, fn, aggregate.get("arg"))
+            out = _aggregate(con, expr, frames, aggregate, cte_tables, tables)
             name = named or _derived_alias(fn, aggregate.get("arg"))
             aggregates.append(out.name(name))
         elif temporal is not None:
@@ -1163,7 +1336,7 @@ def build(
             projected.add(named or column.get_name())
         else:
             raise PayloadError(
-                "select item must have column, literal, scalar, aggregate, temporal, rank, regex, subquery, or *"
+                "select item must have column, literal, scalar, arithmetic, aggregate, temporal, rank, regex, subquery, or *"
             )
 
     keys = []
@@ -1240,20 +1413,24 @@ def build(
 def _build_ctes(
     con, ctes: object, resolved: dict[str, ir.Table], tables: dict[str, ir.Table] | None
 ) -> None:
-    """Build each `ctes` entry in order into `tables`, so a later body can name
-    an earlier CTE. Bodies build against the same connection through `build`;
-    the map is threaded into table resolution (no `con` state mutation)."""
+    """Build a relation's local CTEs in order, shadowing enclosing names.
+
+    `build` owns a copy of the enclosing map: function-local definitions can
+    reuse caller names without leaking into callers or sibling invocations.
+    Only repeated names within this list are duplicates.
+    """
     if ctes is None:
         return
     if not isinstance(ctes, list):
         raise PayloadError("ctes must be an array")
+    names: set[str] = set()
     for spec in ctes:
         if not isinstance(spec, dict):
             raise PayloadError("cte specs must be objects")
         name = spec.get("name")
         if not isinstance(name, str) or not name:
             raise PayloadError("cte must have a non-empty name")
-        if name in resolved:
+        if name in names:
             raise PayloadError(f'duplicate cte name "{name}"')
         body = spec.get("body")
         if not isinstance(body, dict):
@@ -1261,6 +1438,7 @@ def _build_ctes(
         if body.get("ctes"):
             raise PayloadError("nested CTEs are not supported")
         resolved[name] = build(con, body, resolved, tables)
+        names.add(name)
 
 
 def _derived_alias(fn: object, arg: object) -> str:

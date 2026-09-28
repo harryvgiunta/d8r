@@ -582,6 +582,7 @@ class DataSource:
     d1: object = None
     # Connection identity only: the password stays with the driver/profile owner.
     postgres: dict[str, str] = field(default_factory=dict, repr=False)
+    schema_indexed: bool = True
 
 
 def type_name(dtype) -> str:
@@ -725,9 +726,9 @@ def load(
 #     (`wrangler d1 execute --local`), opened in-process through ibis's SQLite
 #     backend — same engine, no network.
 #   * live (`kind="d1-live"`): the database reached over Cloudflare's HTTPS
-#     API with the user's own credentials. Real schemas are pulled into unbound
-#     ibis tables so payloads compile to SQLite SQL exactly like every other
-#     source; the SQL is then run back through the API (`d8r.engine.execute`).
+#     API with the user's own credentials. Referenced table schemas are loaded
+#     on demand into unbound ibis tables to compile payloads to SQLite SQL;
+#     the SQL is then run back through the API (`d8r.engine.execute`).
 #
 # A snapshot is the user's own file (outside `d8r/engine/data/`, never
 # regenerated). Live clients hold credentials in memory for requests; explicit
@@ -806,36 +807,27 @@ def add_d1_live_source(
 ) -> DataSource:
     """Build (but do not register) a *live* Cloudflare D1 datasource.
 
-    The database is reached over its HTTPS API, never opened locally. Its real
-    schemas are pulled once into unbound ibis tables — enough for the explorer
-    and for compiling every payload to SQLite SQL; the SQL is then run back
-    through the API (see `d8r.engine.execute`). A bad token or unknown database
-    raises `D1Error` during introspection, before anything registers.
+    The initial request authenticates without discovering any tables. Referenced
+    table schemas load on demand through the connection; the app can independently
+    index the full schema for its explorer. A bad token or unknown database raises
+    `D1Error` before anything registers.
     """
     d1 = client or CloudflareD1(account_id=account_id, api_token=api_token, database=database)
     try:
         d1.resolve()
-        schemas = d1.schemas()
-        counts = d1.row_counts(list(schemas))
+        d1.check_connection()
         label = (display or "").strip() or f"D1 · {database}"
-        con = schema_connection(schemas)
-        source = DataSource(
+        return DataSource(
             id=source_id,
             display=label,
             doc=f"Cloudflare D1 · {d1.database_uuid}",
             kind="d1-live",
             dialect="sqlite",
             dir=Path(database),
-            con=con,
+            con=schema_connection({}, d1=d1),
             d1=d1,
+            schema_indexed=False,
         )
-        for name in schemas:
-            source.datasets[name] = {
-                "table": con.table(name),
-                "doc": f"{name} · {database}",
-                "rows": counts.get(name, 0),
-            }
-        return source
     except Exception:
         d1.close()
         raise

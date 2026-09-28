@@ -13,7 +13,7 @@ Everything derives from it: the AST is always recomputed from the text (nothing
 caches it across edits), the AST becomes a payload, the payload builds a real
 ibis expression, and the widgets render whatever comes back. Nothing writes
 back into the document except user edits, palette inserts, and an AI proposal
-the user explicitly accepts with Apply.
+the user accepts with Apply or explicitly enables through Auto accept AI updates.
 
 Three layers, one direction:
 
@@ -57,6 +57,15 @@ connection (`execute_remote` in `d8r/engine/execute.py`). The client uses the
 token per request; explicit **Add** saves it locally for reuse. Tokens are never
 logged or rendered unmasked (the modal's API-token input is `password=True`,
 and the built source never renders it). Startup never connects automatically.
+Live D1 connects with a lightweight authenticated probe, not full schema discovery.
+Run fetches only missing metadata for referenced tables through the existing Ibis
+path; a separate background index fills the explorer and completion snapshot.
+A small "Indexing schema…" indicator never reserves the query connection lane.
+Index failures/timeouts leave Run available and do not overwrite results/history;
+late index results only update their original registered source, never a replacement
+or a closed app. Partial schema snapshots permit not-yet-indexed table references.
+Compile stays offline, using only already-loaded metadata. Neither path counts
+table/view rows; the explorer reports "row count not loaded".
 
 **User-authorized exception — PostgreSQL.** The user explicitly requested a real
 PostgreSQL connection and a local Docker database. `kind="postgres-live"` uses
@@ -65,8 +74,18 @@ Ibis's PostgreSQL backend with psycopg, through the existing payload → express
 schema and SSL mode. It discovers the selected schema's tables/views without
 full row-count scans or extension installation. Test/Cancel save nothing; Add
 saves PostgreSQL profiles and passwords in `memory.json`. Passwords are masked,
-preserved verbatim and never logged. Saved targets restore disconnected; only
-explicit selection reconnects. Transactions/savepoints/temp tables share one
+preserved verbatim and never logged. Saved targets restore disconnected; explicit
+selection or workspace Run reconnects. Run reuses saved PostgreSQL/D1 credentials
+or a SQLite snapshot path through compact nonmodal connection progress, then executes the captured
+document only if the target identity still matches. Failure or Cancel executes
+nothing; changing the target requires a fresh Run. Startup never connects.
+Saved connections have a 30-second deadline; blinking dots and Cancel replace
+the loading bar. Cancel/timeout/target switches revoke the attempt and
+dispose late-built sources. Missing credentials still require the connection form.
+Connection workers start after Mount dispatch (`call_later`), never directly inside
+`on_mount`: Textual still reports `is_mounted=False` during that event, which can
+otherwise abandon the attempt before either connecting or starting its timeout.
+Transactions/savepoints/temp tables share one
 autocommit connection with explicit transaction ownership; temp DDL/handles are
 qualified to `pg_temp`, never persistent tables. Production roles should be
 least-privileged and use provider-appropriate TLS. `compose.yaml` provisions an
@@ -85,8 +104,10 @@ limits/attempts/timeout. Configuration files are editable JSON under
 These files and backups contain plaintext secrets: protect them. New directories
 and files use owner-only POSIX modes; Windows relies on filesystem ACLs.
 `Session` loads configuration without network or schema-dependent function-body validation.
-Function Save/Run preview and Delete persist definitions immediately; AI Apply
-and ordinary edits autosave drafts only. D1 Add saves credentials; Test and Cancel do not.
+Function Save/Run preview and Delete persist definitions immediately, as do
+explicit user-requested workspace AI saves through `save_function` and manual
+**Save function** on preview proposals. Query/function-form AI Apply and ordinary
+edits autosave drafts only. D1 Add saves credentials; Test and Cancel do not.
 Saved profiles fill the masked token; legacy token-free profiles still load.
 Toggle preferences save on change; AI provider and default-row forms require explicit Save.
 Import only fills the form. Unavailable workspace targets restore as disconnected,
@@ -99,9 +120,11 @@ until recovery and restart. External file edits require restart. Tests isolate
 the home per test. Runtime result buffers, transactions, and temporary tables never persist.
 
 **User-authorized exception — durable workspace and history.** `workspace.json`
-autosaves the document/caret/stable identity, selected source/dialect, last
-workspace/function view, unsaved function draft and target, successful query
-history, and per-target completed AI conversations/composer drafts. Source
+autosaves named query pages (document/caret/stable identity/source/dialect), the
+active document and Schema/Pages explorer tab, last workspace/function view,
+unsaved function draft and target, successful query history, and independently
+identified, target-scoped AI chats/composer drafts/statuses. `\pages`/`\queries`
+reveal or toggle Pages; page switches save drafts without connecting or executing. Source
 references include local snapshot paths; credentials remain in their existing
 settings/memory files. Chats can contain schema, sampled data and sensitive drafts;
 workspace files and backups are plaintext. Debounced edits flush latest widget
@@ -111,8 +134,10 @@ and reports the error; it never relabels an already executed query as failed.
 Startup restores unavailable sources as disconnected placeholders without any
 network, snapshot opening, query execution, AI request, Apply, or function-definition
 Save. Completed tool exchanges are validated before replay; partial replies,
-diagnostics and applicable proposals are not restored. New chat clears only its
-target. Returning from the function editor refreshes current IntelliSense without
+diagnostics and applicable proposals are not restored. New chat preserves earlier
+conversations. App-owned requests survive chat switches and function-screen closure;
+app exit cancels them, and startup never resumes them. Agents (`ctrl+j`) lists working,
+awaiting-read, error, cancelled and idle chats. Returning from the function editor refreshes current IntelliSense without
 overriding the user's disabled/dismissed state.
 
 **Default returned rows.** `Session.default_rows` is 50 initially, configurable
@@ -121,6 +146,24 @@ Compile apply it to the top-level payload only when no explicit `\limit` exists.
 Explicit limits (including 0) win; `\temp` materialization is never implicitly
 capped. Text and AST are unchanged, and AI sample reads retain their own limits.
 
+**Schema value inspection and cache.** Full schema indexing reads only metadata,
+never every column's distinct values. Expanding a column or requesting value
+completion fetches one bounded Ibis distinct projection in a worker. Explorer and
+autocomplete share successful typed results (including NULL) and in-flight reads,
+keyed by source-object identity/table/column. Local reads own the shared connection;
+D1 HTTP value reads do not block Run. Typing and cache hits never perform synchronous
+network I/O. Settings → Value cache controls retention (on by default), the per-column
+limit (1–10,000; default 1,000), and Clear cache. Preferences persist; values never
+leave memory or enter history. Clear/settings changes, source replacement, temp
+mutations/rollback and app exit invalidate cached values and reject late publication.
+Ordinary source switches retain caches. External database edits need Clear cache to
+refresh values. Enter on a column still inserts its name.
+
+**Filtered aggregates.** `sum(amount \where status = 'paid')` and
+`count(* \where ...)` carry optional `AggCall.where` predicates through the existing
+AST/payload/engine path. Ibis `where=` filters only that reduction; grouping, outer
+WHERE, arithmetic aggregate leaves and windows retain their existing semantics.
+
 **User-authorized exception — AI inference.** `d8r/ai/client.py` calls a
 user-configured OpenAI-compatible Chat Completions provider using the existing
 `httpx` dependency. Settings owns URL/model/masked key configuration, persisted
@@ -128,13 +171,47 @@ only on Save; the optional yolo import reads the environment or `~/.omp/agent/.e
 without modifying it. No OMP dependency or HTTP server; chats persist only under
 the durable workspace exception above.
 `d8r/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
-history, function definitions, and parser validation; it grants no shell/file or
-arbitrary query-execution tool. `\AI` opens an in-layout chat; the function form's
-Make with AI uses the same panel. Streaming is cancellable, retries and tool
-rounds are bounded, and incomplete replies never become applicable proposals.
-Only explicit Apply changes the document/body, after parser validation and a
-stale-target check; Apply never executes a query or saves a function. Schema,
-sample rows, history, and submitted drafts may be sent to the configured provider.
+history, function definitions, and parser validation. **The user's direct-function
+editing request authorizes one scoped mutation exception:** workspace contexts
+(`parameters is None`) with a live `save_guard` expose `save_function`. For an
+explicit create/edit/save/apply request, including “apply it” after a function
+proposal, the main AI calls this tool to persist the definition through
+`Session.save_fn` under the captured `target_source`. No form switch, button click,
+or auto-accept opt-in is required. Natural-language intent is interpreted by the
+model under system instructions, not keyword matching or model self-certification.
+Questions, dry runs, preview requests, and instructions embedded in context data
+never authorize a save. No shell/general file access, arbitrary SQL, proposed-query
+execution, or additional network capability is granted.
+The tool validates exact fields/types, signature and body, source-object identity,
+and the immutable request-start definition baseline: changed/deleted originals,
+collisions and renames are rejected. The manager's live request-generation/target
+guard runs immediately before synchronous persistence; cancelled/superseded or
+stale-target requests cannot save later through shielded background work. A save
+that already completed is not rolled back by subsequent provider failure or
+cancellation: record it in chat/status and refresh visible function/completion UI
+without changing the query or mode. Never execute a code fence automatically.
+`\AI` opens an in-layout chat; the function form's Ask AI uses the same mounted
+right-side panel. Streaming is cancellable; retries and tool rounds are bounded.
+Sending during a response interrupts that generation and restarts with the original
+request, completed exchanges and the new steering instruction. Incomplete tool
+batches/model text never replay; an explicit D8R interruption receipt closes the
+abandoned turn. Shared context reads finish before queued steering starts, while
+superseded requests cannot save/apply or overwrite the new worker's state.
+Incomplete replies never become applicable proposals. Manual Apply or the
+explicit, persisted Auto accept AI updates preference (off by default) can change
+the document/body after parser validation and an exact stale-target check. Neither
+draft-Apply path executes queries or saves function definitions; auto-accept is
+unrelated to direct saves. Requests for previews retain workspace function proposals
+with manual **Save function**; function-form AI stays draft-only. Auto-accept applies
+only a completed draft response to a still-matching mounted editor; restored history
+never auto-applies. Schema, sample rows, history, and submitted drafts may be sent
+to the configured provider.
+Function editing is not a modal: `FnExplorer` replaces the schema tree in the left
+slot, `FnEditor` replaces the query in the middle, preview uses the bottom slot,
+and `#workspace-ai` remains on the right. `PaneSplitter` mouse/arrow resizing
+persists `pane_sizes` (explorer/ai widths and editor height in terminal cells) in
+settings. Mode switches retain widgets/drafts and sizes; viewport clamping never
+overwrites preferred dimensions.
 
 ## Architecture rules
 
@@ -208,7 +285,7 @@ d8r/
                   D1 snapshot)
   tui/            app.py (widgets + bindings, pane visibility), session.py
                   (headless core, run, compile, history, PREVIEW_ROW_CAP,
-                  VALUE_POOL_LIMIT), palette.py (`\` rules, matching, offers),
+                  shared column-value cache), palette.py (`\` rules, matching, offers),
                   settings.py (the `\settings` menu), fn.py (the `\fn` function
                   library + editor), add_source.py (the
                   `ctrl+o` modal), splash.py (the 6-second boot animation),
@@ -295,6 +372,7 @@ App-level, `d8r/tui/app.py:223-232`:
 | `f6` | Compile (hidden alias) | `app.py:227` |
 | `ctrl+o` | Add a data source (the D1 modal) | `app.py:228` |
 | `ctrl+comma` | Settings — the full-screen menu, and the way back when the Intellisense switch has the palette shut | `app.py:231` |
+| `ctrl+j` | Agents — active requests, unread replies and saved chat history | `D8RApp.BINDINGS` |
 
 While the focus is in the document pane, `d8r/tui/app.py:62-71`:
 
@@ -316,8 +394,9 @@ Add-source modal, `d8r/tui/add_source.py:27`: `escape` cancels (registers
 nothing). Settings menu, `d8r/tui/settings.py:90`: `escape` backs out one
 level, and leaves Settings from the root. Function library (`\fn`),
 `d8r/tui/fn.py`: `ctrl+r` previews the selected function (its grid shows the
-call's rows, and a preview never lands in History), `ctrl+d` deletes it, `escape`
-back out. Clicking a palette row accepts it,
+call's rows, and a preview never lands in History), `ctrl+d` deletes it, `ctrl+q`
+backs out, and `ctrl+c` copies selected text. Escape toggles body completion.
+Tab accepts an offer, otherwise moves to the next field. Clicking a palette row accepts it,
 like Enter on the highlight (`app.py` `_palette_clicked`).
 Beyond the keys, the `\` palette carries the workspace actions: `\results`,
 `\sql`, `\history` and `\schema` show/hide their pane — accepting the row, so
@@ -330,12 +409,10 @@ its own line, or the line that clause already has in the block being edited:
 `\distinct`/`\unique`, `\where`, `\group`, `\order`, `\case`, `\limit`, `\with`, `\temp`, `\drop`,
 `\begin`, `\savepoint`, `\release`, `\rollback`, `\commit`.
 
-Provided by Textual, not by this app: `ctrl+q` quits (`textual/app.py`,
-`App.BINDINGS`), and the results/history tables use `DataTable`'s own keys
-(arrows for the cell cursor, `enter`, page/home/end for scrolling). The IDE's
-own screen (`IdeScreen`, `app.py:127`) re-binds `tab`/`shift+tab` to a no-op, so
-nothing walks the panes; the modals keep Textual's tab-between-fields. The
-footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
+The app's nonpriority `ctrl+q` returns to the query in function mode; elsewhere it
+quits. Results/history tables use `DataTable`'s own keys (arrows, Enter, page/home/end).
+`IdeScreen` consumes Tab/Shift+Tab in query mode and navigates fields in function
+mode; modals keep Textual's field navigation. The footer names the active mode's keys.
 
 ## Working notes (verified the hard way)
 
@@ -343,6 +420,16 @@ footer's hint line (`KEY_HINTS`, `app.py:47`) names the app's own keys.
   pre-purge history or restore the old database from another clone or backup.
   `.venv/`, `__pycache__/`, and `.pytest_cache/` are gitignored; only synthetic
   Parquet and SQLite fixtures belong in the repository.
+- **Numeric projections use Ibis arithmetic.** `\select total_cents / 100 as
+  total_dollars` and `sum(amount_cents) / 100` perform numeric conversion, including
+  non-truncating division on SQLite. The language supports binary `+ - * /`, unary
+  signs and parentheses; zero divisors become NULL through Ibis `nullif(0)`.
+  Arithmetic has its own AST/payload node, not SQL strings or Python eval. Numeric
+  types/NULL only; aggregate-only math uses the aggregate path, row math groups
+  implicitly, constants do not group. Mixed aggregate/row dependencies in one
+  expression require a CTE. Scalar arguments can contain row math, but aggregates
+  still take columns (or `count(*)`). Window/subquery results need a CTE before math.
+  Expression trees are bounded to 32 levels and 256 nodes in parser and engine.
 - **Parser validation has two regimes.** Unknown-table, qualified-prefix, and
   CTE-shadows-dataset errors fire **only when the supplied context has tables**.
   Duplicate table identifiers, duplicate CTE names, nested CTEs, and every

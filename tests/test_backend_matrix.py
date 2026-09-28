@@ -159,7 +159,7 @@ def d1_live_source():
         if request.method == "GET":  # resolve(): name → uuid
             return httpx.Response(200, json=envelope([{"uuid": args["database"], "name": "matrix"}]))
         sql = json.loads(request.content)["sql"]
-        if request.url.path.endswith("/query"):  # schemas() / row_counts()
+        if request.url.path.endswith("/query"):  # connection probe and lazy metadata
             cursor = engine.execute(sql)
             names = [d[0] for d in cursor.description]
             rows = [dict(zip(names, row)) for row in cursor.fetchall()]
@@ -176,7 +176,11 @@ def d1_live_source():
 
     client = CloudflareD1(**args, _client=httpx.Client(transport=httpx.MockTransport(handler)))
     try:
-        yield add_d1_live_source("matrix-d1", client=client, **args)
+        source = add_d1_live_source("matrix-d1", client=client, **args)
+        assert source.datasets == {}
+        assert source.con.list_tables() == []
+        assert not source.schema_indexed
+        yield source
     finally:
         client.close()
         engine.close()

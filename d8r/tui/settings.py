@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 MENUS: dict[str, str] = {
     "general": "General",
     "menus": "Show/Hide Menus",
+    "values": "Value cache",
     "sources": "Data source",
     "dialects": "Dialect",
     "ai": "AI provider",
@@ -44,7 +45,8 @@ class Row:
 
     label: str
     detail: str = ""
-    # pane | intellisense | default-rows | source | dialect | ai | add-source.
+    # pane | intellisense | default-rows | value-cache | value-limit | clear-values |
+    # source | dialect | ai | ai-auto-accept | add-source.
     action: str = ""
     value: str = ""
 
@@ -142,9 +144,13 @@ class SettingsScreen(ModalScreen[None]):
         descriptions = {
             "general": "Control editor completion and default query rows. Row changes require Save in the editor.",
             "menus": "Show or hide workspace panes without changing your document.",
+            "values": "Autocomplete and the schema explorer share a memory-only value cache. "
+                      "Values are fetched lazily on the first read of a column; there is no startup scan "
+                      "or distinct-value fetch across every column. Values never go to disk and are cleared "
+                      "at exit. Only these preferences are saved. Changing them clears cached values.",
             "sources": "Connect a new Cloudflare D1 database or select an existing source. Selecting a source refreshes its schema and completion.",
             "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
-            "ai": "Select any value to edit your OpenAI-compatible provider. Changes are saved only when you choose Save in the editor.",
+            "ai": "Provider changes require Save. Auto accept toggles immediately: validated proposals update unchanged drafts only; queries never run and functions are never saved automatically.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
         self.query_one("#settings-description", Static).update(
@@ -154,9 +160,10 @@ class SettingsScreen(ModalScreen[None]):
         action = {
             "general": "enter / click toggle or edit",
             "menus": "enter / click toggle",
+            "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
             "dialects": "enter / click select",
-            "ai": "enter / click edit",
+            "ai": "enter / click toggle or edit",
             "keys": "read-only reference",
         }[self.menu]
         self.query_one("#settings-hint", Static).update(
@@ -173,6 +180,12 @@ class SettingsScreen(ModalScreen[None]):
                     name,
                 )
                 for name, title in self.ide.PANE_TITLES.items()
+            ]
+        if self.menu == "values":
+            return [
+                Row("Cache column values", "on" if self.session.value_cache_enabled else "off", "value-cache"),
+                Row("Values per column", str(self.session.value_cache_limit), "value-limit"),
+                Row("Clear cache", f"{self.session.cached_value_columns} cached columns", "clear-values"),
             ]
         if self.menu == "keys":
             return binding_rows()
@@ -201,6 +214,8 @@ class SettingsScreen(ModalScreen[None]):
                 Row("Sample records per read", str(config.sample_rows), "ai", "ai-sample-rows"),
                 Row("Maximum attempts", str(config.max_attempts), "ai", "ai-attempts"),
                 Row("Request timeout", f"{config.timeout:g} seconds", "ai", "ai-timeout"),
+                Row("Auto accept AI updates", "on · validated drafts only" if self.session.ai_auto_accept else
+                    "off · review and Apply manually", "ai-auto-accept"),
             ]
         return [
             Row("Intellisense", "on" if self.session.intellisense else "off", "intellisense"),
@@ -248,6 +263,19 @@ class SettingsScreen(ModalScreen[None]):
             self.ide.toggle_pane(row.value)
         elif row.action == "intellisense":
             self.ide.update_settings(intellisense=not self.session.intellisense)
+        elif row.action == "ai-auto-accept":
+            self.ide.update_settings(ai_auto_accept=not self.session.ai_auto_accept)
+        elif row.action == "value-cache":
+            self.ide.update_settings(value_cache_enabled=not self.session.value_cache_enabled)
+        elif row.action == "clear-values":
+            self.ide.clear_value_cache()
+        elif row.action == "value-limit":
+            def limit_saved(_) -> None:
+                self._draw(event.option_index)
+                self.action_details()
+
+            self.app.push_screen(ValueCacheLimitScreen(self.ide), limit_saved)
+            return
         elif row.action == "default-rows":
             def rows_saved(_) -> None:
                 self._draw(event.option_index)
@@ -345,6 +373,67 @@ class DefaultRowsScreen(ModalScreen[None]):
         self.dismiss(None)
 
     @on(Button.Pressed, "#rows-settings-cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ValueCacheLimitScreen(ModalScreen[None]):
+    """Bound per-column distinct reads, persisted only on explicit Save."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    ValueCacheLimitScreen { align: center middle; background: $background; }
+    #value-cache-settings { width: 76; max-width: 100%; height: auto; max-height: 100%; padding: 1 2; border: round $accent; }
+    #value-cache-settings Static { height: auto; margin-top: 1; }
+    #value-cache-settings-buttons { height: auto; margin-top: 1; }
+    #value-cache-settings-buttons Button { margin-right: 1; min-width: 10; }
+    #value-cache-settings-error { color: $error; }
+    """
+
+    def __init__(self, ide: "D8RApp", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.ide = ide
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="value-cache-settings"):
+            yield Static("Values per column")
+            yield Static(
+                "Limits distinct values read for each requested column in autocomplete and the schema explorer. "
+                "Changing this limit clears cached values; new values are read only when needed, never across every column "
+                "at startup. Values stay in memory, never on disk, and are cleared at exit.", markup=False,
+            )
+            yield Static("Whole number from 1 to 10,000.")
+            yield Input(str(self.ide.session.value_cache_limit), type="integer", id="value-cache-limit")
+            yield Static("", id="value-cache-settings-error", markup=False)
+            with Horizontal(id="value-cache-settings-buttons"):
+                yield Button("Save", id="value-cache-settings-save", variant="primary")
+                yield Button("Cancel", id="value-cache-settings-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#value-cache-limit", Input).focus()
+
+    @on(Button.Pressed, "#value-cache-settings-save")
+    def _save_limit(self) -> None:
+        field = self.query_one("#value-cache-limit", Input)
+        try:
+            value = int(field.value)
+            if not 1 <= value <= 10_000:
+                raise ValueError
+        except ValueError:
+            self.query_one("#value-cache-settings-error", Static).update(
+                "Enter a whole number from 1 to 10,000."
+            )
+            field.focus()
+            return
+        try:
+            self.ide.session.update_settings(value_cache_limit=value)
+        except ValueError as exc:
+            self.query_one("#value-cache-settings-error", Static).update(str(exc))
+            return
+        self.ide.value_cache_changed()
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#value-cache-settings-cancel")
     def action_cancel(self) -> None:
         self.dismiss(None)
 

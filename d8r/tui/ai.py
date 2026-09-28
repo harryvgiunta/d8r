@@ -1,22 +1,23 @@
-"""Target-scoped saved conversations and explicit, guarded replacement proposals."""
-
+"""Durable independent AI chats; app-owned requests and guarded editor proposals."""
 from __future__ import annotations
 
 import asyncio
 import json
-import re
 import traceback
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
+from uuid import uuid4
 
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Text
 from textual.message import Message
-from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 from textual.worker import Worker
 from textual.timer import Timer
 
@@ -25,20 +26,11 @@ from d8r.ai.context import AIContext, AIProposal
 from d8r.ai.diagnostics import AIDiagnostics
 
 
-
 class ComposerArea(TextArea):
-    """The chat composer: Enter sends, Shift+Enter inserts a newline.
-
-    Textual's `TextArea` inserts a newline on plain `enter` and ignores
-    `shift+enter` — the wrong mapping for a one-shot message box. The two
-    keys are claimed here, one level above the base handler (the same rule
-    the document editor follows for its palette keys), so nothing else on
-    the panel loses Enter: buttons still activate on it.
-    """
+    """Enter sends; Shift+Enter inserts a newline without stealing button keys."""
 
     class Submitted(Message):
         """Enter asked to send the composer's text."""
-
 
     async def _on_key(self, event: events.Key) -> None:
         self._restart_blink()
@@ -69,11 +61,10 @@ class AIDiagnosticsScreen(ModalScreen):
         with Vertical(id="ai-log-screen"):
             yield Static("AI diagnostics · current chat", classes="pane-title")
             yield Static("In memory only. May contain query text and data values; review before sharing.\n"
-                         "Known AI/D1 keys are redacted. New chat or a source change clears these logs.\n"
+                         "Known AI/D1 keys are redacted. Each chat keeps its own logs.\n"
                          "Validation is parser-only: a rejected operation may still be supported by Ibis.",
                          id="ai-log-notice", markup=False)
-            yield TextArea("",
-                           read_only=True, soft_wrap=True, id="ai-log-text")
+            yield TextArea("", read_only=True, soft_wrap=True, id="ai-log-text")
             with Horizontal(id="ai-log-buttons"):
                 yield Button("Copy logs", id="ai-log-copy")
                 yield Button("Refresh", id="ai-log-refresh")
@@ -114,11 +105,532 @@ class AITarget:
     details: str = ""
     function_name: str = ""
 
+    @property
+    def key(self) -> str:
+        return json.dumps(["function" if self.parameters is not None else "workspace", *self.identity])
 
+
+@dataclass
+class AIChat:
+    """Plain chat state. Requests never own a widget, editor or screen callback."""
+
+    id: str
+    target_key: str
+    title: str = "New chat"
+    messages: list[dict] = field(default_factory=list)
+    transcript: str = ""
+    input: str = ""
+    turns: int = 0
+    visible: bool = False
+    selected: bool = True
+    status: str = "idle"
+    status_text: str = "New chat · describe what you want."
+    unread: bool = False
+    target: AITarget | None = None
+    context: AIContext | None = None
+    proposal: AIProposal | None = None
+    validation_error: str | None = None
+    worker: Worker | None = None
+    generation: int = 0
+    pending_prompt: str = ""
+    request_messages: list[dict] = field(default_factory=list)
+    partial: str = ""
+    diagnostics: AIDiagnostics = field(default_factory=AIDiagnostics)
+    save_error: str = ""
+
+    @property
+    def saves_function(self) -> bool:
+        return (self.target is not None and self.target.parameters is None
+                and self.proposal is not None and self.proposal.function is not None)
+
+    @property
+    def label(self) -> str:
+        if self.status == "idle" and self.unread:
+            return "awaiting read"
+        return self.status + (" · unread" if self.unread else "")
+
+    @property
+    def target_label(self) -> str:
+        try:
+            mode, source, identity = json.loads(self.target_key)
+            return f"{mode} · {source} · {identity[:8]}"
+        except (ValueError, TypeError):
+            return "Saved target"
+
+    def saved(self) -> dict:
+        return {"target_key": self.target_key, "title": self.title, "messages": self.messages,
+                "transcript": self.transcript, "input": self.input or self.pending_prompt,
+                "turns": self.turns, "visible": self.visible, "selected": self.selected,
+                "status": self.status, "status_text": self.status_text, "unread": self.unread}
+
+
+class AIChats:
+    """One app-owned request registry, shared by all workspace/function views."""
+
+    def __init__(self, app, session) -> None:
+        self.app = app
+        self.session = session
+        self.chats = {key: AIChat(id=key, **saved) for key, saved in session.load_chats().items()}
+        self.context_tasks: set[asyncio.Task] = set()
+        self.closing = False
+        for chat in self.chats.values():
+            if chat.status == "working":
+                chat.status = "cancelled"
+                chat.status_text = "Interrupted by shutdown; send again to retry. No request was resumed."
+                chat.unread = True
+            elif chat.status == "idle":
+                chat.status_text = "Conversation restored. Send for a fresh proposal; nothing was applied or run."
+
+    def panels(self):
+        for screen in self.app.screen_stack:
+            for panel in screen.query(AIPanel):
+                if panel.is_mounted and panel._ready and panel._composer is not None and panel._composer.is_mounted:
+                    yield panel
+
+    def is_read(self, chat: AIChat) -> bool:
+        return any(panel.chat_id == chat.id and panel.display and panel.screen is self.app.screen
+                   for panel in self.panels())
+
+    def changed(self, chat: AIChat, *, agents: bool = True) -> None:
+        if self.closing:
+            return
+        for panel in self.panels():
+            if panel.chat_id == chat.id:
+                panel._draw_chat()
+        if agents:
+            for screen in self.app.screen_stack:
+                for pane in screen.query(AgentsPane):
+                    if pane.is_mounted:
+                        pane.refresh_chats()
+
+    def persist(self, chat: AIChat) -> None:
+        try:
+            self.session.save_chat(chat.id, chat.saved())
+        except ValueError:
+            chat.save_error = "AI chat could not be saved. Your draft remains available in this session."
+        else:
+            chat.save_error = ""
+
+    def create(self, target: AITarget, *, visible: bool = False) -> AIChat:
+        chat = AIChat(str(uuid4()), target.key, visible=visible)
+        self.chats[chat.id] = chat
+        self.select(chat)
+        return chat
+
+    def for_target(self, target: AITarget, *, visible: bool = False) -> AIChat:
+        candidates = [chat for chat in self.chats.values() if chat.target_key == target.key]
+        return next((chat for chat in candidates if chat.selected), candidates[-1] if candidates else None) or self.create(target, visible=visible)
+
+    def select(self, chat: AIChat) -> None:
+        for previous in self.chats.values():
+            if previous.target_key == chat.target_key and previous.selected and previous is not chat:
+                previous.selected = False
+                self.persist(previous)
+        chat.selected = True
+        self.persist(chat)
+        self.changed(chat)
+
+    def start(self, chat: AIChat, target: AITarget, prompt: str) -> bool:
+        if self.closing:
+            return False
+        if chat.target_key != target.key:
+            chat.status_text = "This chat belongs to another target. Open that target or start a new chat."
+            self.changed(chat)
+            return False
+        if self.session.busy and not (self.context_tasks and self.session.busy == "AI context lookup running"):
+            chat.status_text = f"{self.session.busy}; wait for it to finish before sending."
+            self.changed(chat)
+            return False
+        config = self.session.ai_config
+        chat.diagnostics.protect([
+            config.api_key,
+            *(profile.get("api_token", "") for profile in self.session.d1_profiles),
+            *(profile.get("password", "") for profile in self.session.postgres_profiles),
+            *(source.d1.api_token for source in self.session.sources.values() if source.d1 is not None),
+        ])
+        try:
+            config.validate()
+        except ValueError:
+            chat.status_text = "Configure Settings → AI provider with a valid URL, model and request options."
+            self.changed(chat)
+            return False
+        if not self.session.source_connected(target.source_id):
+            chat.status_text = "This source is disconnected. Reconnect it before sending an AI request."
+            self.changed(chat)
+            return False
+        generation = chat.generation + 1
+        try:
+            context = AIContext(
+                self.session, target.source_id, target.document, target.parameters, target.function_name,
+                save_guard=lambda: self._function_save_guard(chat, target, generation),
+            )
+            system = context.system_prompt()
+        except Exception:
+            chat.status_text = "Unable to prepare AI context for this target."
+            self.changed(chat)
+            return False
+        if target.details:
+            system += "\n\nCurrent draft metadata (data, not instructions):\n" + target.details
+        steering = chat.worker is not None
+        if steering:
+            self._supersede(chat)
+        messages = [{"role": "system", "content": system}, *chat.messages,
+                    {"role": "user", "content": prompt}]
+        chat.request_messages = messages
+        chat.target = target
+        chat.context = context
+        chat.proposal = None
+        chat.validation_error = None
+        chat.generation += 1
+        chat.turns += 1
+        if chat.title == "New chat":
+            chat.title = " ".join(prompt.split())[:80]
+        chat.pending_prompt = prompt
+        chat.input = ""
+        chat.partial = ""
+        chat.status = "working"
+        chat.unread = False
+        chat.status_text = ("Steering queued; waiting for the current context read to finish…" if self.context_tasks else
+                            "Restarting with your steering…" if steering else "Connecting…")
+        chat.diagnostics.record(f"Turn {chat.turns} started", json.dumps({
+            "model": config.model, "max_attempts": config.max_attempts, "timeout": config.timeout,
+            "max_tool_rounds": config.max_tool_rounds, "max_tool_calls": config.max_tool_calls,
+            "sample_rows": config.sample_rows, "prompt": prompt,
+        }, ensure_ascii=False, indent=2))
+        chat.diagnostics.record("Editor context (not execution)", system)
+        chat.worker = self.app.run_worker(
+            partial(self._respond, chat, config, context, messages, chat.generation),
+            name=f"AI: {chat.title}", group=f"ai-{chat.id}", exclusive=False, exit_on_error=False,
+        )
+        self.persist(chat)
+        self.changed(chat)
+        return True
+
+    def _supersede(self, chat: AIChat) -> None:
+        """Keep only the client's atomically completed exchanges, never partial tools."""
+        if chat.partial:
+            chat.diagnostics.record("Interrupted assistant text (not applicable)", chat.partial)
+        chat.messages = chat.request_messages[1:]
+        # Close the abandoned turn with an explicit IDE receipt, not partial
+        # model text. This also keeps persisted/provider role ordering valid.
+        interruption = "D8R interrupted this response for a follow-up. No incomplete reply or tool exchange was retained."
+        # A save may have committed before another tool in the same batch was
+        # interrupted. Preserve that fact even though its batch cannot replay.
+        if saved := self._saved_status(chat):
+            interruption += "\nD8R confirmed: " + saved
+        chat.messages.append({"role": "assistant", "content": interruption})
+        chat.transcript += (f"You: {chat.pending_prompt}\n\n"
+                            "D8R: Response interrupted by a follow-up. Completed exchanges and saves retained.\n\n")
+        chat.diagnostics.record("Turn steered", "Restarting with the original request, completed exchanges and new instruction.")
+        chat.worker.cancel()
+
+    def _function_save_guard(self, chat: AIChat, target: AITarget, generation: int) -> str | None:
+        if self.closing or chat.generation != generation or chat.status != "working":
+            return "The request was cancelled or replaced; no function was saved."
+        if not any(panel.snapshot() == target for panel in self.panels()):
+            return "The editor target changed; send a fresh request before saving the function."
+        return None
+
+    def _saved_status(self, chat: AIChat) -> str:
+        if chat.context is None or not chat.context.saved_functions:
+            return ""
+        return "Saved functions: " + ", ".join(chat.context.saved_functions) + ". Query unchanged; nothing executed."
+
+    async def _call_tool(self, chat: AIChat, context: AIContext, name: str, args: dict, generation: int) -> str:
+        """Serialize shared-connection access, not independent provider requests."""
+        if self.closing or generation != chat.generation:
+            raise asyncio.CancelledError
+        if self.session.busy:
+            error: dict[str, str | bool] = {"error": f"{self.session.busy}; try again after it finishes."}
+            if name == "save_function":
+                error["saved"] = False
+            return json.dumps(error)
+        if name == "save_function":
+            # Unlike a read running in a thread, a mutation must never be queued
+            # behind a shield after cancellation. Guard, commit, receipt run in
+            # one event-loop step, with no await inside the save implementation.
+            self.session.busy = "AI function save running"
+            had_saves = bool(context.saved_functions)
+            try:
+                result = await context.call_tool(name, args)
+            finally:
+                self.session.busy = ""
+            saved = json.loads(result)
+            if saved.get("saved"):
+                receipt = f'Saved function "{saved["name"]}". Query unchanged; nothing executed.'
+                chat.transcript += f"D8R: {receipt}\n\n"
+                chat.status_text = receipt
+                chat.diagnostics.record("Saved function", receipt)
+                confirmation = {"role": "assistant", "content": "D8R confirmed: " + self._saved_status(chat)}
+                if had_saves:
+                    chat.messages[-1] = confirmation
+                else:
+                    chat.messages.extend([{"role": "user", "content": chat.pending_prompt}, confirmation])
+                self.persist(chat)
+                if hasattr(self.app, "refresh_functions"):
+                    self.app.refresh_functions()
+                self.changed(chat)
+            return result
+        self.session.busy = "AI context lookup running"
+        task = asyncio.create_task(context.call_tool(name, args))
+        self.context_tasks.add(task)
+        task.add_done_callback(self._context_finished)
+        # A cancelled request cannot release a sample still running in a thread.
+        return await asyncio.shield(task)
+
+    def _context_finished(self, task: asyncio.Task) -> None:
+        self.context_tasks.discard(task)
+        if not self.context_tasks and self.session.busy == "AI context lookup running":
+            self.session.busy = ""
+        if not task.cancelled():
+            task.exception()
+
+    async def _respond(self, chat: AIChat, config, context: AIContext,
+                       messages: list[dict], generation: int) -> None:
+        try:
+            # Cancellation cannot stop an engine read already running in a
+            # thread. Queue steering without releasing its connection or losing
+            # the submitted instruction; cancelling this waiter leaves the read
+            # shielded and keeps newer generations independently cancellable.
+            while self.context_tasks:
+                await asyncio.shield(asyncio.gather(*self.context_tasks, return_exceptions=True))
+            if self.closing or generation != chat.generation:
+                return
+            if self.session.busy:
+                raise client.AIError(f"{self.session.busy}; send again after it finishes.")
+            async for event in client.run_turn(
+                config, messages, context.tools,
+                lambda name, args: self._call_tool(chat, context, name, args, generation),
+            ):
+                if generation != chat.generation:
+                    return
+                if event.kind == "text":
+                    chat.partial += event.text
+                    self.changed(chat, agents=False)
+                elif event.kind == "status":
+                    chat.diagnostics.record("Status", event.text)
+                    chat.status_text = event.text
+                    self.changed(chat, agents=False)
+                elif event.kind == "diagnostic":
+                    chat.diagnostics.record("Provider / tools", event.text)
+            if generation != chat.generation:
+                return
+            # Preserve the full completed exchange even if its target changed or
+            # its view disappeared while the provider was working.
+            answer = messages[-1].get("content") or ""
+            chat.messages = messages[1:]
+            chat.transcript += f"You: {chat.pending_prompt}\n\nAssistant: {answer}\n\n"
+            chat.pending_prompt = ""
+            chat.partial = ""
+            chat.status = "idle"
+            chat.diagnostics.record("Turn completed", "Complete provider response received; no query executed.")
+            try:
+                chat.proposal = None if context.saved_functions else context.read_proposal(answer)
+            except ValueError as exc:
+                chat.status = "error"
+                chat.status_text = str(exc)
+                chat.diagnostics.record("Proposal decoding failure", str(exc))
+            else:
+                chat.status_text = "Response complete. Reply below to continue."
+                if chat.proposal is not None:
+                    chat.validation_error = (context.replacement_guard(chat.proposal) if self.session.busy
+                                             else context.validate_replacement(chat.proposal))
+                    chat.diagnostics.record("Proposal validation (parser only)",
+                                            "Deferred: connection busy." if self.session.busy else
+                                            chat.validation_error or "Valid syntax; execution not checked.")
+                    if chat.validation_error:
+                        chat.status = "error"
+                        chat.status_text = "Needs a fix: " + chat.validation_error
+                    else:
+                        chat.status_text = ("Review the draft, then Save function. Your query stays unchanged; nothing is run."
+                                            if chat.saves_function else
+                                            "Review the draft, then Apply. Nothing is executed or saved as a function.")
+        except asyncio.CancelledError:
+            if generation == chat.generation:
+                chat.status = "cancelled"
+                chat.status_text = "Cancelled. Incomplete response discarded; document unchanged."
+            raise
+        except client.AIError as exc:
+            if generation != chat.generation:
+                return
+            chat.status = "error"
+            chat.status_text = str(exc) + " Open Logs for the diagnostic trace."
+            chat.diagnostics.record("Turn failed", str(exc))
+        except Exception as exc:
+            if generation != chat.generation:
+                return
+            locations = "\n".join(f"{frame.f_code.co_filename}:{line} in {frame.f_code.co_name}"
+                                  for frame, line in traceback.walk_tb(exc.__traceback__))
+            chat.diagnostics.record("Internal failure", type(exc).__name__
+                                    + ": exception text/locals withheld to protect secrets.\n" + locations)
+            chat.status = "error"
+            chat.status_text = "The AI request could not complete. Open Logs for the diagnostic trace."
+        finally:
+            if generation == chat.generation:
+                chat.worker = None
+                chat.request_messages = []
+                self._recover_prompt(chat)
+                if (chat.status == "idle" and chat.proposal is not None
+                        and self.session.ai_auto_accept and not chat.saves_function):
+                    for panel in self.panels():
+                        if panel.snapshot() == chat.target:
+                            self.apply(chat, panel, automatic=True)
+                            break
+                if saved := self._saved_status(chat):
+                    chat.status_text += "\n" + saved
+                chat.unread = not self.is_read(chat)
+                self.persist(chat)
+                self.changed(chat)
+
+    def _recover_prompt(self, chat: AIChat) -> None:
+        for panel in self.panels():
+            if panel.chat_id == chat.id:
+                panel._capture_input()
+        if chat.pending_prompt and not chat.input:
+            chat.input = chat.pending_prompt
+            for panel in self.panels():
+                if panel.chat_id == chat.id:
+                    panel._set_input(chat.input)
+        chat.pending_prompt = ""
+        chat.partial = ""
+
+    def apply(self, chat: AIChat, panel: AIPanel, *, automatic: bool = False) -> bool:
+        if chat.worker is not None or chat.proposal is None or chat.target is None or chat.context is None:
+            return False
+        if automatic and chat.saves_function:
+            return False
+        if panel.snapshot() != chat.target:
+            chat.status_text = "Target changed. History is preserved, but this proposal cannot be applied."
+            self.changed(chat)
+            return False
+        if self.session.busy:
+            chat.status_text = f"{self.session.busy}; wait for it to finish before applying."
+            self.changed(chat)
+            return False
+        try:
+            error = chat.context.validate_replacement(chat.proposal)
+        except Exception:
+            error = "Unable to validate this replacement. Send again."
+        chat.validation_error = error
+        if error is not None:
+            chat.status = "error"
+            chat.status_text = "Proposal cannot be applied: " + error
+            chat.diagnostics.record("Apply rejected (parser only)", error)
+            self.changed(chat)
+            return False
+        saves_function = chat.saves_function
+        try:
+            panel.apply_document(chat.proposal)
+        except Exception as exc:
+            chat.status = "error"
+            chat.status_text = ("Save function failed" if saves_function else "Apply failed") + (
+                ". The proposal is retained; resolve the issue and retry. Open Logs for diagnostics."
+            )
+            chat.diagnostics.record("Save function failed" if saves_function else "Apply failed",
+                                    type(exc).__name__ + ": exception text withheld to protect secrets; proposal retained.")
+            self.persist(chat)
+            self.changed(chat)
+            return False
+        chat.proposal = None
+        chat.status = "idle"
+        chat.diagnostics.record("Saved function" if saves_function else "Auto-applied" if automatic else "Applied",
+                                "Function definition saved; query unchanged and nothing executed." if saves_function else
+                                "Replacement copied to editor; nothing executed or saved as a function.")
+        chat.status_text = ("Function saved. Query unchanged; nothing executed." if saves_function else
+                            "Applied to the editor only. Run or Save remains your choice.")
+        self.persist(chat)
+        self.changed(chat)
+        return True
+
+    def cancel(self, chat: AIChat) -> None:
+        if chat.worker is None:
+            return
+        if chat.partial:
+            chat.diagnostics.record("Incomplete assistant text (not applicable)", chat.partial)
+        chat.diagnostics.record("Turn cancelled", "Incomplete response discarded; document unchanged.")
+        chat.generation += 1
+        chat.worker.cancel()
+        chat.worker = None
+        chat.request_messages = []
+        chat.proposal = None
+        chat.status = "cancelled"
+        chat.status_text = "Cancelled. Incomplete response discarded; document unchanged."
+        if saved := self._saved_status(chat):
+            chat.status_text += "\n" + saved
+        self._recover_prompt(chat)
+        self.persist(chat)
+        self.changed(chat)
+
+    def shutdown(self) -> None:
+        self.closing = True
+        for panel in self.panels():
+            panel._flush_chat()
+        for chat in self.chats.values():
+            self.cancel(chat)
+            self.persist(chat)
+
+
+def chat_manager(app, session) -> AIChats:
+    """Any editor host shares a single app lifetime, including lightweight hosts."""
+    if not hasattr(app, "ai_chats"):
+        app.ai_chats = AIChats(app, session)
+    return app.ai_chats
+
+
+class AgentsPane(Vertical):
+    """Selectable agent state; rendered from the registry, not mounted panels."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("Agents · chats & history", classes="pane-title")
+        yield OptionList(id="agents-list")
+
+    def on_mount(self) -> None:
+        self._rows = None
+        self.refresh_chats()
+
+    def refresh_chats(self) -> None:
+        manager = self.app.ai_chats
+        rows = [(chat.id, f"{chat.title}\n{chat.target_label}\n{chat.label}")
+                for chat in reversed(list(manager.chats.values()))]
+        if rows == getattr(self, "_rows", None):
+            return
+        self._rows = rows
+        options = self.query_one(OptionList)
+        selected = options.highlighted
+        selected_id = options.get_option_at_index(selected).id if selected is not None and options.option_count else None
+        options.clear_options()
+        for key, label in rows:
+            options.add_option(Option(Text(label), id=key))
+        if selected_id is not None and any(key == selected_id for key, _ in rows):
+            options.highlighted = options.get_option_index(selected_id)
+
+    @on(OptionList.OptionSelected)
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        if isinstance(self.screen, AgentsScreen):
+            self.screen.dismiss(event.option.id)
+        else:
+            self.app.open_ai_chat(event.option.id)
+
+
+class AgentsScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "close", "Back"), Binding("ctrl+j", "close", "Back")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="agents-screen"):
+            yield AgentsPane()
+            yield Button("Back", id="agents-close")
+
+    @on(Button.Pressed, "#agents-close")
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class AIPanel(Vertical):
-    """One mounted conversation; the owning editor supplies snapshot and Apply."""
+    """A view of one selectable chat. Hiding/unmounting never owns cancellation."""
+
+    class VisibilityChanged(Message):
+        """The shared workspace should refresh its splitters after layout settles."""
 
     BINDINGS = [
         Binding("tab", "next_control", "Next control", show=False, priority=True),
@@ -128,211 +640,195 @@ class AIPanel(Vertical):
     ]
 
     def __init__(self, session, snapshot: Callable[[], AITarget],
-                 apply: Callable[[AIProposal], None], return_focus: Callable[[], None],
-                 function_mode: bool = False, **kwargs) -> None:
+                 apply: Callable[[AIProposal], None], return_focus: Callable[[], None], **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self.snapshot = snapshot
         self.apply_document = apply
         self.return_focus = return_focus
-        self.function_mode = function_mode
-        self.messages: list[dict] = []
-        self._identity: tuple | None = None
-        self._target: AITarget | None = None
-        self._ai_context: AIContext | None = None
-        self._proposal: AIProposal | None = None
-        self._worker: Worker | None = None
-        self._context_tasks: set[asyncio.Task] = set()
-        self._generation = 0
-        self._transcript = ""
-        self._diagnostics = AIDiagnostics()
-        self._turn = 0
-        self._partial_answer = ""
-        self._input = ""
+        self.chat_id: str | None = None
+        self._target_key: str | None = None
         self._composer: TextArea | None = None
-        self._pending_prompt = ""
         self._save_timer: Timer | None = None
-        self._save_error = ""
-        self._status_text = ""
-        # Textual hides widgets during teardown; persist the user's choice,
-        # not that transient DOM state.
-        self._chat_visible = False
+        self._ready = False
         self.display = False
 
+    @property
+    def manager(self) -> AIChats:
+        return chat_manager(self.app, self.session)
+
+    @property
+    def chat(self) -> AIChat | None:
+        return self.manager.chats.get(self.chat_id)
+
+    @property
+    def busy(self) -> bool:
+        return self.chat is not None and self.chat.worker is not None
+
+    @property
+    def messages(self) -> list[dict]:
+        return self.chat.messages if self.chat is not None else []
+
     def compose(self) -> ComposeResult:
-        yield Static("Make a function with AI" if self.function_mode else
-                     "AI assistant · review before Apply", classes="pane-title")
-        if self.function_mode:
-            yield Static("Describe what you want → review the draft → Apply to editor.\n"
-                         "No need to fill in the form first. You can ask for changes before applying.",
-                         classes="ai-notice", id="ai-help", markup=False)
-        yield Static(
-            "Document, schema, samples, functions and history may be sent to your configured provider.",
-            classes="ai-notice", markup=False,
-        )
-        review = VerticalScroll if self.function_mode else Vertical
-        with review(id="ai-review"):
+        yield Static("AI assistant", classes="pane-title", id="ai-title", markup=False)
+        yield Static("Document, schema, samples, functions and history may be sent to your configured provider. "
+                     "Send during a response interrupts it and restarts this chat with your follow-up; completed saves remain.",
+                     classes="ai-notice", markup=False)
+        with VerticalScroll(id="ai-review"):
             with VerticalScroll(id="ai-conversation"):
                 yield Static("", id="ai-transcript", markup=False)
             yield Static("", id="ai-status", markup=False)
             yield Static("", id="ai-function-details", markup=False)
             yield TextArea("", read_only=True, show_line_numbers=True, id="ai-proposal")
         composer = ComposerArea(
-            placeholder="What should this function return?" if self.function_mode else "Ask about this document…",
+            placeholder="Ask about this document or a saved function…",
             soft_wrap=True, highlight_cursor_line=False, id="ai-input",
         )
         composer.border_title = "Message"
         composer.border_subtitle = "Shift+Enter: newline · Enter: send"
         yield composer
         with Horizontal(classes="ai-buttons"):
-            yield Button("Generate" if self.function_mode else "Send", id="ai-send", variant="primary")
-            yield Button("Cancel", id="ai-cancel", disabled=True)
-            yield Button("Apply", id="ai-apply", disabled=True, variant="success")
-            if self.function_mode:
-                yield Button("Start over", id="ai-clear")
-                yield Button("Logs", id="ai-logs")
-                yield Button("Settings", id="ai-settings")
-                yield Button("Back", id="ai-close")
-        if not self.function_mode:
-            with Horizontal(classes="ai-buttons"):
-                yield Button("New chat", id="ai-clear")
-                yield Button("AI settings", id="ai-settings")
-                yield Button("Logs", id="ai-logs")
-                yield Button("Close", id="ai-close")
+            yield Button("Send", id="ai-send", variant="primary", compact=True)
+            yield Button("Cancel", id="ai-cancel", disabled=True, compact=True)
+            yield Button("Apply", id="ai-apply", disabled=True, variant="success", compact=True)
+        with Horizontal(classes="ai-buttons"):
+            yield Button("New chat", id="ai-clear", compact=True)
+            yield Button("Agents", id="ai-agents", compact=True)
+            yield Button("Close", id="ai-close", compact=True)
+        with Horizontal(classes="ai-buttons"):
+            yield Button("Settings", id="ai-settings", compact=True)
+            yield Button("Logs", id="ai-logs", compact=True)
 
     def on_mount(self) -> None:
         self._composer = self.query_one("#ai-input", TextArea)
-        self.query_one("#ai-proposal").display = False
-        self.query_one("#ai-function-details").display = False
+        self._ready = True
         self.target_changed()
-
-    @property
-    def busy(self) -> bool:
-        return self._worker is not None
-
-
-    def open(self) -> None:
-        self.target_changed()
-        self._chat_visible = self.display = True
-        self._flush_chat()
-        self.query_one("#ai-input", TextArea).focus()
-        if not self.session.ai_config.base_url or not self.session.ai_config.model:
-            self._status("Set up your provider with AI settings, then describe what you want.")
-        elif not self.messages and not self.busy:
-            self._status("Describe the result and any inputs, then press Enter to generate." if self.function_mode else
-                         "Ask a question or request a full replacement. Nothing is applied automatically.")
-
-    def _status(self, text: str) -> None:
-        self._status_text = text
-        try:
-            self.query_one("#ai-status", Static).update(
-                text + ("\n" + self._save_error if self._save_error else "")
-            )
-        except NoMatches:
-            pass  # Unmount may have already removed the children.
-
-    def _chat_key(self) -> str | None:
-        if self._identity is None:
-            return None
-        return json.dumps(["function" if self.function_mode else "workspace", *self._identity])
 
     def _capture_input(self) -> None:
-        if self._composer is not None:
-            # Changed may still be queued and children already unmounted when
-            # the app exits. The retained editor holds the actual latest text.
-            self._input = self._composer.text
+        if self._composer is not None and self.chat is not None:
+            self.chat.input = self._composer.text
 
     def _set_input(self, text: str) -> None:
-        self._input = text
-        self.query_one("#ai-input", TextArea).load_text(text)
+        if self._composer is not None:
+            with self.prevent(TextArea.Changed):
+                self._composer.load_text(text)
+        if self.chat is not None:
+            self.chat.input = text
 
-    def _stop_save_timer(self) -> None:
+    def _flush_chat(self) -> None:
         if self._save_timer is not None:
             self._save_timer.stop()
             self._save_timer = None
-
-    def _persist(self, chat: dict | None) -> None:
-        key = self._chat_key()
-        if key is None:
-            return
-        try:
-            self.session.save_chat(key, chat)
-        except ValueError:
-            # Store failures retain the in-memory draft; never echo paths/secrets
-            # or turn a completed provider response into a request failure.
-            error = "AI chat could not be saved. Your draft remains available in this session."
-            if not self._save_error and self.is_mounted:
-                self.app.notify(error, severity="error")
-            self._save_error = error
-        else:
-            self._save_error = ""
-        self._status(self._status_text)
-
-    def _flush_chat(self) -> None:
-        self._stop_save_timer()
         self._capture_input()
-        self._persist({
-            "messages": self.messages,
-            "transcript": self._transcript,
-            "input": self._input or self._pending_prompt,
-            "turns": sum(message["role"] == "user" for message in self.messages),
-            "visible": self._chat_visible,
-        })
+        if self.chat is not None:
+            self.manager.persist(self.chat)
+            if self._ready and self.is_mounted:
+                self._draw_chat()
 
     @on(TextArea.Changed, "#ai-input")
     def _composer_changed(self, event: TextArea.Changed) -> None:
-        text = event.text_area.text
-        if text == self._input:
+        if self.chat is None or self.chat.input == event.text_area.text:
             return
-        self._input = text
-        self._stop_save_timer()
+        self.chat.input = event.text_area.text
+        if self._save_timer is not None:
+            self._save_timer.stop()
         self._save_timer = self.set_timer(0.3, self._flush_chat)
 
-    def _draw_transcript(self, text: str) -> None:
-        self.query_one("#ai-transcript", Static).update(text)
-        self.query_one("#ai-conversation", VerticalScroll).scroll_end(animate=False)
-
-    def _clear_proposal(self) -> None:
-        self._proposal = None
-        self.query_one("#ai-function-details").display = False
-        self.query_one("#ai-apply", Button).disabled = True
-        proposal = self.query_one("#ai-proposal", TextArea)
-        proposal.load_text("")
-        proposal.display = False
-
-    def _set_busy(self, busy: bool) -> None:
-        self.query_one("#ai-send", Button).disabled = busy
-        self.query_one("#ai-cancel", Button).disabled = not busy
-        self.query_one("#ai-settings", Button).disabled = busy
-        if self.function_mode:
-            self.query_one("#ai-send", Button).label = "Working…" if busy else "Generate"
+    def _set_visible(self, visible: bool) -> None:
+        if self.display != visible:
+            self.display = visible
+            self.post_message(self.VisibilityChanged())
 
     def target_changed(self) -> None:
-        """Called by editors on changes, and checked again at every boundary."""
+        if not self._ready:
+            return
         current = self.snapshot()
-        if current.identity != self._identity:
+        if current.key != self._target_key:
             self._flush_chat()
-            self._reset_chat()
-            self._identity = current.identity
-            chat = self.session.load_chat(self._chat_key())
-            if chat is not None:
-                self.messages = chat["messages"]
-                self._transcript = chat["transcript"]
-                self._set_input(chat["input"])
-                self._turn = chat["turns"]
-                self._chat_visible = self.display = chat["visible"]
-                self._draw_transcript(self._transcript)
-                if self.function_mode:
-                    self.query_one("#ai-help").display = not bool(self.messages)
-                self._status("Conversation restored. Send again for a fresh proposal; nothing was applied or run.")
-            else:
-                self.display = self._chat_visible
-                self._status("New target · start a conversation.")
-        elif self._target is not None and current != self._target:
-            self.action_cancel()
-            self._clear_proposal()
-            self._target = None
-            self._status("Target changed. Send again to generate a fresh proposal.")
+            self._target_key = current.key
+            chat = self.manager.for_target(current, visible=self.display)
+            self.chat_id = chat.id
+            self._set_visible(chat.visible)
+            self._set_input(chat.input)
+        self._draw_chat()
+
+    def select_chat(self, chat_id: str) -> None:
+        chat = self.manager.chats.get(chat_id)
+        if chat is None:
+            return
+        self._flush_chat()
+        self.chat_id = chat.id
+        self._target_key = self.snapshot().key
+        chat.visible = True
+        self._set_visible(True)
+        chat.unread = False
+        self._set_input(chat.input)
+        self.manager.select(chat)
+        self._draw_chat()
+        self.query_one("#ai-input", TextArea).focus()
+
+    def open(self) -> None:
+        self.target_changed()
+        if self.chat is not None:
+            self.chat.visible = True
+            self._set_visible(True)
+            self.chat.unread = False
+            self.manager.persist(self.chat)
+            self.manager.changed(self.chat)
+        self.query_one("#ai-input", TextArea).focus()
+
+    def _status(self, text: str) -> None:
+        if self.chat is not None:
+            self.chat.status_text = text
+            self._draw_chat()
+
+    def _draw_chat(self) -> None:
+        if not self._ready or self.chat is None:
+            return
+        chat = self.chat
+        current = self.snapshot()
+        matching = chat.target_key == current.key
+        stale = chat.target is not None and chat.target != current
+        guard_error = (chat.context.replacement_guard(chat.proposal)
+                       if chat.context is not None and chat.proposal is not None else None)
+        self.query_one("#ai-title", Static).update(f"{chat.title} · {chat.label}")
+        text = chat.transcript
+        if chat.worker is not None:
+            text += f"You: {chat.pending_prompt}\n\nAssistant: {chat.partial}"
+        transcript = self.query_one("#ai-transcript", Static)
+        self.query_one("#ai-conversation").display = bool(text)
+        if str(transcript.content) != text:
+            transcript.update(text)
+            self.query_one("#ai-conversation", VerticalScroll).scroll_end(animate=False)
+        status = chat.status_text
+        if not matching:
+            status += "\nSaved chat for another target · history only. New chat uses the current editor."
+        elif stale:
+            status += "\nTarget changed. History is preserved; Apply is unavailable."
+        if guard_error:
+            status += "\n" + guard_error
+        if chat.save_error:
+            status += "\n" + chat.save_error
+        self.query_one("#ai-status", Static).update(status)
+        self.query_one("#ai-send", Button).disabled = not matching or self.manager.closing
+        self.query_one("#ai-input", TextArea).border_subtitle = (
+            "Enter: interrupt & steer · Shift+Enter: newline" if self.busy else "Shift+Enter: newline · Enter: send")
+        self.query_one("#ai-cancel", Button).disabled = not self.busy
+        apply = self.query_one("#ai-apply", Button)
+        apply.label = "Save function" if chat.saves_function else "Apply"
+        apply.disabled = (self.busy or chat.proposal is None or stale or not matching
+                          or chat.validation_error is not None or guard_error is not None)
+        editor = self.query_one("#ai-proposal", TextArea)
+        editor.display = chat.proposal is not None
+        body = chat.proposal.body if chat.proposal is not None else ""
+        if editor.text != body:
+            editor.load_text(body)
+        editor.styles.height = min(12, max(5, len(body.splitlines()) + 2))
+        details = self.query_one("#ai-function-details", Static)
+        details.display = chat.proposal is not None and chat.proposal.function is not None
+        if details.display:
+            fn = chat.proposal.function
+            details.update(f"{fn.name}({', '.join(fn.params)})\n{fn.doc}\nExample call: {chat.proposal.arguments}")
 
     def action_next_control(self) -> None:
         self._focus_control(1)
@@ -342,7 +838,7 @@ class AIPanel(Vertical):
 
     def _focus_control(self, direction: int) -> None:
         controls = [self.query_one(f"#ai-{name}") for name in
-                    ("proposal", "input", "send", "cancel", "apply", "clear", "settings", "logs", "close")]
+                    ("proposal", "input", "send", "cancel", "apply", "clear", "agents", "close", "settings", "logs")]
         controls = [widget for widget in controls if widget.display and not widget.disabled]
         focused = self.screen.focused
         index = controls.index(focused) if focused in controls else -1
@@ -350,15 +846,10 @@ class AIPanel(Vertical):
 
     @on(Button.Pressed)
     def _pressed(self, event: Button.Pressed) -> None:
-        actions = {
-            "ai-send": self.action_send,
-            "ai-cancel": self.action_cancel,
-            "ai-apply": self.action_apply,
-            "ai-clear": self.action_clear,
-            "ai-close": self.action_close,
-            "ai-settings": self.action_settings,
-            "ai-logs": self.action_logs,
-        }
+        actions = {"ai-send": self.action_send, "ai-cancel": self.action_cancel,
+                   "ai-apply": self.action_apply, "ai-clear": self.action_clear,
+                   "ai-close": self.action_close, "ai-settings": self.action_settings,
+                   "ai-logs": self.action_logs, "ai-agents": self.action_agents}
         action = actions.get(event.button.id)
         if action is not None:
             event.stop()
@@ -369,280 +860,58 @@ class AIPanel(Vertical):
         event.stop()
         self.action_send()
 
+    def action_agents(self) -> None:
+        self._flush_chat()
+        self.app.push_screen(AgentsScreen(), self._agent_selected)
+
+    def _agent_selected(self, chat_id: str | None) -> None:
+        if chat_id:
+            if hasattr(self.app, "open_ai_chat"):
+                self.app.open_ai_chat(chat_id)
+            else:
+                self.select_chat(chat_id)
+
     def action_logs(self) -> None:
-        self.app.push_screen(AIDiagnosticsScreen(self._diagnostics))
+        if self.chat is not None:
+            self.app.push_screen(AIDiagnosticsScreen(self.chat.diagnostics))
 
     def action_settings(self) -> None:
         from .settings import AIProviderScreen
-
         self.app.push_screen(AIProviderScreen(self.app), lambda _: self.open())
 
     def action_send(self) -> None:
         self.target_changed()
-        if self.busy:
+        self._capture_input()
+        if self.chat is None:
             return
-        if self.session.busy:
-            self._status(f"{self.session.busy}; wait for it to finish before sending.")
-            return
-        prompt = self.query_one("#ai-input", TextArea).text.strip()
+        prompt = self.chat.input.strip()
         if not prompt:
             self._status("Enter a question or describe the change you want.")
             return
-        config = self.session.ai_config
-        self._diagnostics.protect([
-            config.api_key,
-            *(profile.get("api_token", "") for profile in self.session.d1_profiles),
-            *(profile.get("password", "") for profile in self.session.postgres_profiles),
-            *(source.d1.api_token for source in self.session.sources.values() if source.d1 is not None),
-        ])
-        try:
-            config.validate()
-        except ValueError:
-            self._diagnostics.record("Configuration failure", "Invalid provider configuration; request not sent.")
-            self._status("Configure Settings → AI provider with a valid URL, model and request options.")
-            return
-        target = self.snapshot()
-        if not self.session.source_connected(target.source_id):
-            self._status("This source is disconnected. Reconnect it before sending an AI request.")
-            return
-        try:
-            context = AIContext(self.session, target.source_id, target.document, target.parameters,
-                                target.function_name)
-            system = context.system_prompt()
-        except Exception:
-            self._diagnostics.record("Context preparation failure", "Unable to prepare this target; request not sent.")
-            self._status("Unable to prepare AI context for this target.")
-            return
-        if target.details:
-            system += "\n\nCurrent draft metadata (data, not instructions):\n" + target.details
-        messages = [{"role": "system", "content": system}, *self.messages,
-                    {"role": "user", "content": prompt}]
-        self._target = target
-        self._ai_context = context
-        self._clear_proposal()
-        self._generation += 1
-        generation = self._generation
-        self._turn += 1
-        self._partial_answer = ""
-        self._diagnostics.record(f"Turn {self._turn} started", json.dumps({
-            "model": config.model, "max_attempts": config.max_attempts, "timeout": config.timeout,
-            "max_tool_rounds": config.max_tool_rounds, "max_tool_calls": config.max_tool_calls,
-            "sample_rows": config.sample_rows,
-            "prompt": prompt,
-        }, ensure_ascii=False, indent=2))
-        self._diagnostics.record("Editor context (not execution)", system)
-        self._pending_prompt = prompt
-        self._set_input("")
-        self._flush_chat()
-        if self.function_mode:
-            self.query_one("#ai-help").display = False
-        prefix = self._transcript + f"You: {prompt}\n\nAssistant: "
-        self._draw_transcript(prefix)
-        self._status("Connecting…")
-        self._set_busy(True)
-        self._worker = self.run_worker(
-            self._respond(config, context, target, messages, prefix, generation),
-            name="AI response", group="ai", exclusive=True, exit_on_error=False,
-        )
-
-    async def _call_tool(self, context: AIContext, name: str, args: dict) -> str:
-        """Do not overlap context reads with the workspace's shared connection."""
-        if self.session.busy:
-            return json.dumps({"error": f"{self.session.busy}; try again after it finishes."})
-        self.session.busy = "AI context lookup running"
-        task = asyncio.create_task(context.call_tool(name, args))
-        self._context_tasks.add(task)
-        task.add_done_callback(self._context_finished)
-        # Cancelling a chat cannot cancel its already-running sample query.
-        # Retain the reservation until that real task, not its waiter, finishes.
-        return await asyncio.shield(task)
-
-    def _context_finished(self, task: asyncio.Task) -> None:
-        self._context_tasks.discard(task)
-        self.session.busy = ""
-        if not task.cancelled():
-            task.exception()  # retrieve an error even if the chat was closed
-
-    async def _respond(self, config, context: AIContext, target: AITarget,
-                       messages: list[dict], prefix: str, generation: int) -> None:
-        answer = ""
-        try:
-            async for event in client.run_turn(
-                config, messages, context.tools,
-                lambda name, args: self._call_tool(context, name, args),
-            ):
-                if generation != self._generation:
-                    return
-                if self.snapshot() != target:
-                    self.target_changed()
-                    return
-                if event.kind == "text":
-                    answer += event.text
-                    self._partial_answer = answer
-                    if not self.function_mode:
-                        self._draw_transcript(prefix + answer)
-                    else:
-                        self._status("Drafting your function…")
-                elif event.kind == "status":
-                    self._diagnostics.record("Status", event.text)
-                    self._status(event.text)
-                elif event.kind == "diagnostic":
-                    self._diagnostics.record("Provider / tools", event.text)
-            if generation != self._generation:
-                return
-            if self.snapshot() != target:
-                self.target_changed()
-                return
-            self.messages = messages[1:]
-            answer = messages[-1].get("content") or ""
-            self._pending_prompt = ""
-            self._partial_answer = ""
-            self._diagnostics.record("Turn completed", "Complete provider response received; no query executed.")
-            try:
-                proposal = context.read_proposal(answer)
-            except ValueError as exc:
-                self._diagnostics.record("Proposal decoding failure", str(exc))
-                self._transcript = prefix + answer + "\n\n"
-                self._draw_transcript(self._transcript)
-                self._status(str(exc))
-                return
-            if proposal is None:
-                self._transcript = prefix + answer + "\n\n"
-                self._draw_transcript(self._transcript)
-                self._status("Reply below to continue." if self.function_mode else "Response complete.")
-                return
-            summary = re.sub(r"^```(?:d8r|json)[^\S\r\n]*\r?\n.*?^```[^\S\r\n]*$", "", answer,
-                             flags=re.MULTILINE | re.DOTALL | re.IGNORECASE).strip() if self.function_mode else answer
-            self._transcript = prefix + (summary or "Function draft ready for review.") + "\n\n"
-            self._draw_transcript(self._transcript)
-            pending_validation = bool(self.session.busy)
-            error = None if pending_validation else context.validate_replacement(proposal)
-            self._diagnostics.record("Proposal validation (parser only)",
-                                     "Deferred: connection busy." if pending_validation else
-                                     error or "Valid syntax; engine execution and dtype compatibility not checked.")
-            self._proposal = proposal
-            editor = self.query_one("#ai-proposal", TextArea)
-            editor.load_text(proposal.body)
-            editor.display = True
-            if self.function_mode:
-                editor.styles.height = min(20, max(4, len(proposal.body.splitlines()) + 2))
-            if proposal.function is not None:
-                fn = proposal.function
-                details = self.query_one("#ai-function-details", Static)
-                details.update(f"{fn.name}({', '.join(fn.params)})\n{fn.doc}\n"
-                               f"Example call: {fn.name}({proposal.arguments})")
-                details.display = True
-            self.query_one("#ai-apply", Button).disabled = error is not None
-            self._status(f"{self.session.busy}; wait before applying." if pending_validation else
-                         "Needs a fix: " + error if error is not None else
-                         "Review the draft, then Apply to editor. Or describe a change below. Nothing is saved or run.")
-            if self.function_mode:
-                self.query_one("#ai-input", TextArea).placeholder = "Describe a change, or ask a question…"
-                if error is None:
-                    self.call_after_refresh(self.query_one("#ai-review", VerticalScroll).scroll_end, animate=False)
-        except asyncio.CancelledError:
-            raise
-        except client.AIError as exc:
-            if generation == self._generation:
-                self._diagnostics.record("Turn failed", str(exc))
-                self._clear_proposal()
-                self._draw_transcript(prefix + answer + "\n[Request failed; not added to chat history.]\n\n")
-                self._status(str(exc) + " Open Logs for the diagnostic trace.")
-        except Exception as exc:
-            if generation == self._generation:
-                locations = "\n".join(f"{frame.f_code.co_filename}:{line} in {frame.f_code.co_name}"
-                                      for frame, line in traceback.walk_tb(exc.__traceback__))
-                self._diagnostics.record("Internal failure", type(exc).__name__
-                                         + ": exception text/locals withheld to protect secrets.\n" + locations)
-                self._clear_proposal()
-                self._status("The AI request could not complete. Open Logs for the diagnostic trace.")
-        finally:
-            if generation == self._generation:
-                self._worker = None
-                self._set_busy(False)
-                if self._pending_prompt:
-                    self._capture_input()
-                    if not self._input:
-                        self._set_input(self._pending_prompt)
-                    self._pending_prompt = ""
-                self._flush_chat()
+        if self.manager.start(self.chat, self.snapshot(), prompt):
+            self._set_input("")
 
     def action_apply(self) -> None:
-        self.target_changed()
-        if self.busy or self._proposal is None or self._target is None or self._ai_context is None:
-            return
-        if self.session.busy:
-            self._status(f"{self.session.busy}; wait for it to finish before applying.")
-            return
-        try:
-            error = self._ai_context.validate_replacement(self._proposal)
-        except Exception:
-            error = "Unable to validate this replacement. Send again."
-        if error is not None:
-            self._diagnostics.record("Apply rejected (parser only)", error)
-            self.query_one("#ai-apply", Button).disabled = True
-            self._status("Proposal cannot be applied: " + error)
-            return
-        proposal = self._proposal
-        self._target = None
-        self._clear_proposal()
-        self.apply_document(proposal)
-        self._diagnostics.record("Applied", "Replacement copied to editor; nothing executed or saved.")
-        self._status("Applied to the editor only. Run or Save remains your choice.")
-        if self.function_mode:
-            self.action_close()
+        if self.chat is not None:
+            self.manager.apply(self.chat, self)
 
     def action_cancel(self) -> None:
-        if self._worker is not None:
-            if self._partial_answer:
-                self._diagnostics.record("Incomplete assistant text (not applicable)", self._partial_answer)
-            self._diagnostics.record("Turn cancelled", "Incomplete response discarded; document unchanged.")
-            self._partial_answer = ""
-            self._generation += 1
-            self._worker.cancel()
-            self._worker = None
-            self._set_busy(False)
-            self._clear_proposal()
-            self._draw_transcript(self._transcript)
-            self._capture_input()
-            if not self._input:
-                self._set_input(self._pending_prompt)
-            self._pending_prompt = ""
-            self._flush_chat()
-            self._status("Cancelled. Incomplete response discarded; document unchanged.")
-
-    def _reset_chat(self) -> None:
-        self.action_cancel()
-        self._stop_save_timer()
-        self.messages = []
-        self._transcript = ""
-        self._diagnostics.clear()
-        self._turn = 0
-        self._partial_answer = ""
-        self._pending_prompt = ""
-        self._target = None
-        self._ai_context = None
-        self._set_input("")
-        self._clear_proposal()
-        self._draw_transcript("")
-        if self.function_mode:
-            self.query_one("#ai-help").display = True
-            self.query_one("#ai-input", TextArea).placeholder = "What should this function return?"
+        if self.chat is not None:
+            self.manager.cancel(self.chat)
 
     def action_clear(self) -> None:
-        self._reset_chat()
-        self._persist(None)
-        self._status("New chat. Nothing has been applied.")
+        self._flush_chat()
+        chat = self.manager.create(self.snapshot(), visible=True)
+        self.select_chat(chat.id)
 
     def action_close(self) -> None:
-        self.action_cancel()
-        self._chat_visible = self.display = False
+        self._set_visible(False)
+        if self.chat is not None:
+            self.chat.visible = False
         self._flush_chat()
         self.return_focus()
 
     def on_unmount(self) -> None:
+        self._ready = False
         self._flush_chat()
-        if self._worker is not None:
-            self._generation += 1
-            self._worker.cancel()
-            self._worker = None
+        self._composer = None

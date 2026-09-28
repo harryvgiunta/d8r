@@ -18,7 +18,7 @@ local storage layer, independently of this transport.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import batched
+from threading import RLock
 from urllib.parse import quote
 from uuid import UUID
 
@@ -26,17 +26,10 @@ import httpx
 import ibis
 
 D1_API_ROOT = "https://api.cloudflare.com/client/v4"
-# Cloudflare's SQLite runtime caps UNION/INTERSECT/EXCEPT at five terms.
-_COUNT_BATCH_SIZE = 5
 
 
 class D1Error(Exception):
     """A D1-side failure the user must see (bad token, unknown database, SQL error)."""
-
-
-def _quote(identifier: str) -> str:
-    """Safely double-quote a SQLite identifier (D1 runs SQLite; `""` escapes `"`)."""
-    return '"' + identifier.replace('"', '""') + '"'
 
 
 # Declared-type (as D1/sqlite reports it) → ibis dtype. Unknown names fall back
@@ -148,7 +141,7 @@ class CloudflareD1:
 
     # -- statements -------------------------------------------------------
     def query(self, sql: str) -> list[dict]:
-        """Run SQL, returning each row as an object (for introspection/counts)."""
+        """Run SQL, returning each row as an object (for introspection)."""
         results = self._post("query", sql).get("results") or []
         return [row for row in results if isinstance(row, dict)]
 
@@ -158,6 +151,10 @@ class CloudflareD1:
         columns = [str(c) for c in (results.get("columns") or [])]
         rows = [list(r) for r in (results.get("rows") or [])]
         return columns, rows
+
+    def check_connection(self) -> None:
+        """Authenticate against the resolved database without discovering its schema."""
+        self.query("SELECT 1")
 
     # -- introspection ----------------------------------------------------
     def resolve(self) -> str:
@@ -186,21 +183,25 @@ class CloudflareD1:
             "and database name, or paste the database UUID from Workers & Pages → D1."
         )
 
-    def schemas(self) -> dict[str, dict[str, str]]:
-        """table → {column: ibis dtype} for every user table/view, in one query.
+    def schemas(self, names: list[str] | None = None) -> dict[str, dict[str, str]]:
+        """Return ordered column types for all or only the named user tables/views.
 
-        Correlated `pragma_table_info(m.name)` pulls every table's columns in one
-        round-trip; D1's authorizer refuses pragmas reaching the internal
-        `sqlite_*`/`_cf_*` objects, so those are filtered out of the scan — the
-        same set D1's own console hides.
+        Filter `sqlite_schema` before the correlated `pragma_table_info(m.name)`
+        introspection. D1's authorizer rejects internal `sqlite_*`/`_cf_*`
+        objects; a named lookup must also leave unrelated user objects alone.
         """
+        if names is not None and not names:
+            return {}
         sql = (
             'select m.name as source_table, p.cid as cid, p.name as name, p.type as type, p."notnull" as "notnull" '
             "from sqlite_schema m join pragma_table_info(m.name) p "
             "where m.type in ('table', 'view') "
             "and substr(m.name, 1, 7) != 'sqlite_' and substr(m.name, 1, 4) != '_cf_' "
-            "order by m.name, p.cid"
         )
+        if names is not None:
+            literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
+            sql += f"and m.name in ({literals}) "
+        sql += "order by m.name, p.cid"
         tables: dict[str, dict[str, str]] = {}
         for row in self.query(sql):
             table = row.get("source_table")
@@ -211,21 +212,8 @@ class CloudflareD1:
             cols[str(column)] = _ibis_type(str(row.get("type") or ""), int(row.get("notnull") or 0))
         return tables
 
-    def row_counts(self, tables: list[str]) -> dict[str, int]:
-        """Count every table in batches within Cloudflare's five-term SQL limit."""
-        counts: dict[str, int] = {}
-        for batch in batched(tables, _COUNT_BATCH_SIZE):
-            parts = (f"select {_lit(t)} as dataset, count(*) as n from {_quote(t)}" for t in batch)
-            for row in self.query(" union all ".join(parts)):
-                counts[str(row.get("dataset"))] = int(row.get("n") or 0)
-        return counts
-
     def close(self) -> None:
         self._client.close()
-
-
-def _lit(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
 
 
 def _looks_like_uuid(text: str) -> bool:
@@ -250,27 +238,43 @@ def _api_error(node: dict, status: int) -> str:
     return f"Cloudflare D1 request failed (HTTP {status})"
 
 
-def schema_connection(schemas: dict[str, dict[str, str]]):
-    """A read-only ibis "connection" over unbound tables carrying real schemas.
+def schema_connection(schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | None = None):
+    """A read-only ibis connection with optional on-demand D1 table metadata.
 
-    A schema pane and every payload compile run against this exactly like a
-    bound connection — only `.execute()` would fail (there is no local data),
-    which is why remote queries compile to SQLite SQL and run it through the
-    D1 API instead.
+    With no `d1`, the connection stays entirely offline. Supplying a client
+    loads only missing tables, while `.seed()` accepts separately indexed
+    metadata without performing network requests.
     """
-    return _UnboundCon(schemas)
+    return _UnboundCon(schemas, d1=d1)
 
 
 class _UnboundCon:
-    def __init__(self, schemas: dict[str, dict[str, str]]) -> None:
-        self._schemas = schemas
+    def __init__(self, schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | None = None) -> None:
+        self._schemas: dict[str, dict[str, str]] = {}
+        self._d1 = d1
+        self._lock = RLock()
+        self.seed(schemas)
 
     def table(self, name: str):
-        try:
-            schema = self._schemas[name]
-        except KeyError:
-            raise KeyError(name) from None
+        if name.startswith(("sqlite_", "_cf_")):
+            raise KeyError(name)
+        with self._lock:
+            schema = self._schemas.get(name)
+        if schema is None and self._d1 is not None:
+            # Never hold the cache lock across HTTP: another table's lookup or
+            # the application's background index must not gate this request.
+            self.seed(self._d1.schemas([name]))
+            with self._lock:
+                schema = self._schemas.get(name)
+        if schema is None:
+            raise KeyError(name)
         return ibis.table(name=name, schema=ibis.schema(schema))
 
+    def seed(self, schemas: dict[str, dict[str, str]]) -> None:
+        snapshot = {name: dict(columns) for name, columns in schemas.items()}
+        with self._lock:
+            self._schemas.update(snapshot)
+
     def list_tables(self) -> list[str]:
-        return list(self._schemas)
+        with self._lock:
+            return list(self._schemas)

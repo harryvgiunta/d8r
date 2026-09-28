@@ -107,6 +107,13 @@ def test_lines_are_trimmed_before_dispatch():
     assert ast.select[0].raw == "user_id"
 
 
+def test_builtin_parenthesized_commands_keep_precedence_over_function_calls():
+    ast = parse_query("\\from events\n\\where(amount > 3)\n\\limit 2", settled=True)
+    assert ast.errors == []
+    assert ast.from_.table == "events"
+    assert ast.where.group.column == "amount"
+
+
 # --- empty vs loaded registry -----------------------------------------------
 
 
@@ -278,7 +285,6 @@ def test_with_expects_a_bare_name_and_a_body(loaded):
 
 def test_body_errors_bubble_to_the_document_with_absolute_lines(loaded):
     ast = parse_query("\\with a\n  \\from events\n  \\select bogus!\n\\limit 2", schema=loaded)
-    assert messages(ast) == ['cannot parse expression "bogus!"']
     assert [e.line for e in ast.errors] == [3]
     assert ast.with_[0].body.errors == []
     assert ast.with_[0].body.select[0].line == 3
@@ -391,9 +397,6 @@ def test_rank_names_with_arguments_are_rejected():
         assert messages(ast) == [f'"{fn}" takes no arguments — write {fn}() over ( ... )']
 
 
-def test_unparseable_select_expression_is_reported():
-    ast = parse_query("\\select amount + 1\n\\limit 2")
-    assert messages(ast) == ['cannot parse expression "amount + 1"']
 
 
 def test_rank_requires_the_frame_and_its_order():
@@ -495,6 +498,7 @@ def test_star_parses_to_a_star_item_and_the_payload_carries_star():
         "column": None,
         "literal": None,
         "scalar": None,
+        "arithmetic": None,
         "star": True,
         "aggregate": None,
         "temporal": None,
@@ -984,10 +988,15 @@ def test_payload_maps_the_canonical_document():
     (
         customer, month_col, total, running, rank_col, extracted, peak,
         *constants, _scalar, translated, distance, link_host, placed_date,
+        dollars, safe_dollars, paid_total,
     ) = payload["select"]
     assert [item["literal"] for item in constants] == [
         {"value": "1"}, {"value": 1}, {"value": "x"}, {"value": None},
     ]
+    assert paid_total["aggregate"] == {
+        "fn": "sum", "arg": "amount",
+        "where": {"column": "status", "op": "=", "value": "paid", "subquery": None},
+    }
     assert customer["column"] == "customer_id"
     assert customer["alias"] is None
     assert month_col["temporal"] == {"fn": "month", "arg": "placed_at"}
@@ -996,6 +1005,7 @@ def test_payload_maps_the_canonical_document():
         "column": None,
         "literal": None,
         "scalar": None,
+        "arithmetic": None,
         "star": False,
         "aggregate": {"fn": "sum", "arg": "amount"},
         "temporal": None,
@@ -1015,6 +1025,7 @@ def test_payload_maps_the_canonical_document():
         "column": None,
         "literal": None,
         "scalar": None,
+        "arithmetic": None,
         "star": False,
         "aggregate": None,
         "temporal": None,
@@ -1067,6 +1078,13 @@ def test_payload_maps_the_canonical_document():
         ],
     }
     assert placed_date["alias"] == "placed_date"
+    assert dollars["arithmetic"] == {
+        "op": "/", "args": [{"column": "amount"}, {"literal": {"value": 100}}],
+    }
+    assert safe_dollars["scalar"] == {
+        "fn": "coalesce",
+        "args": [dollars["arithmetic"], {"literal": {"value": 0}}],
+    }
 
     # The lateral join carries its body and its correlation, left as written.
     lateral = payload["joins"][0]
@@ -1204,3 +1222,61 @@ def test_payload_nests_cte_bodies_recursively():
     assert second["body"]["dataset"] == "first"
     assert second["body"]["select"][0]["column"] == "amount_sum"
     assert second["body"]["ctes"] == []
+
+
+def test_filtered_aggregate_aliases_and_predicate_qualification(loaded):
+    ast = parse_query(
+        "\\from events e\n"
+        "\\select sum(e.amount \\where e.status = 'paid') as paid, count(* \\where e.amount is null)\n"
+        "\\order paid", schema=loaded, settled=True,
+    )
+    assert ast.errors == []
+    assert ast.order_by[0].resolves_to == 1
+    payload = payload_from_ast(ast)
+    assert payload["where"] is None
+    assert [item["alias"] for item in payload["select"]] == ["paid", "__count"]
+    assert payload["select"][0]["aggregate"]["where"] == {
+        "column": "e.status", "op": "=", "value": "paid", "subquery": None,
+    }
+    bad = parse_query(
+        "\\from events e\n\\select sum(e.amount \\where events.status = 'paid') / 100",
+        schema=loaded, settled=True,
+    )
+    assert has_error(bad, 'events.status')
+
+
+@pytest.mark.parametrize("expression", [
+    r"sum(amount \where)",
+    r"sum(amount \where status =)",
+    r"sum(amount \where status is null paid)",
+    r"sum(amount \where status = 'paid' and)",
+    r"sum(amount \where ())",
+    r"sum(amount \where status in ())",
+    r"sum(amount \where status = 'paid' \where amount > 0)",
+    r"sum(amount \where status = 'paid') over ()",
+    r"sum(amount / 100 \where status = 'paid')",
+    r"sum(* \where status = 'paid')",
+    r"coalesce(sum(amount \where status = 'paid'), 0)",
+    r"year(amount \where status = 'paid')",
+])
+def test_filtered_aggregate_malformed_predicates_report_on_settled_line(expression):
+    doc = f"\\from events\n\\select {expression}"
+    assert parse_query(doc).errors == []
+    ast = parse_query(doc, settled=True)
+    assert ast.errors
+    assert {error.line for error in ast.errors} == {2}
+
+
+def test_filtered_predicate_text_limits_and_quoted_keywords():
+    from d8r.query.functions import MAX_WHERE_DEPTH, MAX_WHERE_NODES
+
+    for predicate in (
+        "(" * (MAX_WHERE_DEPTH + 1) + "amount > 0" + ")" * (MAX_WHERE_DEPTH + 1),
+        " and ".join(["amount > 0"] * (MAX_WHERE_NODES + 1)),
+    ):
+        assert parse_query(f"\\from events\n\\select count(* \\where {predicate})", settled=True).errors
+    ast = parse_query(
+        r"\select count(* \where status = 'paid and (pending) \\where')", settled=True,
+    )
+    assert ast.errors == []
+    assert ast.select[0].aggregate.where.value == r"paid and (pending) \\where"
