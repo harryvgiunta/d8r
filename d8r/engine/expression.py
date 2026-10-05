@@ -8,22 +8,27 @@ from __future__ import annotations
 
 import functools
 import operator
+import json
 import re
 from collections.abc import Callable
 from operator import eq, ge, gt, le, lt, ne
 
 import ibis
+import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisError
 
 from d8r.query.functions import (
     ARITHMETIC_PRECEDENCE,
+    JSON_FUNCTIONS,
     MAX_EXPRESSION_DEPTH,
     MAX_EXPRESSION_NODES,
     MAX_WHERE_DEPTH,
     MAX_WHERE_NODES,
     SCALAR_FUNCTIONS,
 )
+from d8r.query.identifiers import relation_parts
 
 from .d1api import D1Error
 
@@ -83,6 +88,9 @@ def get_table(
     only cheaper but *correct* on a backend that introspects when it is asked
     for a table by name: SQLite's `con.table()` reads the schema inside a
     transaction of its own, which would commit the session's.
+
+    Unregistered PostgreSQL schema.table operands pass separate name components
+    to Ibis, so qualification never becomes a literal dotted table name.
     """
     if not isinstance(dataset, str) or not dataset:
         raise PayloadError("dataset must be a non-empty string")
@@ -90,7 +98,23 @@ def get_table(
         return ctes[dataset]
     if tables and dataset in tables:
         return tables[dataset]
+    parts = relation_parts(dataset)
+    if tables and parts is not None:
+        equivalent = next((name for name in tables if relation_parts(name) == parts), None)
+        if equivalent is not None:
+            return tables[equivalent]
+        matches = [
+            name for name in tables
+            if (candidate := relation_parts(name)) is not None
+            and (candidate == parts or len(parts) == 1 and candidate[-1] == parts[0])
+        ]
+        if len(matches) == 1:
+            return tables[matches[0]]
+        if matches:
+            raise PayloadError(f"ambiguous dataset: {dataset}")
     try:
+        if parts is not None and len(parts) == 2 and getattr(con, "name", None) == "postgres":
+            return con.table(parts[1], database=(None, parts[0]))
         return con.table(dataset)
     except D1Error:
         raise
@@ -108,7 +132,7 @@ def col(frames: list[tuple[str, ir.Table]], ref: object, what: str = "column") -
     joins in document order.
     """
     if isinstance(ref, str) and "." in ref:
-        dataset, _, name = ref.partition(".")
+        dataset, _, name = ref.rpartition(".")
         for frame_name, table in frames:
             if frame_name == dataset:
                 if name in table.columns:
@@ -146,7 +170,7 @@ def _outer_ref(ref: object, frames: list[tuple[str, ir.Table]]) -> bool:
     """True when a `\\where` operand names a column outside the lateral body."""
     if not isinstance(ref, str) or "." not in ref:
         return False
-    prefix = ref[: ref.index(".")]
+    prefix = ref.rpartition(".")[0]
     return any(prefix == name for name, _ in frames)
 
 
@@ -418,6 +442,27 @@ def _join_frames(
     for spec in joins:
         if not isinstance(spec, dict):
             raise PayloadError("join specs must be objects")
+        if set(spec) - {"dataset", "alias", "left", "right", "lateral", "body", "keys"}:
+            raise PayloadError("join specs contain unknown fields")
+        if "lateral" in spec and not isinstance(spec["lateral"], bool):
+            raise PayloadError("join lateral must be a boolean")
+        extra_keys = spec.get("keys", [])
+        if not isinstance(extra_keys, list):
+            raise PayloadError("join keys must be an array of column pairs")
+        for pair in extra_keys:
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or any(not isinstance(ref, str) or not ref for ref in pair)
+            ):
+                raise PayloadError("each join key pair must contain two non-empty column strings")
+        if spec.get("lateral") and extra_keys:
+            raise PayloadError("compound ON keys are not supported for lateral joins")
+        if not spec.get("lateral") and any(
+            not isinstance(spec.get(side), str) or not spec[side]
+            for side in ("left", "right")
+        ):
+            raise PayloadError("join left and right must be non-empty column strings")
         right_name = spec.get("dataset")
         right_alias = spec.get("alias")
         right_ident = right_alias if isinstance(right_alias, str) and right_alias else right_name
@@ -448,13 +493,22 @@ def _join_frames(
 
         left_column = key(spec.get("left"), frames)
         right_column = key(spec.get("right"), [(right_ident, right)])
-        expr = expr.join(right, left_column == right_column)
+        predicate = left_column == right_column
+        for left_ref, right_ref in extra_keys:
+            predicate &= key(left_ref, frames) == key(right_ref, [(right_ident, right)])
+        expr = expr.join(right, predicate)
         frames.append((right_ident, right))
     return frames, expr
 
 
 def _coerce(value: object, dtype) -> object:
     """Coerce a comparison literal to match the column dtype."""
+    if dtype.is_boolean():
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:
+            return value.strip().casefold() == "true"
+        raise PayloadError(f"cannot compare boolean column to {value!r}")
     if dtype.is_numeric():
         if isinstance(value, bool):
             raise PayloadError(f"cannot compare numeric column to {value!r}")
@@ -1082,7 +1136,15 @@ def _scalar_call(spec: object, resolve: Callable[[object], ir.Value]) -> ir.Valu
         value = resolve(node)
         kind = signature.argument_kind(index)
         dtype = value.type()
-        if kind != "any":
+        if kind == "json_input":
+            if not (dtype.is_json() or dtype.is_string() or dtype.is_null()):
+                raise PayloadError(f"{fn} argument {index + 1} needs JSON or JSON text, got {dtype}")
+        elif kind == "json_key":
+            if not (dtype.is_string() or dtype.is_integer()):
+                raise PayloadError(f"{fn} argument {index + 1} needs a string key or integer index, got {dtype}")
+            if isinstance(value.op(), ops.Literal) and dtype.is_integer() and value.op().value < 0:
+                raise PayloadError(f"{fn} array indices must be zero-based non-negative integers")
+        elif kind != "any":
             if dtype.is_null():
                 value = value.cast("int64" if kind == "integer" else "string")
             elif not (dtype.is_string() if kind == "string" else dtype.is_integer()):
@@ -1090,6 +1152,8 @@ def _scalar_call(spec: object, resolve: Callable[[object], ir.Value]) -> ir.Valu
         args.append(value)
     first, *rest = args
     try:
+        if fn in JSON_FUNCTIONS:
+            return _json_call(fn, first, rest)
         if fn == "string":
             return first.cast("string")
         if fn == "concat":
@@ -1103,6 +1167,19 @@ def _scalar_call(spec: object, resolve: Callable[[object], ir.Value]) -> ir.Valu
         return getattr(first, fn)(*rest)
     except (IbisError, TypeError, ValueError, OverflowError) as exc:
         raise PayloadError(f"invalid {fn} arguments: {exc}") from exc
+
+
+def _json_call(fn: str, value: ir.Value, keys: list[ir.Value]) -> ir.Value:
+    """Portable JSON operations; target compiler gaps are lowered at the engine seam."""
+    if not value.type().is_json():
+        value = value.cast("json")
+    for key in keys:
+        value = value[key]
+    if fn == "json_get":
+        return value
+    return value.unwrap_as({
+        "json_text": "string", "json_int": "int64", "json_float": "float64", "json_bool": "boolean",
+    }[fn])
 
 
 def _scalar_subquery_column(
@@ -1458,10 +1535,196 @@ def column_name_of(aggregate: dict) -> str:
     return "arg"
 
 
+@ibis.udf.scalar.builtin(name="json", signature=((dt.string,), dt.json))
+def _sqlite_json(value):
+    """SQLite's validating JSON parser, not CAST's numeric affinity."""
+
+
+@ibis.udf.scalar.builtin(name="json_quote", signature=((dt.string,), dt.string))
+def _sqlite_json_quote(value):
+    """Encode a literal object key as a quoted JSON path component."""
+
+
+@ibis.udf.scalar.builtin(name="json_type", signature=((dt.json,), dt.string))
+def _json_type(value):
+    """SQLite/DuckDB native JSON type inspection."""
+
+
+@ibis.udf.scalar.builtin(name="json_type", signature=((dt.json, dt.string), dt.string))
+def _sqlite_json_path_type(value, path):
+    """Inspect a JSON member before SQL scalar extraction erases its type."""
+
+
+@ibis.udf.scalar.builtin(name="json_extract", signature=((dt.json, dt.string), dt.json))
+def _sqlite_json_raw(value, path):
+    """Native SQLite extraction, immediately re-encoded by json_quote."""
+
+
+@ibis.udf.scalar.builtin(name="json_quote", signature=((dt.json,), dt.json))
+def _sqlite_json_encode(value):
+    """Preserve objects/arrays and re-quote extracted SQL scalar strings."""
+
+
+@ibis.udf.scalar.builtin(name="json_extract", signature=((dt.json, dt.string), dt.int64))
+def _sqlite_json_integer(value, path):
+    """SQLite scalar extraction; typeof checks the actual SQL storage type."""
+
+
+@ibis.udf.scalar.builtin(name="typeof", signature=((dt.int64,), dt.string))
+def _sqlite_typeof(value):
+    """SQLite native storage type, including out-of-range JSON integers."""
+
+
+@ibis.udf.scalar.builtin(name="json_extract_path", database="pg_catalog", signature=((dt.json, dt.string), dt.json))
+def _pg_json_get(value, key):
+    """PostgreSQL literal-key/array-index extraction, not JSONPath."""
+
+
+@ibis.udf.scalar.builtin(name="jsonb_extract_path", database="pg_catalog", signature=((dt.JSON(binary=True), dt.string), dt.JSON(binary=True)))
+def _pg_jsonb_get(value, key):
+    """The JSONB variant preserves the input's native representation."""
+
+
+@ibis.udf.scalar.builtin(name="json_build_array", database="pg_catalog", signature=((dt.json,), dt.json))
+def _pg_json_wrap(value):
+    """Make a one-element native JSON array for root scalar text extraction."""
+
+
+@ibis.udf.scalar.builtin(name="json_extract_path_text", database="pg_catalog", signature=((dt.json, dt.string), dt.string))
+def _pg_json_string(value, key):
+    """Native JSON string decoding, including escapes, with an explicit path."""
+
+
+@ibis.udf.scalar.builtin(name="json_typeof", signature=((dt.json,), dt.string))
+def _pg_json_type(value):
+    """PostgreSQL native JSON type inspection."""
+
+
+@ibis.udf.scalar.builtin(name="jsonb_typeof", signature=((dt.JSON(binary=True),), dt.string))
+def _pg_jsonb_type(value):
+    """PostgreSQL native JSONB type inspection."""
+
+
+@ibis.udf.scalar.builtin(name="regexp_match", signature=((dt.string, dt.string), dt.Array(dt.string)))
+def _pg_integer_match(value, pattern):
+    """Native PostgreSQL regex matching, also available before PostgreSQL 15."""
+
+
+_JSON_OPERATIONS = (
+    ops.JSONGetItem, ops.UnwrapJSONString, ops.UnwrapJSONInt64,
+    ops.UnwrapJSONFloat64, ops.UnwrapJSONBoolean,
+)
+
+
+def lower_for_backend(expr: ir.Expr, dialect: str | None = None) -> ir.Expr:
+    """Lower genuine compiler gaps for one target without mutating the neutral graph.
+
+    Native execution, materialization and SQL rendering share this seam. The
+    whitelisted builtin UDF declarations above name existing database functions;
+    no Python UDF registration or handwritten SQL is involved (including on D1).
+    """
+    if not expr.op().find(_JSON_OPERATIONS):
+        return expr
+    target = dialect or expr._find_backend().name
+    if target not in {"sqlite", "duckdb", "postgres"}:
+        raise PayloadError(f"JSON extraction is not supported for compile target {target!r}")
+    paths: dict[ops.JSONGetItem, tuple[ir.Value, tuple[ir.Value, ...]]] = {}
+    postgres_paths: dict[ops.JSONGetItem, tuple[ir.Value, ir.Value]] = {}
+
+    def rewrite(node, children):
+        original = node
+        node = node.__recreate__(children) if children else node
+        if target == "sqlite" and isinstance(node, ops.Cast) and node.to.is_json():
+            if node.arg.dtype.is_string():
+                return _sqlite_json(node.arg.to_expr()).op()
+        if isinstance(node, ops.JSONGetItem):
+            value, key = node.arg.to_expr(), node.index.to_expr()
+            integer = key.type().is_integer()
+            if target == "sqlite" and not integer:
+                if not isinstance(key.op(), ops.Literal):
+                    raise PayloadError("SQLite JSON object keys must be literal strings; dynamic keys require DuckDB or PostgreSQL")
+                if '"' in key.op().value:
+                    raise PayloadError("SQLite JSON paths cannot address object keys containing double quotes")
+            missing = ibis.literal(None, type=value.type())
+            if target == "postgres":
+                value, valid = postgres_paths.get(original.arg, (value, ibis.literal(True)))
+                binary = value.type().binary
+                inspect = _pg_jsonb_type if binary else _pg_json_type
+                extract = _pg_jsonb_get if binary else _pg_json_get
+                result = extract(value, key.cast("string"))
+                valid = valid & key.notnull() & (inspect(value) == ("array" if integer else "object"))
+                if integer:
+                    valid = valid & (key >= 0)
+                postgres_paths[original] = result, valid
+                return (valid & (inspect(result) != "null")).ifelse(result, missing).op()
+            # A chain within one scalar call needs one native extraction, not
+            # repeated CASE-wrapped parsing of every intermediate JSON value.
+            value, previous = paths.get(original.arg, (value, ()))
+            segments = (*previous, key)
+            paths[original] = value, segments
+            pieces = []
+            valid_path = ibis.literal(True)
+            for segment in segments:
+                valid_path = valid_path & segment.notnull()
+                if segment.type().is_integer():
+                    valid_path = valid_path & (segment >= 0)
+                    pieces.append(ibis.literal("[").concat(segment.cast("string"), "]"))
+                else:
+                    encoded = (
+                        ibis.literal(json.dumps(segment.op().value, ensure_ascii=False))
+                        if isinstance(segment.op(), ops.Literal) else _sqlite_json_quote(segment)
+                    )
+                    pieces.append(ibis.literal(".").concat(encoded))
+            path = valid_path.ifelse(ibis.literal("$").concat(*pieces), ibis.literal(None, type="string"))
+            if target == "sqlite":
+                kind = _sqlite_json_path_type(value, path)
+                return ibis.cases(
+                    (kind == "true", _sqlite_json("true")),
+                    (kind == "false", _sqlite_json("false")),
+                    (kind.isnull() | (kind == "null"), missing),
+                    else_=_sqlite_json_encode(_sqlite_json_raw(value, path)),
+                ).op()
+            result = ops.JSONGetItem(value, path).to_expr()
+            return (_json_type(result) == "NULL").ifelse(missing, result).op()
+        if target == "sqlite" and isinstance(node, ops.UnwrapJSONInt64):
+            value = node.arg.to_expr()
+            scalar = _sqlite_json_integer(value, "$")
+            valid = (_json_type(value) == "integer") & (_sqlite_typeof(scalar) == "integer")
+            return valid.ifelse(scalar, ibis.literal(None, type="int64")).op()
+        if target == "sqlite" and isinstance(node, ops.UnwrapJSONBoolean):
+            value = node.arg.to_expr()
+            kind = _json_type(value)
+            valid = (kind == "true") | (kind == "false")
+            return valid.ifelse(_sqlite_json_integer(value, "$").cast("boolean"),
+                                ibis.literal(None, type="boolean")).op()
+        if target == "postgres" and isinstance(node, ops.UnwrapJSONString):
+            value = node.arg.to_expr()
+            inspect = _pg_jsonb_type if value.type().binary else _pg_json_type
+            json_value = value.cast("json") if value.type().binary else value
+            text = _pg_json_string(_pg_json_wrap(json_value), "0")
+            return (inspect(value) == "string").ifelse(text, ibis.literal(None, type="string")).op()
+        if target == "postgres" and isinstance(node, (ops.UnwrapJSONFloat64, ops.UnwrapJSONBoolean)):
+            value = node.arg.to_expr()
+            inspect = _pg_jsonb_type if value.type().binary else _pg_json_type
+            kind = "number" if isinstance(node, ops.UnwrapJSONFloat64) else "boolean"
+            scalar = value.cast("string").cast(node.dtype)
+            return (inspect(value) == kind).ifelse(scalar, ibis.literal(None, type=node.dtype)).op()
+        if target == "postgres" and isinstance(node, ops.UnwrapJSONInt64):
+            value = node.arg.to_expr()
+            inspect = _pg_jsonb_type if value.type().binary else _pg_json_type
+            text = value.cast("string")
+            valid = (inspect(value) == "number") & _pg_integer_match(text, r"^-?(0|[1-9][0-9]*)$").notnull()
+            return valid.ifelse(text.cast("int64"), ibis.literal(None, type="int64")).op()
+        return node
+
+    return expr.op().replace(rewrite).to_expr()
+
+
 def compile_sql(expr: ir.Table, dialect: str | None = None) -> str:
     """Render the expression's SQL without executing it.
 
     `dialect` names any ibis-supported compile target (e.g. "postgres");
     None renders for the expression's own backend.
     """
+    expr = lower_for_backend(expr, dialect)
     return str(ibis.to_sql(expr, dialect=dialect)) if dialect else str(ibis.to_sql(expr))

@@ -51,6 +51,7 @@ from .functions import (
     MAX_WHERE_NODES,
     SCALAR_FUNCTIONS,
 )
+from .identifiers import IDENTIFIER, RELATION_NAME
 from .schema import (
     AGGREGATES,
     TEMPORAL,
@@ -59,9 +60,9 @@ from .schema import (
     SchemaContext,
 )
 
-# A column reference: bare (`amount`) or qualified with one dot (`users.score`).
-_COL = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
-_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_IDENT = IDENTIFIER
+# Bare column, table.column, or schema.table.column; aliases remain bare.
+_COL = rf"(?:{RELATION_NAME}\.)?{_IDENT}"
 _COL_RE = re.compile(rf"^{_COL}$")
 _AGG_RE = re.compile(rf"^([A-Za-z_][A-Za-z0-9_]*)\((\*|{_COL})\)$")
 _CALL_HEAD_RE = re.compile(rf"({_IDENT})\s*\(")
@@ -84,9 +85,10 @@ _ORDER_RE = re.compile(rf"^({_COL})(?:\s+(asc|desc))?$", re.IGNORECASE)
 # is optional, so the tail is matched separately from the source). Either side
 # may be identifier-qualified — the left usually is.
 _JOIN_ON_RE = re.compile(rf"^on\s+({_COL})(?:\s*=\s*({_COL}))?$", re.IGNORECASE)
+_JOIN_KEY_RE = re.compile(rf"^({_COL})\s*=\s*({_COL})$", re.IGNORECASE)
 # `\union`/`\intersect`/`\except [all|distinct] <dataset>` — the modifier comes
 # first, and absent means SQL's default (`distinct`): rows are deduplicated.
-_SET_OP_RE = re.compile(rf"^(?:(all|distinct)\s+)?({_IDENT})$", re.IGNORECASE)
+_SET_OP_RE = re.compile(rf"^(?:(all|distinct)\s+)?({RELATION_NAME})$", re.IGNORECASE)
 _CMD_RE = re.compile(r"^\\([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$")
 # `\case <alias> = when …` — the tail is scanned for when/then/else segments.
 _CASE_HEAD_RE = re.compile(rf"^({_IDENT})\s*=\s*(.*)$")
@@ -166,6 +168,7 @@ TX_COMMANDS: dict[str, str] = {
 TX_BARE = frozenset({"begin", "commit"})
 
 _PAREN_SPLIT_RE = re.compile(r"[,\s]+")
+_GROUP_COLUMN_RE = re.compile(rf"{_COL}(?=[,\s]|$)|[^,\s]+")
 
 # At CPython's minimum configurable integer-string limit (640 digits).
 MAX_NUMERIC_CHARS = 640
@@ -327,6 +330,33 @@ def split_logic(text: str, keyword: str) -> list[str]:
         last = pos + len(keyword)
     pieces.append(text[last:])
     return pieces
+def _join_on(text: str) -> tuple[tuple[str, str], ...] | None:
+    """Read the entire ON tail; compound joins require explicit equalities."""
+    single = _JOIN_ON_RE.fullmatch(text)
+    if single is not None:
+        return ((single.group(1), single.group(2) or single.group(1)),)
+    head = re.match(r"^on\s+", text, re.IGNORECASE)
+    if head is None:
+        return None
+    tail = text[head.end() :]
+    pairs: list[tuple[str, str]] = []
+    last = 0
+    # Only standalone joining words split keys: columns such as a.and retain
+    # the same identifier grammar as single-key joins.
+    positions = [
+        pos for pos in keyword_positions(tail, "and")
+        if pos > 0 and tail[pos - 1].isspace()
+        and pos + 3 < len(tail) and tail[pos + 3].isspace()
+    ]
+    for end in [*positions, len(tail)]:
+        match = _JOIN_KEY_RE.fullmatch(tail[last:end].strip())
+        if match is None:
+            return None
+        pairs.append((match.group(1), match.group(2)))
+        last = end + 3
+    return tuple(pairs)
+
+
 
 
 def where_head(text: str) -> tuple[str, str, str] | None:
@@ -395,7 +425,9 @@ def parse_expression(
             tokens.append((text[pos:end], pos, end))
             pos = end
             continue
-        match = (_STRING_RE if text[pos] in "\"'" else _EXPRESSION_TOKEN_RE).match(text, pos)
+        match = _EXPRESSION_TOKEN_RE.match(text, pos)
+        if match is None and text[pos] in "\"'":
+            match = _STRING_RE.match(text, pos)
         if match is None:
             raise ValueError(f'cannot parse expression near "{text[pos:pos + 32]}"')
         tokens.append((match.group(), pos, match.end()))
@@ -802,7 +834,7 @@ def parse_source(text: str) -> tuple[str, str | None, str | None] | None:
             return None
         body, rest = paren[0], paren[1]
     else:
-        m = re.match(rf"^({_IDENT})", rest)
+        m = re.match(rf"^({RELATION_NAME})(?=\s|$)", rest)
         if m is None:
             return None
         dataset, rest = m.group(1), rest[m.end() :].strip()
@@ -1374,7 +1406,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             ast.errors.extend(body_ast.errors)
             body_ast.errors = []
             ast.with_.append(WithClause(line=line, name=name, body=body_ast))
-            if opts.schema.tables and name not in opts.visible_ctes and opts.schema.table_by_name(name):
+            if name not in opts.visible_ctes and any(table.name == name for table in opts.schema.tables):
                 # The CTE name shadows nothing, that's fine; only a dataset
                 # collision is worth flagging (the dataset becomes unreachable).
                 err(f'CTE name "{name}" shadows dataset "{name}"')
@@ -1468,8 +1500,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     continue
                 absorb(ast, fn_body)
                 fn_left = fn_right = ""
+                fn_keys: tuple[tuple[str, str], ...] = ()
                 if on_text:
-                    fn_on = _JOIN_ON_RE.match(on_text)
+                    fn_on = _join_on(on_text)
                     if fn_on is None:
                         err(
                             "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
@@ -1478,8 +1511,12 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         )
                         i += 1
                         continue
-                    fn_left = fn_on.group(1)
-                    fn_right = fn_on.group(2) or fn_on.group(1)
+                    if lateral and len(fn_on) > 1:
+                        err("compound ON keys are not supported for lateral joins")
+                        i += 1
+                        continue
+                    fn_left, fn_right = fn_on[0]
+                    fn_keys = fn_on[1:]
                 elif not lateral:
                     err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
                     i += 1
@@ -1493,6 +1530,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         right=fn_right,
                         lateral=lateral,
                         body=fn_body,
+                        keys=fn_keys,
                     )
                 )
                 i += 1
@@ -1536,8 +1574,9 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         i += 1
                         continue
             left_ref = right_ref = ""
+            join_keys: tuple[tuple[str, str], ...] = ()
             if on_text:
-                on_match = _JOIN_ON_RE.match(on_text)
+                on_match = _join_on(on_text)
                 if on_match is None:
                     err(
                         "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
@@ -1546,8 +1585,12 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     )
                     i += 1
                     continue
-                left_ref = on_match.group(1)
-                right_ref = on_match.group(2) or on_match.group(1)
+                if lateral and len(on_match) > 1:
+                    err("compound ON keys are not supported for lateral joins")
+                    i += 1
+                    continue
+                left_ref, right_ref = on_match[0]
+                join_keys = on_match[1:]
             elif not lateral:
                 err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
                 i += 1
@@ -1561,6 +1604,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     right=right_ref,
                     lateral=lateral,
                     body=body,
+                    keys=join_keys,
                 )
             )
             # Like `\from`: only complain once the schema has loaded.
@@ -1784,7 +1828,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             continue
 
         if cmd == "group":
-            parts = [p for p in _PAREN_SPLIT_RE.split(rest) if p]
+            parts = _GROUP_COLUMN_RE.findall(rest)
             if not parts:
                 err("\\group expects a column")
                 i += 1
@@ -1931,7 +1975,7 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
         def check(ref_line: int, ref: str) -> None:
             if ref_line == opts.typing_line or "." not in ref:
                 return
-            prefix = ref[: ref.index(".")]
+            prefix = ref.rpartition(".")[0]
             if prefix not in known_idents:
                 listed = ", ".join(open_idents) or "(no \\from)"
                 ast.errors.append(
@@ -1988,10 +2032,10 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
         sofar: list[str] = [ast.from_.alias or ast.from_.table] if ast.from_ else []
         for j in ast.joins:
             open_here = [*sofar, j.alias or j.dataset]
-            for side in (j.left, j.right):
+            for side in (ref for pair in ((j.left, j.right), *j.keys) for ref in pair):
                 if "." not in side:
                     continue
-                prefix = side[: side.index(".")]
+                prefix = side.rpartition(".")[0]
                 if j.line != opts.typing_line and prefix not in open_here:
                     listed = ", ".join(open_here) or "(no \\from)"
                     ast.errors.append(
@@ -2106,7 +2150,7 @@ def payload_from_ast(ast: QueryAST) -> dict:
     `\\limit` maps to `limit`. `\\union`/`\\intersect`/`\\except` pass through as
     `setOps` in document order (always a list, possibly empty) with SQL's
     deduplicating default baked in (`distinct`). Column strings may be qualified
-    (`users.score`, `e.user_id` — identifiers, not necessarily dataset names) and reach the
+    (`users.score`, `etl.users.score`, `e.user_id` — full table identifiers) and reach the
     engine untouched. Table aliases ride along (`alias`, always present, `None`
     when unaliased). Aggregate select items carry the derived auto-alias
     (`auto_alias`) when the user gave none — the engine re-derives the same
@@ -2132,6 +2176,7 @@ def payload_from_ast(ast: QueryAST) -> dict:
                 "right": j.right,
                 "lateral": j.lateral,
                 "body": payload_from_ast(j.body) if j.body else None,
+                **({"keys": [list(pair) for pair in j.keys]} if j.keys else {}),
             }
             for j in ast.joins
         ],

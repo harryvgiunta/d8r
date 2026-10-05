@@ -308,6 +308,9 @@ def test_legacy_ai_settings_fill_limits_without_rewriting(sources, tmp_path):
     assert session.ai_config.max_tool_calls == 16
     assert session.ai_config.sample_rows == 5
     assert session.ai_config.max_attempts == 2
+    assert not session.ai_allow_sample_data
+    assert session.ai_allow_schema_refreshes
+    assert not session.ai_auto_accept
     assert path.read_bytes() == contents
 
 
@@ -319,6 +322,8 @@ def test_legacy_ai_settings_fill_limits_without_rewriting(sources, tmp_path):
     b'{"ai":{"max_tool_rounds":0}}',
     b'{"ai":{"max_tool_calls":17}}',
     b'{"ai":{"sample_rows":101}}',
+    b'{"ai_allow_sample_data":"false"}',
+    b'{"ai_allow_schema_refreshes":1}',
     b'{"panes":{"secret-content":false}}',
     b'{"dialect":"secret-value"}',
     b'{"source":null}',

@@ -5,8 +5,8 @@ signature: the body is an ordinary query whose `@params` are filled with the
 arguments of each call (the engine sees literals; ibis never learns a function
 exists). The explorer occupies the workspace's left slot; the form occupies
 the same middle slot as the query editor, with the shared AI panel on the right.
-The form has a name, description, parameter signature, body, and arguments for a
-trial call. `Run preview` saves, then calls it through the same path a
+The form lists name, description, parameter signature, and trial-call arguments,
+then the body. `Run preview` saves, then calls it through the same path a
 document's `\\from name(args)` takes, so the grid shows what the editor gets.
 
 Definitions are saved locally through `Session` and restored on the next launch.
@@ -130,7 +130,7 @@ class FnEditor(Vertical):
         with VerticalScroll(id="fn-editor"):
             yield Select(
                 self.session.source_options(),
-                value=self.source_id, allow_blank=False, id="fn-source",
+                value=self.source_id, allow_blank=False, id="fn-source", compact=True,
             )
             yield Button("Reconnect target", id="fn-reconnect", disabled=self.session.source_connected(self.source_id), compact=True)
             with Horizontal(classes="fn-field"):
@@ -142,15 +142,15 @@ class FnEditor(Vertical):
             with Horizontal(classes="fn-field"):
                 yield Static("Parameters")
                 yield Input(self._initial_fields["parameters"], placeholder="min_amount (names in order, no @)", id="fn-params")
+            with Horizontal(classes="fn-field"):
+                yield Static("Preview values")
+                yield Input(self._initial_fields["arguments"], placeholder='10 (quote text; values in parameter order)', id="fn-args")
             with FnBodyPane(id="fn-body-pane"):
                 yield TextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
                 yield CommandPalette(
                     self.session, source_id=self.source_id, workspace_actions=False,
                     parameters=self._parameter_names, id="fn-palette", markup=False,
                 )
-            with Horizontal(classes="fn-field"):
-                yield Static("Preview values")
-                yield Input(self._initial_fields["arguments"], placeholder='10 (quote text; values in parameter order)', id="fn-args")
         with Horizontal(id="fn-buttons"):
             yield Button("Save", id="fn-save", variant="primary", compact=True)
             yield Button("Run preview", id="fn-preview", compact=True)
@@ -261,6 +261,24 @@ class FnEditor(Vertical):
         self.preview_grid.clear(columns=True)
         self._status(f"target · {self.session.sources[self.source_id].display}")
         self._queue_draft_save()
+
+    def retarget(self, source) -> None:
+        """Adopt a reconnected source's registry id when the draft's target died.
+
+        A disconnected target is registered under its identity key; the live
+        source that replaces it gets its own id, and the old key is dropped.
+        Nothing else re-reads `source_id`, so a Save or preview after
+        reconnecting would name a key no longer in the registry.
+        """
+        if source.id == self.source_id or self.source_id in self.session.sources:
+            return
+        if self.session.source_key(source.id) != self.session.source_key(self.source_id):
+            return
+        select = self.query_one("#fn-source", Select)
+        with self.prevent(Select.Changed):
+            select.set_options(self.session.source_options())
+            select.value = source.id
+        self._select_target(source.id)
 
     def _source_connected(self, source) -> None:
         if source is None:

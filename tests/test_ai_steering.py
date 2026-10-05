@@ -182,6 +182,7 @@ def test_rapid_steering_waits_for_read_and_preserves_committed_save_without_part
         monkeypatch.setattr(context_module, "execute", delayed_execute)
         _install(monkeypatch, provider)
         session = _session(tmp_path)
+        session.update_settings(ai_allow_sample_data=True)
         app = D8RApp(session)
         async with app.run_test(size=(150, 54)) as pilot:
             app.action_ai()
@@ -312,6 +313,7 @@ def test_cancel_or_shutdown_discards_queued_steering_without_losing_its_draft(tm
         monkeypatch.setattr(context_module, "execute", delayed_execute)
         _install(monkeypatch, provider)
         app = D8RApp(_session(tmp_path))
+        app.session.update_settings(ai_allow_sample_data=True)
         chat = None
         try:
             async with app.run_test(size=(140, 48)) as pilot:

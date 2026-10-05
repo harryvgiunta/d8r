@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from copy import deepcopy
 
 import pytest
-from textual.widgets import DataTable, Input, Select, Static, TextArea
+from textual.widgets import DataTable, Input, OptionList, Select, Static, TabbedContent, TextArea
 
 from d8r.tui.add_source import AddSourceModal
 from d8r.tui.app import D8RApp
@@ -14,7 +15,7 @@ from d8r.tui.session import Session
 
 
 def _forbidden(*args, **kwargs):
-    raise AssertionError("Restoring a workspace must not execute, connect, compile, or save a function")
+    raise AssertionError("Restoration must not execute, compile, save a function, or connect an unselected/incomplete target")
 
 
 def _snapshot(session, tmp_path):
@@ -22,6 +23,7 @@ def _snapshot(session, tmp_path):
     with sqlite3.connect(path) as connection:
         connection.execute("create table events (id integer)")
         connection.execute("insert into events values (123)")
+    connection.close()
     source = session.build_sqlite_source(str(path), "Original snapshot label")
     session.register(source, activate=False)
     return source, path
@@ -67,7 +69,86 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
             assert reopened.query_one("#history-table", DataTable).row_count == 1
             assert reopened.query_one("#results-table", DataTable).row_count == 0
             assert reopened.query_one("#sql-text", TextArea).text == ""
+            assert not isinstance(reopened.screen, AddSourceModal)
+            assert "connection details" in str(reopened.query_one("#status", Static).content)
             assert reopened._ai_target().identity == identity
+
+    asyncio.run(restore())
+
+
+def test_startup_reconnects_only_selected_snapshot_without_replaying_draft(tmp_path, monkeypatch):
+    data_dir = tmp_path / "state"
+    first = Session(data_dir=data_dir)
+    first.run("\\from events\n\\limit 1")
+    source, path = _snapshot(first, tmp_path)
+    first.remember_d1("a" * 32, "00000000-0000-0000-0000-000000000001", "Unselected", "saved-token")
+    first.set_active(source.id)
+    document = "\\from events\n\\select id"
+    first.save_workspace(document=document, cursor=[1, 8], source=first.source_key(), dialect="postgres")
+    connections = []
+    build = Session.build_sqlite_source
+
+    def record_connection(self, snapshot_path, display=""):
+        connections.append(snapshot_path)
+        return build(self, snapshot_path, display)
+
+    monkeypatch.setattr(Session, "build_sqlite_source", record_connection)
+    for name in ("build_live_source", "run", "compile", "save_fn"):
+        monkeypatch.setattr(Session, name, _forbidden)
+    reopened = D8RApp(Session(data_dir=data_dir))
+
+    async def restore():
+        async with reopened.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            await reopened.workers.wait_for_complete()
+            await pilot.pause()
+            assert connections == [str(path.resolve())]
+            assert reopened.session.source_connected()
+            assert reopened.session.source_key() == f"snapshot:{path.resolve()}"
+            assert reopened.session.dialect == "postgres"
+            assert reopened.query_one("#dialect-select", Select).value == "postgres"
+            assert reopened.editor.text == document
+            assert reopened.editor.cursor_location == (1, 8)
+            assert len(reopened.session.history) == 1
+            assert reopened.query_one("#history-table", DataTable).row_count == 1
+            assert reopened.query_one("#results-table", DataTable).row_count == 0
+            assert reopened.query_one("#sql-text", TextArea).text == ""
+            assert not isinstance(reopened.screen, AddSourceModal)
+            assert reopened.query_one("#schema-tree").root.children
+            reopened._restore_startup_view()
+            await pilot.pause()
+            assert connections == [str(path.resolve())]
+
+    asyncio.run(restore())
+
+
+def test_failed_startup_keeps_selected_snapshot_and_draft_disconnected(tmp_path, monkeypatch):
+    data_dir = tmp_path / "state"
+    first = Session(data_dir=data_dir)
+    source, path = _snapshot(first, tmp_path)
+    first.set_active(source.id)
+    document = "\\from events\n\\select id"
+    target = first.source_key()
+    first.save_workspace(document=document, source=target, dialect="postgres")
+    source.con.disconnect()
+    path.unlink()
+    for name in ("run", "compile", "save_fn", "build_live_source"):
+        monkeypatch.setattr(Session, name, _forbidden)
+    reopened = D8RApp(Session(data_dir=data_dir))
+
+    async def restore():
+        async with reopened.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            await reopened.workers.wait_for_complete()
+            await pilot.pause()
+            assert reopened.session.source_key() == target
+            assert not reopened.session.source_connected()
+            assert reopened.session.dialect == "postgres"
+            assert reopened.editor.text == document
+            assert "Could not connect" in str(reopened.query_one("#status", Static).content)
+            assert not isinstance(reopened.screen, AddSourceModal)
+            assert not reopened.session.history
+            assert reopened.query_one("#results-table", DataTable).row_count == 0
 
     asyncio.run(restore())
 
@@ -227,6 +308,57 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
     asyncio.run(workspace_then_new_draft())
 
 
+def test_function_preview_follows_a_reconnect_from_the_workspace(tmp_path):
+    """A reconnect retitles the draft's dead target key; preview must follow.
+
+    The draft names its disconnected target by identity key. Registering the
+    live source replaces that key, and a preview still naming the old one must
+    adopt the new id rather than crash on the missing key.
+    """
+    data_dir = tmp_path / "state"
+    first = Session(data_dir=data_dir)
+    source, path = _snapshot(first, tmp_path)
+    app = D8RApp(first)
+
+    async def edit_draft():
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            app._open_fn(focus="")
+            await pilot.pause()
+            screen = app.function_editor
+            screen.query_one("#fn-source", Select).value = source.id
+            await pilot.pause()
+            screen.query_one("#fn-name", Input).value = "draft_events"
+            screen.query_one("#fn-params", Input).value = "minimum"
+            screen.query_one("#fn-args", Input).value = "100"
+            screen.query_one("#fn-body", TextArea).load_text(
+                "\\from events\n\\where id > @minimum\n\\select id")
+            app.exit()
+
+    asyncio.run(edit_draft())
+    reopened = D8RApp(Session(data_dir=data_dir))
+
+    async def reconnect_and_preview():
+        async with reopened.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            screen = reopened.function_editor
+            key = screen.source_id
+            assert key.startswith("snapshot:") and not reopened.session.source_connected(key)
+            # The workspace header's reconnect path: register under the live
+            # id; the draft's key leaves the registry.
+            reopened._source_added(
+                reopened.session.build_sqlite_source(str(path), "Original snapshot label"),
+                activate=False)
+            await pilot.pause()
+            assert screen.source_id == "original-snapshot-label"
+            assert screen.query_one("#fn-source", Select).value == "original-snapshot-label"
+            screen.action_preview()
+            await pilot.pause()
+            assert reopened.query_one("#fn-grid", DataTable).row_count == 1
+            assert reopened.session.fns["draft_events"].params == ("minimum",)
+
+    asyncio.run(reconnect_and_preview())
+
 def test_autosave_failure_keeps_editor_available_and_retries_on_exit(tmp_path, monkeypatch):
     data_dir = tmp_path / "state"
     app = D8RApp(Session(data_dir=data_dir))
@@ -325,3 +457,95 @@ def test_returning_from_function_editor_respects_suppressed_completion(tmp_path,
             assert app.editor.cursor_location == (0, len(line))
 
     asyncio.run(scenario())
+
+
+def test_page_deletion_preserves_other_drafts_and_retries_failed_last_page_save(tmp_path, monkeypatch):
+    session = Session(data_dir=tmp_path)
+    app = D8RApp(session)
+    survivor_id = None
+    blank_id = None
+    history = None
+
+    async def scenario():
+        nonlocal survivor_id, blank_id, history
+        async with app.run_test(size=(150, 52)) as pilot:
+            await pilot.pause()
+            assert not session.load_chats()
+            app.action_run()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            history = list(session.history)
+            table = app.query_one("#results-table", DataTable)
+            result = [[table.get_cell_at((row, column)) for column in range(len(table.columns))]
+                      for row in range(table.row_count)]
+            first_page = app._document_identity
+            app.ai_panel.open()
+            app.ai_panel.query_one("#ai-input", TextArea).load_text("First page draft")
+            app._new_page()
+            first_chat = next(iter(session.load_chats()))
+            active_page = app._document_identity
+            document = "\\from users\n\\select name\n\\limit 3"
+            app.editor.load_text(document)
+            app.editor.move_cursor((1, 8))
+            app._flush_workspace()
+            assert set(session.load_chats()) == {first_chat}
+            app.ai_panel.open()
+            app.ai_panel.query_one("#ai-input", TextArea).load_text("Second page draft")
+            app.action_fn()
+            active_chat = next(chat_id for chat_id in session.load_chats() if chat_id != first_chat)
+            await pilot.pause()
+            assert set(session.load_chats()) == {first_chat, active_chat}
+            app.ai_panel.action_clear()
+            survivor_id = app.ai_panel.chat_id
+            app.ai_panel.query_one("#ai-input", TextArea).load_text("Keep this function conversation")
+            app.action_workspace()
+            await pilot.pause()
+            survivor = deepcopy(session.load_chat(survivor_id))
+            caret = app.editor.cursor_location
+            source = session.source_key()
+            for name in ("run", "compile", "save_fn", "build_live_source", "build_sqlite_source"):
+                monkeypatch.setattr(session, name, _forbidden)
+            monkeypatch.setattr(app, "reconnect_source", _forbidden)
+            app.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
+            listing = app.query_one("#pages-list", OptionList)
+            listing.highlighted = listing.get_option_index(first_page)
+            await pilot.pause()
+            await pilot.click("#page-delete")
+            await pilot.pause(0.4)
+            assert app._document_identity == active_page
+            assert app.editor.text == document and app.editor.cursor_location == caret
+            assert session.source_key() == source
+            assert set(session.load_chats()) == {active_chat, survivor_id}
+            assert session.load_chat(survivor_id) == survivor
+
+            def fail_save(document):
+                raise ValueError("Workspace is not writable.")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(session._workspace, "save", fail_save)
+                listing.highlighted = listing.get_option_index(active_page)
+                listing.focus()
+                await pilot.press("delete")
+                await pilot.pause(0.4)
+                blank_id = app._document_identity
+                assert blank_id not in (first_page, active_page)
+                assert app.editor.text == "" and app.editor.cursor_location == (0, 0)
+                assert session.source_key() == source
+                assert [page["id"] for page in session.workspace["pages"]] == [blank_id]
+                assert set(session.load_chats()) == {survivor_id}
+                assert session.load_chat(survivor_id) == survivor
+                assert "not writable" in str(app.query_one("#status", Static).content)
+            app.action_fn()
+            app.action_workspace()
+            assert set(session.load_chats()) == {survivor_id}
+            assert session.history == history
+            assert [[table.get_cell_at((row, column)) for column in range(len(table.columns))]
+                    for row in range(table.row_count)] == result
+            app.exit()
+
+    asyncio.run(scenario())
+    restored = Session(data_dir=tmp_path)
+    assert restored.workspace["document_id"] == blank_id
+    assert [page["id"] for page in restored.workspace["pages"]] == [blank_id]
+    assert set(restored.load_chats()) == {survivor_id}
+    assert restored.history == history

@@ -41,7 +41,7 @@ from d8r.query import ColumnDef
 
 from .add_source import AddSourceModal
 from .connection import CONNECTION_TIMEOUT, ConnectionProgress, build_saved_source, saved_source_label
-from .ai import AIChats, AIPanel, AITarget, AgentsPane, AgentsScreen
+from .ai import AIChats, AIPanel, AITarget, AgentsPane, DeleteOptionList
 from .palette import CommandPalette, EditorPane
 from .results import ResultsTable
 from .session import RunOutcome, Session, default_dialect
@@ -115,20 +115,23 @@ class D8RApp(App):
     TITLE = "D8R"
     SUB_TITLE = "data IDE"
 
-    # The panes `\results`, `\sql`, `\history` and `\schema` show and hide, and
-    # the names the Settings menu lists them under. Results, SQL and History are
-    # tabs of the result view; the schema explorer is its own container.
+    # Settings lists result tabs, the left explorer, its agents tab and the
+    # right assistant. Explorer tabs stay mounted across editor modes.
     TAB_PANES: dict[str, str] = {
         "results": "tab-results",
         "sql": "tab-sql",
         "history": "tab-history",
     }
-    PANES: dict[str, str] = {**TAB_PANES, "schema": "#schema-pane"}
+    PANES: dict[str, str] = {
+        **TAB_PANES, "schema": "#schema-pane", "agents": "tab-agents", "ai": "#workspace-ai",
+    }
     PANE_TITLES: dict[str, str] = {
         "results": "Results pane",
         "sql": "SQL pane",
         "history": "History pane",
         "schema": "Schema pane",
+        "agents": "Agents tab",
+        "ai": "AI pane (right)",
     }
 
     # Priority bindings so they win over the focused editor's own keys — the
@@ -171,6 +174,7 @@ class D8RApp(App):
         self._value_reads: dict[tuple[int, str, str, int], asyncio.Task] = {}
         self._connection_progress: ConnectionProgress | None = None
         self._connection_generation = 0
+        self._startup_connection_started = False
         self._schema_workers: dict[str, tuple[DataSource, Worker]] = {}
         self._schema_errors: dict[str, str] = {}
 
@@ -200,22 +204,28 @@ class D8RApp(App):
             yield Button("Agents", id="open-agents", compact=True)
         with Horizontal(id="body"):
             with Vertical(id="explorer-slot"):
-                with Vertical(id="schema-pane"):
-                    with TabbedContent(initial="tab-" + self.session.workspace["explorer_tab"], id="explorer-tabs"):
-                        with TabPane("Schema", id="tab-schema"):
+                initial_tab = self.session.workspace["explorer_tab"]
+                if initial_tab == "agents" and not self.session.pane_visibility["agents"]:
+                    initial_tab = "schema"
+                with TabbedContent(initial="tab-" + initial_tab, id="explorer-tabs"):
+                    with TabPane("Schema", id="tab-schema"):
+                        with Vertical(id="schema-pane"):
                             yield Static("Expand column: values · Enter: insert", id="schema-hint", markup=False)
                             with Horizontal(id="schema-index"):
                                 yield LoadingIndicator(id="schema-index-dots")
                                 yield Static("", id="schema-index-label", markup=False)
                             yield Tree(Text("datasets"), id="schema-tree")
-                        with TabPane("Pages", id="tab-pages"):
-                            with Horizontal(id="page-actions"):
-                                yield Button("New", id="page-new", compact=True)
-                                yield Button("Duplicate", id="page-duplicate", compact=True)
-                            yield Input(placeholder="Page name · Enter to rename", id="page-title")
-                            yield OptionList(id="pages-list", markup=False)
-                yield FnExplorer(id="fn-list-pane")
-                yield AgentsPane(id="workspace-agents")
+                        yield FnExplorer(id="fn-list-pane")
+                    with TabPane("Pages", id="tab-pages"):
+                        with Horizontal(id="page-actions"):
+                            yield Button("New", id="page-new", compact=True)
+                            yield Button("Duplicate", id="page-duplicate", compact=True)
+                            yield Button("Delete", id="page-delete", compact=True, disabled=True)
+                        yield Input(placeholder="Page name · Enter to rename", id="page-title")
+                        yield DeleteOptionList(id="pages-list", markup=False)
+                        yield Static("↑/↓ select · Enter open · Delete remove", id="pages-hint", markup=False)
+                    with TabPane("Agents", id="tab-agents"):
+                        yield AgentsPane(id="workspace-agents")
             yield PaneSplitter("#explorer-slot", "width", "explorer", min_size=16,
                                min_remaining=30, id="explorer-splitter")
             with Vertical(id="work-bench"):
@@ -284,10 +294,27 @@ class D8RApp(App):
         self._queue_workspace_save()
         self._flush_workspace()
         self._refresh_pages()
-        if self.session.workspace.get("active_view") == "function":
-            self.call_after_refresh(self.action_fn)
+        self.call_after_refresh(self._restore_startup_view)
         for source in self.session.sources.values():
             self._start_schema_index(source)
+
+    def _restore_startup_view(self) -> None:
+        """Restore the visible target before reconnecting it once, without running."""
+        if self._closing or self._startup_connection_started:
+            return
+        self._startup_connection_started = True
+        if self.session.workspace.get("active_view") == "function":
+            self._open_fn(reveal_list=False)
+        source_id = self.session.active_id
+        if self.session.source_connected(source_id):
+            return
+
+        def connected(source: DataSource | None) -> None:
+            self._source_added(source, activate=False)
+            if source is not None:
+                self._set_status(f"{source.id} connected · nothing executed")
+
+        self.reconnect_source(source_id, connected, prompt_for_credentials=False)
 
     def on_unmount(self) -> None:
         self._closing = True
@@ -363,12 +390,20 @@ class D8RApp(App):
             return
         self._page_rows = state
         listing = self.query_one("#pages-list", OptionList)
+        highlighted = listing.highlighted
+        highlighted_id = (listing.get_option_at_index(highlighted).id
+                          if highlighted is not None and listing.option_count else None)
         listing.clear_options()
         for page in reversed(pages):
             title = page["title"] or next((line.strip() for line in page["document"].splitlines()
                                             if line.strip()), "Untitled query")
             marker = "• " if page["id"] == self._document_identity else ""
             listing.add_option(Option(Text(f"{marker}{title[:80]}\n  {page['source']}"), id=page["id"]))
+        if highlighted_id is not None and any(page["id"] == highlighted_id for page in pages):
+            listing.highlighted = listing.get_option_index(highlighted_id)
+        elif pages:
+            listing.highlighted = min(highlighted or 0, len(pages) - 1)
+        self.query_one("#page-delete", Button).disabled = listing.highlighted is None
         active = next((page for page in pages if page["id"] == self._document_identity), None)
         title_input = self.query_one("#page-title", Input)
         if not title_input.has_focus:
@@ -401,6 +436,55 @@ class D8RApp(App):
     def _page_selected(self, event: OptionList.OptionSelected) -> None:
         self.open_page(str(event.option_id or ""))
 
+
+    @on(OptionList.OptionHighlighted, "#pages-list")
+    def _page_highlighted(self) -> None:
+        self.query_one("#page-delete", Button).disabled = self.query_one("#pages-list", OptionList).highlighted is None
+
+    @on(Button.Pressed, "#page-delete")
+    def _delete_page_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.query_one("#pages-list", DeleteOptionList).action_delete_selected()
+
+    @on(DeleteOptionList.DeleteRequested, "#pages-list")
+    def _delete_page_requested(self, event: DeleteOptionList.DeleteRequested) -> None:
+        event.stop()
+        self.delete_page(event.option_id)
+
+    def delete_page(self, page_id: str) -> None:
+        pages = self.session.workspace["pages"]
+        index = next((index for index, page in enumerate(pages) if page["id"] == page_id), None)
+        if index is None:
+            return
+        active = page_id == self._document_identity
+        if active and self.session.busy != "AI context lookup running" and self.refuse_busy("Delete query page"):
+            return
+        self._flush_workspace()
+        pages = self.session.workspace["pages"]
+        remaining = [page for page in pages if page["id"] != page_id]
+        for panel in self.ai_chats.panels():
+            panel._flush_chat()
+        chat_ids = [chat.id for chat in self.ai_chats.chats.values() if chat.page_id == page_id]
+        self.ai_chats.discard(chat_ids)
+        if active:
+            replacement = remaining[max(0, index - 1)] if remaining else {
+                "id": str(uuid4()), "title": "", "document": "", "cursor": [0, 0],
+                "source": self.session.source_key(), "dialect": self.session.dialect,
+            }
+            self._restore_page(replacement)
+        self._capture_workspace()
+        removed_chats = set(chat_ids)
+        saved = self.save_workspace(
+            pages=remaining,
+            chats={key: chat for key, chat in self.session.workspace["chats"].items() if key not in removed_chats},
+            **self._workspace_snapshot,
+        )
+        self._refresh_pages()
+        if saved:
+            self._set_status("Query page deleted · nothing executed")
+        else:
+            self._set_status("Query page removed from this session, but deletion was not saved. " + self._autosave_error)
+
     def open_page(self, page_id: str) -> None:
         if page_id == self._document_identity or self.refuse_busy("Open query page"):
             return
@@ -408,6 +492,14 @@ class D8RApp(App):
         page = next((item for item in self.session.workspace["pages"] if item["id"] == page_id), None)
         if page is None:
             return
+        self._restore_page(page)
+        self.editor.focus()
+        self._flush_workspace()
+        if not self._autosave_error:
+            self._set_status("Query page restored · nothing executed")
+
+    def _restore_page(self, page: dict) -> None:
+        """Swap the stable draft and its offline target without running or connecting."""
         self._cancel_connection()
         self.session.restore_source(page["source"], page["dialect"])
         self._document_identity = page["id"]
@@ -421,14 +513,11 @@ class D8RApp(App):
         self._refresh_tree()
         self.palette.close()
         self.ai_panel.target_changed()
-        self.editor.focus()
-        self._flush_workspace()
-        self._set_status("Query page restored · nothing executed")
 
     @on(TabbedContent.TabActivated, "#explorer-tabs")
     def _explorer_tab_changed(self, event: TabbedContent.TabActivated) -> None:
         if self._workspace_ready:
-            self.save_workspace(explorer_tab="pages" if event.pane.id == "tab-pages" else "schema")
+            self.save_workspace(explorer_tab=event.pane.id.removeprefix("tab-"))
 
     def action_toggle_pages(self) -> None:
         """Reveal Pages from another tab; toggle the explorer if already selected."""
@@ -488,6 +577,32 @@ class D8RApp(App):
             self.session.save_fn(fn.name, ", ".join(fn.params), proposal.body, fn.doc)
             self.refresh_functions()
             self._set_status(f'Function "{fn.name}" saved locally · query unchanged and not executed')
+            return
+        if proposal.queries:
+            if not self.pane_visible("schema") and not self.update_settings(panes={"schema": True}):
+                raise ValueError("Pages could not be shown; resolve the settings error and retry.")
+            pages = [page for page in self.session.workspace["pages"]
+                     if page["id"] != self._document_identity]
+            # Pages displays newest first. Keep the requested order and the
+            # active page's stable identity; unrelated drafts are untouched.
+            for index in range(len(proposal.queries) - 1, -1, -1):
+                query = proposal.queries[index]
+                pages.append({
+                    "id": self._document_identity if index == 0 else str(uuid4()),
+                    "title": query.title, "document": query.body, "cursor": [0, 0],
+                    "source": self.session.source_key(), "dialect": self.session.dialect,
+                })
+            self.editor.load_text(proposal.queries[0].body)
+            self.editor.move_cursor((0, 0))
+            self.palette.close()
+            self._capture_workspace()
+            saved = self.save_workspace(pages=pages, explorer_tab="pages", **self._workspace_snapshot)
+            if not saved:
+                self._refresh_pages()
+            self.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
+            self.set_pane("schema", True)
+            if saved:
+                self._set_status("AI query drafts applied · nothing executed")
             return
         self.editor.load_text(proposal.body)
         self.palette.close()
@@ -675,18 +790,27 @@ class D8RApp(App):
     # -- panes --------------------------------------------------------------
 
     def pane_visible(self, name: str) -> bool:
-        """True while that pane (`results`, `sql`, `history`, `schema`) is shown."""
+        """Read tab visibility, the explorer preference or the live AI panel."""
         if name == "schema":
-            return self.query_one(self.PANES[name]).display
-        return self.query_one("#result-tabs", TabbedContent).get_tab(self.PANES[name]).display
+            return self.session.pane_visibility["schema"]
+        if name == "ai":
+            return self.ai_panel.display
+        tabs = self.query_one("#explorer-tabs" if name == "agents" else "#result-tabs", TabbedContent)
+        return tabs.get_tab(self.PANES[name]).display
 
     def set_pane(self, name: str, visible: bool) -> None:
         """Show or hide one pane; hiding the active tab moves to a visible one."""
         if name == "schema":
-            self.query_one(self.PANES[name]).display = visible
             self._sync_layout()
             return
-        tabs = self.query_one("#result-tabs", TabbedContent)
+        if name == "ai":
+            if visible:
+                self.ai_panel.open()
+            else:
+                self.ai_panel.action_close()
+            self.call_after_refresh(self._refresh_splitters)
+            return
+        tabs = self.query_one("#explorer-tabs" if name == "agents" else "#result-tabs", TabbedContent)
         pane_id = self.PANES[name]
         if visible:
             tabs.show_tab(pane_id)
@@ -706,9 +830,9 @@ class D8RApp(App):
 
     def _sync_layout(self) -> None:
         """Swap slot contents, never the slots or their user-selected dimensions."""
-        self.query_one("#schema-pane").display = not self.function_mode and self.session.pane_visibility.get("schema", True)
+        self.query_one("#schema-pane").display = not self.function_mode and self.session.pane_visibility["schema"]
         self.query_one("#fn-list-pane").display = self.function_mode
-        self.query_one("#explorer-slot").display = self.function_mode or self.query_one("#schema-pane").display
+        self.query_one("#explorer-slot").display = self.function_mode or self.session.pane_visibility["schema"]
         self.query_one("#editor-pane").display = not self.function_mode
         self.function_editor.display = self.function_mode
         self.query_one("#result-tabs").display = not self.function_mode and any(self.pane_visible(name) for name in self.TAB_PANES)
@@ -905,8 +1029,9 @@ class D8RApp(App):
 
     def reconnect_source(
         self, source_id: str, connected: Callable[[DataSource | None], None],
+        *, prompt_for_credentials: bool = True,
     ) -> None:
-        """Reconnect only after an explicit action, never while restoring a draft."""
+        """Reconnect a saved target with bounded progress and stale-target guards."""
         self._sync_source_select()
         self._cancel_connection()
         profile = self.session.saved_source_profile(source_id)
@@ -917,17 +1042,20 @@ class D8RApp(App):
         missing_credentials = profile is not None and profile.get("kind") != "postgres-live" and not profile.get("api_token")
         if (profile is None and snapshot_path is None) or missing_credentials:
             self._set_status("This source is disconnected. Add its connection details to reconnect.")
-            self.push_screen(AddSourceModal(self.session, profile=profile, snapshot_path=snapshot_path), connected)
+            if prompt_for_credentials:
+                self.push_screen(AddSourceModal(self.session, profile=profile, snapshot_path=snapshot_path), connected)
             return
         profile = dict(profile) if profile is not None else None
         generation = self._connection_generation
         source = self.session.source
+        target_source = self.session.sources.get(source_id)
         screen = self.screen
         function_target = self.function_editor.source_id if self.function_mode else None
 
         def valid() -> bool:
             return (not self._closing and generation == self._connection_generation
                     and self.session.source is source and screen.is_mounted
+                    and self.session.sources.get(source_id) is target_source
                     and (self.function_editor.source_id if self.function_mode else None) == function_target)
 
         def completed(built: DataSource) -> None:
@@ -1017,13 +1145,19 @@ class D8RApp(App):
 
     @on(Button.Pressed, "#open-agents")
     def action_agents(self) -> None:
-        """Browse all chats, including hidden, detached, failed and unread agents."""
-        if isinstance(self.screen, AgentsScreen):
-            self.screen.action_close()
+        """Reveal and focus the left tab without changing the active editor."""
+        if self._modal_open():
             return
         for panel in self.ai_chats.panels():
             panel._flush_chat()
-        self.push_screen(AgentsScreen(), self.open_ai_chat)
+        panes = {"schema": True, "agents": True}
+        if any(not self.session.pane_visibility[name] for name in panes):
+            if not self.update_settings(panes=panes):
+                return
+        self.palette.close()
+        self.set_pane("schema", True)
+        self.set_pane("agents", True)
+        self.query_one("#agents-list", OptionList).focus()
 
     def open_ai_chat(self, chat_id: str | None) -> None:
         chat = self.ai_chats.chats.get(chat_id)
@@ -1036,13 +1170,14 @@ class D8RApp(App):
         if self._modal_open():
             return
         if function_mode:
-            self.action_fn()
+            self._open_fn(reveal_list=False)
         else:
             self.action_workspace()
         self.ai_panel.select_chat(chat.id)
         self.call_after_refresh(self._refresh_splitters)
 
-    def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "", *, restore_draft: bool = True) -> None:
+    def _open_fn(self, focus: str = "", new_name: str = "", new_body: str = "", *,
+                 restore_draft: bool = True, reveal_list: bool = True) -> None:
         """Replace explorer/editor contents while keeping the workspace mounted."""
         if self._modal_open() or self.refuse_busy("Function library"):
             return
@@ -1057,6 +1192,8 @@ class D8RApp(App):
         self.function_editor._draw_list()
         self.function_mode = True
         self._sync_layout()
+        if reveal_list:
+            self.query_one("#explorer-tabs", TabbedContent).active = "tab-schema"
         self.ai_panel.target_changed()
         self.save_workspace(active_view="function")
         self.query_one("#keymap", Static).update(FUNCTION_HINT)
@@ -1093,6 +1230,7 @@ class D8RApp(App):
         if source is None:
             return
         self.session.register(source, activate=False)
+        self.function_editor.retarget(source)
         with self.prevent(Select.Changed):
             self.query_one("#source-select", Select).set_options(self._source_options())
         self._sync_source_select()
@@ -1293,17 +1431,31 @@ class D8RApp(App):
 
     @on(Tree.NodeSelected, "#schema-tree")
     def _column_selected(self, event: Tree.NodeSelected) -> None:
-        """Selecting a column puts its name into the document."""
+        """Insert a selected column using its table's current document alias."""
         data = event.node.data if isinstance(event.node.data, dict) else {}
-        if data.get("kind") == "dataset" or event.node.is_root:
+        if data.get("kind") == "dataset":
+            self.palette.sync(respect_dismissal=True)
+            view = self.palette.view
+            row, _ = self.editor.cursor_location
+            head = self.editor.document[row].lstrip().partition(" ")[0]
+            if view is not None and view.phase == "argument" and head.lower() in {"\\from", "\\open", "\\join"}:
+                index = next((index for index, entry in enumerate(view.entries) if entry.label == data["name"]), None)
+                if index is not None and self.palette.accept(index):
+                    self.editor.focus()
+                    self._set_status(f"inserted {data['name']} with alias")
+                    return
+            event.node.toggle()
+            return
+        if event.node.is_root:
             event.node.toggle()
             return
         if data.get("kind") != "column":
             return
-        self.editor.insert(data["name"])
+        reference = self.session.column_reference(self.editor.text, data["dataset"], data["name"])
+        self.editor.insert(reference)
         self.editor.focus()
         self.palette.sync()
-        self._set_status(f"inserted {data['name']}")
+        self._set_status(f"inserted {reference}")
 
     @on(DataTable.RowSelected, "#history-table")
     def _history_selected(self, event: DataTable.RowSelected) -> None:
@@ -1359,10 +1511,11 @@ class D8RApp(App):
 
 
 def main() -> None:
-    """`python -m d8r` — play the boot splash, then run the app."""
-    if splash.should_play():
+    """`python -m d8r` — optionally show the entry screen, then run one session."""
+    session = Session()
+    if session.entry_screen and splash.should_play():
         splash.play()
-    D8RApp().run()
+    D8RApp(session).run()
 
 
 __all__ = ["D8RApp", "main"]

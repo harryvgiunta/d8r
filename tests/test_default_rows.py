@@ -64,7 +64,7 @@ def test_default_never_truncates_temp_materialization_or_its_compile():
 
 def test_ai_samples_keep_their_own_limit(sources):
     session = Session(sources)
-    session.update_settings(default_rows=1, ai=AIConfig(sample_rows=80))
+    session.update_settings(default_rows=1, ai=AIConfig(sample_rows=80), ai_allow_sample_data=True)
     context = AIContext(session, session.active_id, DOCUMENT)
     sample = json.loads(asyncio.run(context.call_tool("sample_rows", {"table": "events"})))
     assert "error" not in sample

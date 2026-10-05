@@ -12,6 +12,7 @@ from d8r.tui.session import Session
 
 def test_configured_sample_default_and_requested_limits_return_bounded_rows(sources):
     session = Session(sources)
+    session.update_settings(ai_allow_sample_data=True)
     session.ai_config = AIConfig(sample_rows=12)
     context = AIContext(session, "demo", "")
 
@@ -28,6 +29,7 @@ def test_configured_sample_default_and_requested_limits_return_bounded_rows(sour
 
 def test_sample_limits_reject_invalid_requests_before_reading(sources, monkeypatch):
     session = Session(sources)
+    session.update_settings(ai_allow_sample_data=True)
     session.ai_config = AIConfig(sample_rows=12)
     context = AIContext(session, "demo", "")
     reads = []
@@ -50,6 +52,7 @@ def test_sample_limits_reject_invalid_requests_before_reading(sources, monkeypat
 
 def test_simultaneous_contexts_freeze_independent_sample_caps(sources, monkeypatch):
     session = Session(sources)
+    session.update_settings(ai_allow_sample_data=True)
     session.ai_config = AIConfig(sample_rows=3)
     small = AIContext(session, "demo", "")
     session.ai_config = AIConfig(sample_rows=11)
@@ -79,3 +82,65 @@ def test_simultaneous_contexts_freeze_independent_sample_caps(sources, monkeypat
     for context, cap in ((small, 3), (large, 11)):
         tool = next(tool["function"] for tool in context.tools if tool["function"]["name"] == "sample_rows")
         assert tool["parameters"]["properties"]["limit"]["maximum"] == cap
+
+
+def test_read_permissions_block_tools_and_revoke_existing_context(sources, monkeypatch):
+    session = Session(sources)
+    default = AIContext(session, "demo", "")
+    assert "sample_rows" not in {tool["function"]["name"] for tool in default.tools}
+
+    async def scenario():
+        assert "error" in json.loads(await default.call_tool("sample_rows", {"table": "events"}))
+        schema = json.loads(await default.call_tool("schema", {"table": "events"}))
+        assert schema["tables"][0]["name"] == "events"
+        session.update_settings(ai_allow_sample_data=True)
+        allowed = AIContext(session, "demo", "")
+        sample = json.loads(await allowed.call_tool("sample_rows", {"table": "events", "limit": 1}))
+        assert len(sample["rows"]) == 1
+
+        session.update_settings(ai_allow_sample_data=False, ai_allow_schema_refreshes=False)
+        reads = []
+
+        def forbidden(*args):
+            reads.append(args)
+
+        monkeypatch.setattr(allowed, "_schema", forbidden)
+        monkeypatch.setattr(allowed, "_sample", forbidden)
+        assert "error" in json.loads(await allowed.call_tool("schema", {}))
+        assert "error" in json.loads(await allowed.call_tool("sample_rows", {"table": "events"}))
+        assert reads == []
+        denied = AIContext(session, "demo", "")
+        assert not {"schema", "sample_rows"} & {tool["function"]["name"] for tool in denied.tools}
+        # Permissions do not remove unrelated tools or normal IDE execution.
+        validation = json.loads(await denied.call_tool("validate_d8r", {"text": "\\from events"}))
+        assert validation["valid"]
+        assert session.run("\\from events\n\\limit 1").ok
+
+    asyncio.run(scenario())
+
+
+def test_disabling_samples_discards_inflight_records(sources, monkeypatch):
+    session = Session(sources)
+    session.update_settings(ai_allow_sample_data=True)
+    context = AIContext(session, "demo", "")
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = context._sample
+
+        async def delayed_sample(*args):
+            rows = await original(*args)
+            started.set()
+            await release.wait()
+            return rows
+
+        monkeypatch.setattr(context, "_sample", delayed_sample)
+        read = asyncio.create_task(context.call_tool("sample_rows", {"table": "events"}))
+        await asyncio.wait_for(started.wait(), 5)
+        session.update_settings(ai_allow_sample_data=False)
+        release.set()
+        result = json.loads(await read)
+        assert "error" in result and "rows" not in result
+
+    asyncio.run(scenario())

@@ -13,14 +13,15 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 
-from .functions import DUCKDB_UNRENDERABLE, SCALAR_FUNCTIONS
+from .functions import DUCKDB_UNRENDERABLE, JSON_FUNCTIONS, SCALAR_FUNCTIONS
+from .identifiers import relation_parts
 
 AGGREGATES: tuple[str, ...] = ("sum", "avg", "count", "min", "max")
 
 # Temporal extraction functions; the capability map selects by dtype family.
 TEMPORAL: tuple[str, ...] = ("year", "month", "day", "quarter", "hour", "minute", "second")
 
-DtypeFamily = Literal["timestamp", "date", "time", "string"]
+DtypeFamily = Literal["timestamp", "date", "time", "string", "json"]
 
 
 @dataclass(frozen=True)
@@ -38,13 +39,28 @@ class ColumnDef:
 
 
 @dataclass(frozen=True)
+class ForeignKey:
+    """One declared constraint, preserving source/target column pairing order."""
+
+    columns: tuple[str, ...]
+    target_table: str
+    target_columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "columns", tuple(self.columns))
+        object.__setattr__(self, "target_columns", tuple(self.target_columns))
+
+
+@dataclass(frozen=True)
 class TableDef:
     name: str
     doc: str = ""
     columns: tuple[ColumnDef, ...] = ()
+    foreign_keys: tuple[ForeignKey, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "columns", tuple(self.columns))
+        object.__setattr__(self, "foreign_keys", tuple(self.foreign_keys))
 
 
 @dataclass(frozen=True)
@@ -72,6 +88,7 @@ class Capabilities:
 
 def dtype_family(type: str) -> DtypeFamily | None:
     """The dtype families recognized by scalar function completion."""
+    type = type.removeprefix("!")
     if type == "timestamp":
         return "timestamp"
     if type == "date":
@@ -80,6 +97,8 @@ def dtype_family(type: str) -> DtypeFamily | None:
         return "time"
     if type == "string":
         return "string"
+    if type in {"json", "jsonb"}:
+        return "json"
     return None
 
 
@@ -95,6 +114,7 @@ DEFAULT_CAPABILITIES = Capabilities(
             fn for fn in SCALAR_FUNCTIONS
             if fn not in {"string", "coalesce", "nullif"} and fn not in DUCKDB_UNRENDERABLE
         ),
+        "json": JSON_FUNCTIONS,
         "any": ("string", "coalesce", "nullif"),
     },
     operators=("=", "!=", ">", ">=", "<", "<=", "like", "ilike", "in", "not in",
@@ -154,6 +174,7 @@ class SchemaContext:
     fns: tuple[FnDef, ...] = ()
     # Partial remote indexes offer known columns without rejecting unseen tables.
     tables_complete: bool = True
+    default_schema: str | None = None
     pool: tuple[PoolColumn, ...] = field(init=False)
     _fns_by_name: Mapping[str, FnDef] = field(init=False, repr=False, compare=False)
 
@@ -179,7 +200,26 @@ class SchemaContext:
         ))
 
     def table_by_name(self, name: str) -> TableDef | None:
-        return next((table for table in self.tables if table.name == name), None)
+        exact = next((table for table in self.tables if table.name == name), None)
+        if exact is not None:
+            return exact
+        parts = relation_parts(name)
+        if parts is None:
+            return None
+        equivalent = next((table for table in self.tables if relation_parts(table.name) == parts), None)
+        if equivalent is not None:
+            return equivalent
+        if len(parts) == 1 and self.default_schema is not None:
+            preferred = next((table for table in self.tables
+                              if relation_parts(table.name) == (self.default_schema, parts[0])), None)
+            if preferred is not None:
+                return preferred
+        matches = [
+            table for table in self.tables
+            if (candidate := relation_parts(table.name)) is not None
+            and (candidate == parts or len(parts) == 1 and candidate[-1] == parts[0])
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def column_by_name(self, name: str) -> PoolColumn | None:
         return next((column for column in self.pool if column.name == name), None)
@@ -211,7 +251,7 @@ class SchemaContext:
             tables = pooled.tables if pooled else ()
             return PoolColumn(
                 column.name, column.type, column.doc, column.values,
-                (open_table.dataset, *(table for table in tables if table != open_table.dataset)),
+                (table.name, *(name for name in tables if name != table.name)),
             )
         return None
 

@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from textual.widgets import DataTable, Input, TextArea
+from textual.widgets import Button, DataTable, Input, TextArea
 
 from d8r.tui.app import D8RApp
 from d8r.tui.palette import CommandPalette
@@ -31,17 +31,17 @@ def test_function_tab_accepts_before_navigating_and_noop_offers_release_focus():
             await pilot.press("tab")
             assert body.text == "\\from events\n\\select user_id "
             assert app.focused is body
-            assert palette.is_open
+            assert not palette.is_open
 
-            # A visible exact-match offer must not trap Tab in the body.
+            # The body is the form's last field, so Tab leaves the editor area.
             await pilot.press("tab")
             assert body.text == "\\from events\n\\select user_id "
-            assert app.focused is screen.query_one("#fn-args", Input)
+            assert app.focused is screen.query_one("#fn-save", Button)
             assert not palette.is_open
 
             body.focus()
             await pilot.press("tab")
-            assert app.focused is screen.query_one("#fn-args", Input)
+            assert app.focused is screen.query_one("#fn-save", Button)
             name = screen.query_one("#fn-name", Input)
             name.focus()
             await pilot.press("tab")

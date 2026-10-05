@@ -366,7 +366,7 @@ class FromClause:
 
 @dataclass
 class JoinClause:
-    """One `\\join <dataset> [as] <alias> on <left>[ = <right>]` clause (always INNER).
+    """One INNER join, with a shared key or an ANDed sequence of equality keys.
 
     Two source shapes ride along: an inline `( … )` subquery (`body`, with the
     dataset name empty), and `lateral`, where the subquery may reference the
@@ -385,9 +385,11 @@ class JoinClause:
     # `\join lateral` — the body may read the left side; `on` is optional then.
     lateral: bool = False
     body: QueryAST | None = None
+    # Additional equality pairs, ANDed with the first left/right pair.
+    keys: tuple[tuple[str, str], ...] = ()
 
     def to_json(self) -> dict:
-        return {
+        data = {
             "line": self.line,
             "dataset": self.dataset,
             "alias": self.alias,
@@ -396,6 +398,9 @@ class JoinClause:
             "lateral": self.lateral,
             "body": self.body.to_json() if self.body else None,
         }
+        if self.keys:
+            data["keys"] = [list(pair) for pair in self.keys]
+        return data
 
 
 @dataclass

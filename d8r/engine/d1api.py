@@ -17,6 +17,7 @@ local storage layer, independently of this transport.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from threading import RLock
 from urllib.parse import quote
@@ -24,6 +25,8 @@ from uuid import UUID
 
 import httpx
 import ibis
+
+from d8r.query.schema import ForeignKey
 
 D1_API_ROOT = "https://api.cloudflare.com/client/v4"
 
@@ -62,6 +65,59 @@ def _ibis_type(declared: str, notnull: int) -> str:
             null = "!" if notnull else ""
             return f"{null}{dtype}"
     return "!string" if notnull else "string"
+
+
+def _sqlite_objects(names: list[str] | None) -> str:
+    sql = (
+        "where m.type in ('table', 'view') "
+        "and substr(m.name, 1, 7) != 'sqlite_' and substr(m.name, 1, 4) != '_cf_' "
+    )
+    if names is not None:
+        literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
+        sql += f"and m.name in ({literals}) "
+    return sql
+
+
+def sqlite_foreign_keys(
+    query: Callable[[str], Iterable[dict]], names: list[str] | None = None,
+) -> dict[str, tuple[ForeignKey, ...]]:
+    """Read only SQLite catalogs; resolve omitted targets by primary-key ordinal."""
+    if names is not None and not names:
+        return {}
+    sql = (
+        'select m.name as source_table, f.id as constraint_id, f.seq as position, '
+        'f."from" as source_column, f."table" as target_table, '
+        'coalesce(f."to", p.name) as target_column, '
+        'case when f."to" is null then '
+        '(select count(*) from pragma_table_info(f."table") where pk > 0) '
+        'end as target_pk_count '
+        'from sqlite_schema m join pragma_foreign_key_list(m.name) f '
+        'left join pragma_table_info(f."table") p on f."to" is null and p.pk = f.seq + 1 '
+    )
+    sql += _sqlite_objects(names) + "order by m.name, f.id, f.seq"
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for row in query(sql):
+        groups.setdefault((row["source_table"], row["constraint_id"]), []).append(row)
+    tables: dict[str, list[ForeignKey]] = {}
+    for (table, _), rows in groups.items():
+        targets = tuple(row["target_column"] for row in rows)
+        if any(target is None for target in targets) or any(
+            row["target_pk_count"] is not None and row["target_pk_count"] != len(rows)
+            for row in rows
+        ):
+            targets = ()
+        tables.setdefault(table, []).append(ForeignKey(
+            tuple(row["source_column"] for row in rows), rows[0]["target_table"], targets,
+        ))
+    return {table: tuple(keys) for table, keys in tables.items()}
+
+
+class _SchemaSnapshot(dict[str, dict[str, str]]):
+    """Column/FK metadata from one successful discovery, published together."""
+
+    def __init__(self, schemas: dict[str, dict[str, str]], foreign_keys: dict[str, tuple[ForeignKey, ...]]):
+        super().__init__(schemas)
+        self.foreign_keys = foreign_keys
 
 
 @dataclass
@@ -195,13 +251,8 @@ class CloudflareD1:
         sql = (
             'select m.name as source_table, p.cid as cid, p.name as name, p.type as type, p."notnull" as "notnull" '
             "from sqlite_schema m join pragma_table_info(m.name) p "
-            "where m.type in ('table', 'view') "
-            "and substr(m.name, 1, 7) != 'sqlite_' and substr(m.name, 1, 4) != '_cf_' "
         )
-        if names is not None:
-            literals = ", ".join("'" + name.replace("'", "''") + "'" for name in names)
-            sql += f"and m.name in ({literals}) "
-        sql += "order by m.name, p.cid"
+        sql += _sqlite_objects(names) + "order by m.name, p.cid"
         tables: dict[str, dict[str, str]] = {}
         for row in self.query(sql):
             table = row.get("source_table")
@@ -210,7 +261,7 @@ class CloudflareD1:
                 continue
             cols = tables.setdefault(table, {})
             cols[str(column)] = _ibis_type(str(row.get("type") or ""), int(row.get("notnull") or 0))
-        return tables
+        return _SchemaSnapshot(tables, sqlite_foreign_keys(self.query, list(tables)))
 
     def close(self) -> None:
         self._client.close()
@@ -251,6 +302,7 @@ def schema_connection(schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | 
 class _UnboundCon:
     def __init__(self, schemas: dict[str, dict[str, str]], *, d1: CloudflareD1 | None = None) -> None:
         self._schemas: dict[str, dict[str, str]] = {}
+        self._foreign_keys: dict[str, tuple[ForeignKey, ...]] = {}
         self._d1 = d1
         self._lock = RLock()
         self.seed(schemas)
@@ -272,9 +324,17 @@ class _UnboundCon:
 
     def seed(self, schemas: dict[str, dict[str, str]]) -> None:
         snapshot = {name: dict(columns) for name, columns in schemas.items()}
+        foreign_keys = getattr(schemas, "foreign_keys", {})
         with self._lock:
             self._schemas.update(snapshot)
+            for name in snapshot:
+                self._foreign_keys[name] = tuple(foreign_keys.get(name, ()))
 
     def list_tables(self) -> list[str]:
         with self._lock:
             return list(self._schemas)
+
+    def foreign_keys(self, name: str) -> tuple[ForeignKey, ...]:
+        """Return cached constraints only; never discover metadata from the UI."""
+        with self._lock:
+            return self._foreign_keys.get(name, ())

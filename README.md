@@ -60,7 +60,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 
 ```
 ┌ D8R   [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ]  duckdb ───────────┐
-│ Schema | Pages      │ Document                                               │
+│ Schema|Pages|agents │ Document                                               │
 │  events  100 rows   │  \from events                                          │
 │   ▸ timestamp       │  \select event_type                                    │
 │   ▸ user_id         │  \select sum(amount) as total                          │
@@ -76,7 +76,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   backend actually in use (`duckdb`, `postgres (mock)`, `sqlite (D1 snapshot)`,
   `sqlite (Cloudflare D1)`, `postgres (live)`). Switching either picker re-points the whole app:
   the tree, the parser's schema seam, and the palette's offers.
-- **Schema / Pages explorer** — Schema lists the active source's datasets and
+- **Schema / Pages / Agents explorer** — Schema lists the active source's datasets and
   column types. Expand a column to inspect up to 1,000 distinct values, including
   NULL, without changing the document or execution history. Enter on a column
   still inserts its name. PostgreSQL row counts remain unloaded to avoid scans.
@@ -85,6 +85,9 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   history seeds pages when upgrading. `\pages` and `\queries` reveal Pages; using
   either again while Pages is visible hides the explorer. Switching pages never runs
   a query or connects a database.
+  **Agents** lists all chats and their current status; select one to reopen its
+  transcript and composer. `ctrl+j` or an **Agents** button reveals this tab
+  without leaving the query or function editor.
 - **Document pane** — the editor (line numbers on), with the `\` palette
   floating under the caret.
 - **Results / SQL / History tabs** — Results shows the executed rows, or the
@@ -96,7 +99,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   (rows, milliseconds, source, dialect).
 
 Query and function editing share these slots. **Functions** (or `\fn`) replaces
-the schema explorer with the function library, the document with the function
+the Schema tab's contents with the function library, the document with the function
 form, and query results with a function preview. **Query** or `ctrl+q` returns to
 the unchanged document. **Ask AI** opens the same assistant on the right in either
 mode; it never takes over the form.
@@ -136,6 +139,11 @@ Enter or click a row to toggle, select, or edit it; the footer names the action
 for the current category. Tab/Shift+Tab switch panels; Left or Escape returns
 to the sidebar without losing the selected category. Escape from the sidebar
 closes Settings. Connection and provider forms return to the same page and row.
+
+**Show/Hide Menus → agents tab** hides just that tab; **AI pane (right)** hides
+or shows the assistant and its splitter. Both preferences survive restart.
+Hiding either area preserves chat drafts and running requests. `ctrl+j` reveals
+a hidden agents tab; **Ask AI** or selecting a chat reopens the right pane.
 
 Preferences are loaded from `~/.d8r/settings.json` and saved when changed.
 You can also edit the JSON while D8R is closed; restart to load edits. Settings
@@ -205,16 +213,30 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   D8R restarts the provider turn with the original request, completed exchanges,
   and your new instruction. Partial replies/tool batches are discarded, not applied.
   A context read already running finishes before the replacement turn starts;
-  completed function saves remain saved and are reported.
-- A query edit or function-form edit response appears as a read-only **full
-  replacement** proposal. **Apply** updates the editor only: it does not run a
-  query or save a function.
+  completed query-page updates and function saves remain and are reported.
+- Ask the workspace AI to **create, make, edit, or apply queries** and it updates
+  the IDE directly. Each complete query gets a labeled **Page**: the first replaces
+  the active draft, and the others become new pages on the same source/dialect.
+  Unrelated pages, results, and history stay unchanged. No copy/paste, extra Apply
+  click, or auto-accept toggle is required. Queries are never run automatically.
+- Questions and preview-only requests remain conversation or read-only **full
+  replacement** proposals. **Apply** updates only the editor; **Apply queries**
+  applies every labeled preview page. Neither runs queries or saves functions.
   Invalid, incomplete, cancelled, or stale proposals cannot be applied. Changing
   the document or function draft makes its proposal stale without losing the reply;
   switching sources or targets selects that target's saved chat.
-- **Settings → AI provider → Auto accept AI updates** is off by default. Enabling
+- **Settings → AI provider → Allow Sample Data** is off by default. Enable it to
+  let the AI read bounded sample records from registered tables.
+- **Allow Schema Refreshes** is on by default. It controls the AI's schema and
+  backend-capability lookups, not normal IDE schema indexing.
+  Both permissions save immediately. Disabled tools are withheld from new requests
+  and denied in existing ones; disabling samples also discards pending sample results.
+  Enabling a tool makes it available on the next message. Previously shared context
+  remains in chat history; disabling a permission does not erase it.
+- **Automatically Apply AI Edits** is off by default. Enabling
   it persists immediately and applies complete, validated proposals only while
   their target draft is unchanged. It never executes queries or saves functions.
+  The preference is unrelated to explicit user-requested query updates or function saves.
 - Ask the main assistant to create, edit, save, or apply a saved function by name.
   It calls `save_function` to validate and persist the requested definition
   directly; “apply it” after a function proposal also authorizes this save.
@@ -234,13 +256,17 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
 - **New chat** starts another conversation without deleting the current one.
   **Close**/Escape hides the panel without changing the draft.
 - **Settings** in the shared chat panel opens provider configuration directly and
-  returns to your unsent request. The auto-accept toggle is in the main Settings menu.
+  returns to your unsent request. The three permission toggles are in the main Settings menu.
 - **New chat** preserves previous conversations and lets multiple requests run
-  concurrently, even for the same target. **Agents** (`ctrl+j`) opens chat history
-  and the agent-status window; the workspace sidebar also lists agents. Select a
-  chat to reopen it. Status distinguishes working, awaiting read, error, cancelled,
-  and idle. Each chat keeps its own composer; **Cancel** stops its request and a
-  follow-up **Send** replaces it with a steered turn.
+  concurrently, even for the same target. **Agents** (`ctrl+j`) opens the left
+  **Agents** tab, which lists chat history in an oh-my-pi-style roster: coloured
+  status markers, bold names, muted target/activity details and live status counts.
+  **Busy** means a request is running; **Ready** means a new chat or an unread
+  completed reply; **Seen** means a completed reply has been opened. **Error** and
+  **Cancelled** remain distinct, with unread failures marked separately. Running
+  requests lead the list; highlighting a row never marks its reply as read.
+  Select a chat to reopen its transcript and composer. Each chat keeps its own
+  composer; **Cancel** stops its request and a follow-up **Send** steers a running turn.
   Completed exchanges, composer drafts, and unread states survive exit. Exiting
   cancels in-flight requests; restart never resumes them or restores applicable
   proposals. Incomplete replies never enter replayable history. **Save** in AI settings
@@ -249,17 +275,19 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   bodies or credentials. Protect the local JSON files and their backups.
 
 Sending a message shares the current document/function draft with the provider.
-The assistant can request read-only schema and backend capabilities, bounded
-sample rows from a registered table (5 by default; at most 20 columns, with long
-string cells truncated),
+When permitted, the assistant can request read-only schema and backend capabilities,
+or bounded sample rows from a registered table (sampling disabled by default;
+when enabled, 5 records per read by default, at most 20 columns, with long string cells truncated).
+It can also request
 the active target source's latest ten matching successful queries, and saved
 function definitions. These read-only context tools also expose parser-only
-validation. The separate `save_function` tool is available only to main workspace
-chat for explicit user-requested function mutations, never instructions embedded
-in schema, samples, history, or function bodies. It saves a local definition, not
-database data. No tool executes arbitrary model-generated queries, runs shell
-commands, grants general file access, or expands the existing network boundaries.
-Ask for a preview when you want suggestions to review before saving.
+validation. The separate `apply_queries` and `save_function` tools are available
+only to guarded main workspace chat for explicit user-requested mutations, never
+instructions embedded in schema, samples, history, or function bodies. They update
+local query drafts or save function definitions, not database data. No tool runs
+arbitrary model-generated queries or shell commands, grants general file access,
+or expands the existing network boundaries. Ask for a preview when you want
+suggestions to review before applying or saving.
 
 The existing `httpx` dependency handles SSE streaming directly. Transient HTTP
 408/429/5xx and connection failures receive bounded backoff; Settings defaults
@@ -387,16 +415,33 @@ follows what you type:
   then operator, then that column's distinct values. Numeric values are inserted
   bare, text values quoted (`\where event_type = "purchase"`); after `~`, `!~`,
   `in` or `not in` the operand is typed rather than chosen.
+- When `\select` already exists, accepting `\group` prefills its selected
+  non-aggregate source columns in selection order, without duplicate references.
+  For example, `\select e.event_type, e.user_id, sum(e.amount) as total`
+  offers `\group e.event_type, e.user_id`. An empty `\group ` offers the same
+  complete list first; Tab accepts it in one step. Existing group choices are
+  preserved, and CTE bodies use only their own select list. A completed group
+  closes its suggestions so Enter starts the next line; a comma opens more choices.
+  Output aliases and aggregate inputs are not substituted for source columns.
+  Computed projections retain the engine's existing implicit expression grouping;
+  constants add no keys. With no eligible columns, ordinary column completion remains.
 - `enter` on the highlight accepts it; if the highlight is already exactly what
   you typed, Enter simply starts a new line. `escape` closes the palette without
   touching the document, and clicking a row accepts it.
-- The offers stay on as you type and after you accept one: an accept lands them
-  where the same characters typed by hand would have, so `\select` keeps
-  offering fields and `sum(` keeps offering its argument. They go quiet by
-  themselves where the language has nothing left to say — `\from events ` takes
-  an alias rather than a second table, and one `\where` sets one value — so
-  Enter is a newline again as soon as the clause is done. Moving the caret with
-  the arrows never summons the palette back; the next keystroke does.
+- `Tab` completes a fully typed command too: `\from` → `\from ` immediately
+  offers tables; another Tab accepts the selected table and its alias. Escape's
+  dismissal and the Intellisense setting remain respected.
+- Suggestions occupy at most six single-line rows, with a content-sized width
+  capped to the editor. Long details are ellipsized rather than wrapped. The popup
+  follows the rendered caret (including wrapped lines), flips above it near the
+  bottom, and never covers the caret or spills into other panes. Leaving the
+  editor or scrolling the caret out of view closes it; clicks retain editor focus.
+- Accepting a completion refreshes the next choices immediately: `\select `
+  offers fields, `sum(` offers its argument, and `\where` advances from column
+  to operator to values. Completed fields stop offering themselves; typing a
+  comma or another command opens the relevant choices again. A completed table
+  stops offering tables (a join can continue with its foreign-key predicates).
+  Moving the caret alone never summons a closed palette.
 - Columns offered after `\from` come from the open tables of *this* document;
   with no `\from` yet, the palette offers the registry's cross-dataset pool.
 
@@ -588,9 +633,31 @@ point of the product: write one document, then read it back as any vendor's SQL.
 Press `ctrl+o` (or Settings → **Data source** → **Add data source**), then choose
 **PostgreSQL** in **Backend**. Enter host, port, database, user, masked password,
 schema (default `public`), and TLS/SSL mode. This is a **real Ibis PostgreSQL
-connection**, not the bundled PostgreSQL mock. Tables and views in the selected
-schema populate the explorer; connect separately to use another schema. Empty
-schemas work, and connection discovery does not count all rows or install extensions.
+connection**, not the bundled PostgreSQL mock. Tables and views across accessible
+user schemas populate the explorer and IntelliSense together, so `public.` and
+`etl.` work on the same connection. The configured schema remains the default
+for bare table names. Empty schemas work; discovery never counts rows or installs extensions.
+
+PostgreSQL tables retain their schema names in the explorer and IntelliSense.
+For a connection configured with schema `etl`, accepting `dataset_symbol` inserts
+`etl.dataset_symbol d` (with a collision-free alias):
+
+```text
+\from etl.dataset_symbol d
+\select d.symbol
+```
+
+Qualified names also work in joins, set operations and nested queries. Without
+an alias, a column can be written `etl.dataset_symbol.symbol`. Existing bare
+table names still resolve within the selected schema; qualification never switches
+to a same-named table on PostgreSQL's search path. Names containing spaces or
+punctuation use double-quoted components, inserted automatically by IntelliSense.
+Completion also accepts quoted prefixes such as `"etl".` and unfinished quoted
+table names. Cross-schema foreign keys offer join predicates with the current aliases.
+
+Run and Compile can load metadata for newly created or otherwise unindexed
+PostgreSQL tables on demand. Compile never executes the query. Reconnect to
+refresh the explorer and IntelliSense after external schema changes.
 
 Use **Test connection** before **Add**. Only Add saves the profile and password
 in local `memory.json`; Test and Cancel save nothing. Password whitespace is
@@ -707,7 +774,7 @@ An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 
 | File | Saved contents |
 | --- | --- |
-| `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout |
+| `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout, sample/schema permissions and automatic draft edits |
 | `memory.json` | Custom functions; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
 | `workspace.json` | Document/caret and stable target identity, last view, function draft, query history, completed AI conversations/composer drafts, source references and snapshot paths |
 
@@ -717,10 +784,17 @@ provider form, and Cancel discards it. D1/PostgreSQL credentials save on **Add**
 edited fields are submitted with **Connect**; function definitions persist on
 **Save**/**Run preview** or Delete, explicit user-requested main-chat saves, or
 manual **Save function** on workspace preview proposals. Workspace drafts and
-histories autosave independently. Loading never connects, executes, or saves a
-function definition.
-Unavailable workspace targets restore as disconnected, preserving their identity
-and drafts until Run reconnects them, they are explicitly reconnected, or another source is selected.
+histories autosave independently. Session loading never connects, executes, or saves a
+function definition. After the IDE mounts, it automatically reconnects only the selected
+source using saved credentials or its snapshot path, with cancellable progress;
+it never runs the restored document. Missing credentials or a failed connection leave
+the original target and draft disconnected. Other targets connect only on selection or Run.
+
+General settings includes **Entry screen**, off by default. Enabling it plays the
+terminal boot animation on future launches. Table completion inserts aliases
+(`\from projects p`) and column completion uses them (`p.id`). Declared foreign keys
+provide `\join` predicates, including composite keys. IntelliSense uses successful
+source-scoped history to rank equal-quality matches by recency.
 
 A `settings.json` example (omitted keys use defaults):
 
@@ -732,6 +806,9 @@ A `settings.json` example (omitted keys use defaults):
   "source": "demo",
   "dialect": "duckdb",
   "default_rows": 50,
+  "ai_allow_sample_data": false,
+  "ai_allow_schema_refreshes": true,
+  "ai_auto_accept": false,
   "ai": {
     "base_url": "https://provider.example/v1",
     "model": "your-model",

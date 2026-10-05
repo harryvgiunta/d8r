@@ -19,6 +19,10 @@ columns available for completion but defers unknown-table rejection for `from`,
 and saved-function expansion retain that same flag. Grammar, duplicate identifiers,
 and qualified-prefix validation remain unchanged. The flag defaults to `True`;
 the default empty context and canonical AST wire contract are unchanged.
+A PostgreSQL snapshot covers accessible user schemas, but remains partial for
+newly created or otherwise unindexed relations. Its `default_schema` selects the
+bare-name match when multiple schemas expose the same table; exact local names
+still win. Parsing and completion read only the snapshot, never the connection.
 Parsing and completion capture one snapshot; there is no process-global registry.
 An old snapshot remains coherent after indexing, source switches or function edits.
 
@@ -129,6 +133,11 @@ Argument rules:
   onto the result of everything before it, always as an INNER join. A malformed
   clause (missing `on`, or a shape the grammar does not read) is
   ``\join expects `<dataset> [as] <alias> on <col>[ = <col>]` ``.
+  Composite keys use explicit equality conjunctions, for example
+  `\join tasks t on p.tenant = t.tenant and p.id = t.project_id`.
+  Every term must be an equality; incomplete terms, OR and non-equality predicates
+  are rejected rather than silently reduced to a partial join. Compound lateral
+  ON clauses are not supported.
 - A bare second identifier after the dataset is a **table alias**
   (`\from events e`, `\join users as u on user_id`); the `as` keyword is
   optional. Duplicate identifiers among open tables are the error
@@ -137,6 +146,34 @@ Argument rules:
   column parses, and the engine refuses it at build time
   (`unknown function: 'year' for float64`). Completion keeps it from happening
   interactively by filtering on the capability map.
+
+### Schema-qualified datasets
+
+Dataset operands in `\from`, `\open`, `\join`, `\union`, `\intersect`, and
+`\except` accept `table` or `schema.table`, including inside CTEs and subqueries.
+The AST and engine payload preserve the complete spelling. PostgreSQL registers
+physical tables under schema-qualified names across accessible user schemas.
+Bare operands prefer the connection's selected schema, then a unique registered
+basename. Explicit qualified operands may address unindexed tables, with Ibis
+loading only referenced metadata for Run or Compile. Exact registered names
+(including session temp tables) take precedence, and built CTEs precede registry
+lookup. Qualification does not change the selected schema or the AST wire shape.
+
+Each relation component may be double-quoted when it contains punctuation or
+spaces; embedded double quotes are doubled (`"etl.""quoted".dataset_symbol`).
+The shared `relation_name(schema, table)` helper formats physical registry names;
+`relation_basename(name)` decodes the final component, and `is_relation_name(text)`
+checks relation syntax. `is_identifier` stays bare-only: aliases, CTE names, temp
+names, saved-function names, and parameters do **not** gain qualification.
+
+Without an alias, the identifier is the dataset operand exactly as written:
+`\from etl.dataset_symbol` exposes `etl.dataset_symbol.id`, not `dataset_symbol.id`.
+With `\from etl.dataset_symbol s`, only `s.id` is a valid qualified reference.
+Column references accept up to three components (schema, table, bare column),
+splitting the relation prefix from the column at the **last** dot. Quoted relation
+components may contain literal dots; columns and aliases remain bare identifiers.
+Three-component datasets, empty qualification components, and trailing dots are
+grammar errors. Bare columns retain leftmost-open-table resolution.
 
 ### Literal constants
 
@@ -943,12 +980,23 @@ document order) has an **identifier**: its alias if given, otherwise its
 dataset name. References in `\select` / `\where` / `\group` / `\order` (and
 aggregate/scalar/arithmetic arguments, window frames, and `\case` conditions) are either:
 
-- **qualified** — `u.region` / `users.region`: one dot, the prefix must match
-  an open table's identifier; it resolves to exactly that table. Aliasing is
-  strict: once `\from events e` is set, `events.user_id` is an unknown-column
-  error — only `e.user_id` resolves.
+- **qualified** — `u.region` / `users.region` / `etl.users.region`: the prefix
+  before the final dot must match an open table's full identifier; it resolves
+  to exactly that table. Aliasing is strict: once `\from etl.events e` is set,
+  `etl.events.user_id` and `events.user_id` are unknown-column errors — only
+  `e.user_id` resolves.
 - **bare** — `region`: resolves to the **leftmost open table** that has the
   column (aliased or not — bare names match the underlying dataset's columns).
+
+Selecting a table in completion inserts a short unused alias (`projects p`, then
+`p2` if `p` is taken); column suggestions use that alias in every supported column
+context. This is an editor insertion, not parser normalization: pasted or fully
+typed unaliased documents retain their existing semantics. Declared foreign keys
+in the immutable `TableDef.foreign_keys` snapshot provide complete qualified join
+suggestions, including composite constraints. FK metadata does not enter the AST.
+`JoinClause.keys` holds additional `(left, right)` pairs beyond the existing
+`left`/`right`; JSON and payloads include `keys: [[left, right], ...]` only when
+nonempty, preserving the single-key canonical fixture shape.
 
 An empty select list (no `\select` at all) projects every column of the
 source, then each joined table's columns **except names already projected** —

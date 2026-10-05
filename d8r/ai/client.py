@@ -234,7 +234,6 @@ class _Response:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
             raise AIError("The AI provider returned an invalid response delta.")
-        self.started |= bool(delta)
         if delta.get("role") not in (None, "assistant"):
             raise AIError("The AI provider returned an unexpected response role.")
         if delta.get("refusal") or "function_call" in delta:
@@ -247,6 +246,7 @@ class _Response:
             if self.content_size > MAX_CONTENT_BYTES:
                 raise AIError("The AI answer exceeded the size limit.")
             self.content.append(content)
+            self.started |= bool(content)
         fragments = delta.get("tool_calls", [])
         if not isinstance(fragments, list):
             raise AIError("The AI provider returned invalid tool calls.")
@@ -259,6 +259,7 @@ class _Response:
             if index not in self.calls:
                 self.calls[index] = _ToolCall()
             self.calls[index].add(fragment)
+        self.started |= bool(self.calls)
         finish = choice.get("finish_reason")
         if finish is not None:
             if finish not in ("stop", "tool_calls"):
@@ -344,6 +345,10 @@ async def run_turn(
 
     ``max_attempts - 1`` is a shared retry budget, not a budget reset per tool
     round. After ``max_tool_rounds`` context rounds, the final request disables tools.
+    Human clarification tools wait without a network/tool deadline and remain
+    cancellable; provider requests and all other tools retain their deadlines.
+    Provider timeouts measure inactivity between complete stream events, not
+    total generation time. Keepalive comments alone do not extend the deadline.
     Tool-budget guidance is merged into the initial system message on a copy;
     it never enters ``messages`` or creates a second system message.
     Diagnostic events expose request stages and model/tool output, not HTTP
@@ -362,6 +367,7 @@ async def run_turn(
         headers["Authorization"] = f"Bearer {config.api_key}"
     retries = rounds = 0
     request_number = 0
+    loop = asyncio.get_running_loop()
     async with create_client(config) as client:
         while True:
             state = _Response(max_tool_calls=config.max_tool_calls)
@@ -374,8 +380,11 @@ async def run_turn(
                         f"You have {remaining} tool rounds remaining for this turn. "
                         f"Request at most {config.max_tool_calls} tool calls per round. "
                         "Reuse context already collected and batch independent lookups. "
-                        "Reserve a tool round for save_function when the user requests a function edit; "
-                        "returning code is not saving. Complete the requested action before the final answer."
+                        "Reserve a tool round for apply_queries for an actionable data/query request, "
+                        "or save_function for a requested function edit, when that tool is available. "
+                        "Those tools validate before changing anything; do not use the last round only "
+                        "to validate a draft. Returning code or asking for approval is not completing "
+                        "an authorized edit. Complete the requested action before the final answer."
                     )
                 else:
                     payload["tool_choice"] = "none"
@@ -384,8 +393,8 @@ async def run_turn(
                         "request any more tools. Provide your final answer using the context "
                         "already collected. If that context is insufficient or the requested "
                         "operation is unsupported, explain the concrete missing information "
-                        "or unsupported operation instead. Never pretend success or invent "
-                        "a query that is not supported by the collected context."
+                        "or unsupported operation instead. Never pretend success, ask for redundant "
+                        "approval, or invent a query that is not supported by the collected context."
                     )
                 # Strict chat templates accept only one initial system message.
                 # Copy it so retries, tool rounds and later turns never accumulate guidance.
@@ -400,7 +409,7 @@ async def run_turn(
                           f"tools {'disabled' if rounds >= config.max_tool_rounds or not tools else 'available'}. "
                           f"Limit: {config.max_tool_calls} calls per round.")
             try:
-                async with asyncio.timeout(config.timeout):
+                async with asyncio.timeout(config.timeout) as deadline:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
                         status = response.status_code
                         yield AIEvent("diagnostic", f"Request {request_number}: HTTP {status}.")
@@ -415,6 +424,7 @@ async def run_turn(
                             raise AIError(f"The AI provider rejected the request (HTTP {status}). Check its URL and model.")
                         if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
                             raise AIError("The AI provider did not return an event stream.")
+                        deadline.reschedule(loop.time() + config.timeout)
                         done = False
                         async for event_type, data in _sse(response):
                             if event_type == "error":
@@ -423,6 +433,7 @@ async def run_turn(
                                 done = True
                                 break
                             text = state.accept(_object(data))
+                            deadline.reschedule(loop.time() + config.timeout)
                             if text:
                                 yield AIEvent("text", text)
                         if not done:
@@ -464,8 +475,13 @@ async def run_turn(
             for tool_call, (name, arguments) in zip(message["tool_calls"], requests):
                 yield AIEvent("diagnostic", f"Executing tool {tool_call['id']} ({name}).")
                 try:
-                    async with asyncio.timeout(config.timeout):
+                    if name == "ask_user":
                         result = await call_tool(name, arguments)
+                    else:
+                        async with asyncio.timeout(config.timeout):
+                            result = await call_tool(name, arguments)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     yield AIEvent("diagnostic", f"Tool {tool_call['id']} ({name}) failed: {type(exc).__name__}; details withheld.")
                     raise AIError("An AI context tool failed; no final answer is available.") from None

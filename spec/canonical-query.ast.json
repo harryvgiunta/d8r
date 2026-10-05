@@ -7,7 +7,7 @@
         "with": [],
         "from": {
           "line": 2,
-          "table": "orders",
+          "table": "etl.orders",
           "alias": null,
           "body": null
         },
@@ -80,7 +80,7 @@
         "with": [],
         "from": {
           "line": 6,
-          "table": "spend_log",
+          "table": "etl.spend_log",
           "alias": null,
           "body": null
         },
@@ -90,8 +90,8 @@
         "distinct": false,
         "where": {
           "line": 6,
-          "raw": "campaign_id = recent.campaign_id",
-          "column": "campaign_id",
+          "raw": "etl.spend_log.campaign_id = recent.campaign_id",
+          "column": "etl.spend_log.campaign_id",
           "op": "=",
           "value": "recent.campaign_id",
           "subquery": null
@@ -118,7 +118,7 @@
     {
       "line": 16,
       "op": "union",
-      "dataset": "archived",
+      "dataset": "etl.archived",
       "distinct": true,
       "body": null
     },

@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from textual import on
+from textual import events, on
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.content import Content
@@ -48,11 +48,14 @@ from d8r.query import (
     dtype_family,
     is_identifier,
     param_spans,
+    parse_query,
     split_logic,
     take_paren,
     where_head,
 )
-from d8r.query.functions import ARITHMETIC_PRECEDENCE, MAX_EXPRESSION_DEPTH, SCALAR_FUNCTIONS, ArgumentKind
+from d8r.query.functions import ARITHMETIC_PRECEDENCE, MAX_EXPRESSION_DEPTH, SCALAR_FUNCTIONS, ArgumentKind, accepts_type
+from d8r.query.parser import block_bounds, keyword_positions, parse_source
+from d8r.query.identifiers import IDENTIFIER, RELATION_NAME, relation_parts
 
 from .session import Session, looks_numeric
 
@@ -136,7 +139,7 @@ DEFAULT_OPERATORS: tuple[str, ...] = (
 # The words that join two conditions; `between`'s own `and` is not one of them
 # (the parser's `split_logic` masks it), so a bound never reads as a joiner.
 _JOINERS: tuple[str, ...] = ("and", "or")
-_COL_PATTER = re.compile(rf"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_COL_PATTER = re.compile(rf"(?:{RELATION_NAME}\.)?{IDENTIFIER}")
 _NUMBER_RE = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)$")
 
 # How many value rows the popup shows; the search still reads the whole pool.
@@ -181,11 +184,7 @@ class View:
         return [entry.label for entry in self.entries]
 
     def highlighted_is_typed(self, index: int) -> bool:
-        """True when the highlighted suggestion is already what the user typed.
-
-        Accepting it would be a no-op, so the editor lets the key through
-        instead of swallowing it (Enter then means a newline, as it should).
-        """
+        """Whether the highlighted text is complete (Enter should be a newline)."""
         entry = self.entries[index]
         if entry.action:
             return False
@@ -208,7 +207,41 @@ def match_rank(text: str, token: str) -> int:
     return 2 if folded in lowered else -1
 
 
-def _offers(rows: Iterable[tuple[int, str, str, str]], token: str) -> list[Entry]:
+def _dataset_match_rank(name: str, token: str) -> int:
+    """Match relation components, including an unfinished quoted component."""
+    parts = relation_parts(name)
+    if parts is None or not any(char in token for char in '."'):
+        return match_rank(name, token)
+    typed = [""]
+    quoted = False
+    index = 0
+    while index < len(token):
+        char = token[index]
+        if char == '"':
+            if quoted and token[index:index + 2] == '""':
+                typed[-1] += '"'
+                index += 2
+                continue
+            quoted = not quoted
+        elif char == "." and not quoted:
+            typed.append("")
+        else:
+            typed[-1] += char
+        index += 1
+    if len(typed) > len(parts):
+        return -1
+    if len(typed) == 1:
+        return min((rank for part in parts if 0 <= (rank := match_rank(part, typed[0])) <= 1), default=-1)
+    if any(a.lower() != b.lower() for a, b in zip(parts, typed[:-1])):
+        return -1
+    rank = match_rank(parts[len(typed) - 1], typed[-1])
+    return rank if rank <= 1 else -1
+
+
+def _offers(
+    rows: Iterable[tuple[int, str, str, str]], token: str, *, recency: dict[str, int] | None = None,
+    qualified: bool = False, dataset: bool = False,
+) -> list[Entry]:
     """(group, name, detail, insert) rows matching `token`, group then rank first.
 
     The group is the block a row belongs to (fields before functions); within a
@@ -217,10 +250,19 @@ def _offers(rows: Iterable[tuple[int, str, str, str]], token: str) -> list[Entry
     kept = [
         (group, rank, name, detail, insert)
         for group, name, detail, insert in rows
-        if (rank := match_rank(name, token)) >= 0
+        if (rank := (_dataset_match_rank(name, token) if dataset else
+                     match_rank(name.rsplit(".", 1)[-1] if qualified and "." not in token else name, token))) >= 0
     ]
-    kept.sort(key=lambda row: (row[0], row[1]))
+    kept.sort(key=lambda row: (row[0], row[1], (recency or {}).get(row[2], float("inf"))))
     return [Entry(label=name, insert=insert, detail=detail) for _, _, name, detail, insert in kept]
+
+
+def _history_offers(
+    session: Session, doc: str, rows: Iterable[tuple[int, str, str, str]], token: str,
+    *, category: str = "column",
+) -> list[Entry]:
+    return _offers(rows, token, recency=session.completion_ranks(doc, category=category),
+                   qualified=category == "column", dataset=category == "dataset")
 
 
 def prompt(label: str, detail: str = "") -> Content:
@@ -268,7 +310,8 @@ def _command_entries(session: Session, token: str, schema: SchemaContext) -> lis
         if call[:-2].lower() not in CLAUSE_NAMES
     ]
     best = [row for row in (*commands, *actions, *functions) if row[0] >= 0]
-    best.sort(key=lambda row: (row[0], row[1]))
+    usage = session.completion_ranks("", category="command")
+    best.sort(key=lambda row: (row[0], usage.get(row[2].label.lstrip("\\"), float("inf")), row[1]))
     return [entry for _, _, entry in best]
 
 
@@ -287,6 +330,7 @@ class _ExpressionPosition:
     arithmetic: bool = False
     close: bool = True
     numeric_result: bool = False
+    result_kind: ArgumentKind | None = None
 
 
 def _expression_position(text: str) -> _ExpressionPosition | None:
@@ -313,11 +357,16 @@ def _expression_position(text: str) -> _ExpressionPosition | None:
                 return None
             if current.arithmetic and fn and fn not in AGGREGATES:
                 spec = SCALAR_FUNCTIONS.get(fn)
-                if spec is None or spec.result not in {"integer", "any"}:
+                if spec is None or spec.result not in {"integer", "float", "any"}:
                     return None
+            parent = SCALAR_FUNCTIONS.get(current.fn)
+            result_kind = parent.argument_kind(current.argument) if parent else None
+            if parent and parent.result_argument == current.argument and current.result_kind is not None:
+                result_kind = current.result_kind
             stack.append(_ExpressionPosition(
                 index + 1, fn, arithmetic=fn is None,
                 numeric_result=current.arithmetic,
+                result_kind=result_kind,
             ))
         elif char == ")":
             if len(stack) > 1:
@@ -345,6 +394,7 @@ def _expression_position(text: str) -> _ExpressionPosition | None:
         current.offset, owner.fn, owner.argument, current.arithmetic,
         close=current is owner and not current.arithmetic,
         numeric_result=owner.numeric_result,
+        result_kind=owner.result_kind,
     )
 
 
@@ -396,8 +446,17 @@ def _command_context(before: str) -> tuple[int, bool]:
     return slash, any(fn in AGGREGATES for _, fn in stack)
 
 
-def _token_end(line: str, start: int, column: int) -> int:
+def _token_end(line: str, start: int, column: int, *, relation: bool = False) -> int:
     """Include a token's stale suffix, but never the next operand or punctuation."""
+    if relation and start < column:
+        quoted = False
+        for index in range(start, len(line)):
+            char = line[index]
+            if char == '"':
+                quoted = not quoted
+            elif not quoted and (char.isspace() or char in ",()+-*/=<>!~\\"):
+                return max(column, index)
+        return len(line)
     if start < column and line[start] in "\"'":
         quote = line[start]
         index = start + 1
@@ -421,9 +480,9 @@ def _column_offers(session: Session, doc: str, token: str, schema: SchemaContext
     """The document's open-table columns as palette rows."""
     rows = [
         (0, name, detail, f"{name} ")
-        for name, _, detail in session.column_entries(doc, schema=schema)
+        for name, _, detail in session.column_entries(doc, schema=schema, qualified="." in token)
     ]
-    return _offers(rows, token)
+    return _history_offers(session, doc, rows, token)
 
 
 def _aggregate_fns(schema: SchemaContext) -> list[str]:
@@ -462,13 +521,6 @@ def _scalar_detail(fn: str) -> str:
     return f"{fn}({', '.join(args)}) → {spec.result}"
 
 
-def _accepts_type(kind: ArgumentKind, type_: str) -> bool:
-    type_ = type_.removeprefix("!")
-    if kind == "any":
-        return True
-    if kind == "integer":
-        return type_.startswith(("int", "uint"))
-    return type_ == kind
 
 
 def _numeric_type(type_: str) -> bool:
@@ -484,7 +536,7 @@ def _select_entries(
     An open call is handled one level up, where its argument's span is known;
     here the token is the whole expression segment being typed.
     """
-    columns = session.column_entries(doc, schema=schema)
+    columns = session.column_entries(doc, schema=schema, qualified="." in token)
     rows = [
         (0, name, detail, f"{name} ") for name, type_, detail in columns
         if not arithmetic or _numeric_type(type_)
@@ -495,24 +547,27 @@ def _select_entries(
         rows += [(3, fn, "window rank", f"{fn}() over (") for fn in _rank_fns(schema)]
     rows += [
         (4, fn, _scalar_detail(fn), f"{fn}(") for fn in _scalar_fns(schema)
-        if not arithmetic or SCALAR_FUNCTIONS[fn].result in {"integer", "any"}
+        if not arithmetic or SCALAR_FUNCTIONS[fn].result in {"integer", "float", "any"}
     ]
-    return _offers(rows, token)
+    return _history_offers(session, doc, rows, token)
 
 
 def _call_argument_entries(
     session: Session, doc: str, fn: str, partial: str, argument: int = 0,
     *, schema: SchemaContext, arithmetic: bool = False, close: bool = True,
     numeric_result: bool = False,
+    result_kind: ArgumentKind | None = None,
 ) -> list[Entry]:
     """Complete the current argument without replacing its enclosing call."""
-    columns = session.column_entries(doc, schema=schema)
+    columns = session.column_entries(doc, schema=schema, qualified="." in partial)
     if fn in SCALAR_FUNCTIONS:
         if fn not in _scalar_fns(schema):
             return []
         spec = SCALAR_FUNCTIONS[fn]
         arithmetic = arithmetic or (numeric_result and spec.result == "any")
         kind = spec.argument_kind(argument)
+        if spec.result_argument == argument and result_kind is not None:
+            kind = result_kind
         if kind is None or (arithmetic and kind == "string"):
             return []
         # Multi-argument calls stay open: the user chooses additional optional
@@ -523,15 +578,15 @@ def _call_argument_entries(
         rows = [
             (0, name, detail, f"{name}{suffix}")
             for name, type_, detail in columns
-            if _accepts_type(kind, type_) and (not arithmetic or _numeric_type(type_))
+            if accepts_type(kind, type_) and (not arithmetic or _numeric_type(type_))
         ]
         rows += [
             (1, nested, _scalar_detail(nested), f"{nested}(")
             for nested in _scalar_fns(schema)
-            if (kind == "any" or SCALAR_FUNCTIONS[nested].result == kind)
-            and (not arithmetic or SCALAR_FUNCTIONS[nested].result in {"integer", "any"})
+            if SCALAR_FUNCTIONS[nested].accepts_result(kind)
+            and (not arithmetic or SCALAR_FUNCTIONS[nested].result in {"integer", "float", "any"})
         ]
-        return _offers(rows, partial)
+        return _history_offers(session, doc, rows, partial)
     if argument or arithmetic:
         return []
     if fn in _aggregate_fns(schema):
@@ -542,7 +597,7 @@ def _call_argument_entries(
         ]
         if fn == "count":
             rows.append((1, "*", "every row", f"*{suffix}"))
-        return _offers(rows, partial)
+        return _history_offers(session, doc, rows, partial)
     families = {family for family, fns in schema.capabilities.functions.items() if fn in fns}
     if fn not in TEMPORAL or not families:
         return []
@@ -551,7 +606,7 @@ def _call_argument_entries(
         for name, type_, detail in columns
         if dtype_family(type_) in families
     ]
-    return _offers(rows, partial)
+    return _history_offers(session, doc, rows, partial)
 
 
 def _value_text(value: str) -> str:
@@ -568,7 +623,11 @@ def _value_entries(
         (0, value, f"{column} value", f"{_value_text(value)} ")
         for value in (value_lookup(column) if value_lookup is not None else session.values_for(doc, column, schema=schema))
     ]
-    return _offers(rows, token.strip("\"'"))[:VALUE_SUGGESTIONS]
+    dataset = session.dataset_of(doc, column, schema=schema)
+    target = f"{dataset}.{column.rsplit('.', 1)[-1]}"
+    recency = {value: rank for (kind, owner, value), rank in session.completion_usage().items()
+               if kind == "value" and owner == target}
+    return _offers(rows, token.strip("\"'"), recency=recency)[:VALUE_SUGGESTIONS]
 
 
 def _fn_call_entries(session: Session, token: str, schema: SchemaContext) -> list[Entry]:
@@ -582,7 +641,8 @@ def _fn_call_entries(session: Session, token: str, schema: SchemaContext) -> lis
         for index, (call, detail) in enumerate(session.fn_call_rows(schema=schema))
         if (rank := match_rank(call, token)) >= 0
     ]
-    kept.sort(key=lambda row: row[0])
+    recency = session.completion_ranks("", category="function")
+    kept.sort(key=lambda row: (row[0], recency.get(row[2].split("(", 1)[0], float("inf"))))
     return [Entry(label=call, insert=call, detail=detail, cursor_back=1) for _, _, call, detail in kept]
 
 
@@ -623,9 +683,72 @@ def _parameter_token(before: str) -> tuple[int, str] | None:
     return None
 
 
+def _join_view(
+    session: Session, doc: str, line: str, column: int, rest: str, start: int,
+    *, row: int | None = None,
+) -> View | None:
+    """Offer entire declared constraints, qualified with this join's identifiers."""
+    on = keyword_positions(rest, "on")
+    head = rest[:on[-1]] if on else rest
+    source = parse_source(head.strip())
+    if source is None or source[1] is not None:
+        return None
+    if not on and not rest[-1:].isspace():
+        return None
+    dataset, _, alias = source
+    identifier = alias or dataset
+    right = session.schema.table_by_name(dataset)
+    if right is None:
+        return None
+    lines = doc.split("\n")
+    if row is None:
+        row = next((index for index in range(len(lines) - 1, -1, -1) if lines[index] == line), len(lines))
+    opened = session.open_tables("\n".join(lines[:row]))
+    prefix = "" if on else "on "
+    on_end = on[-1] + 2 if on else len(rest)
+    token = rest[on_end:].lstrip() if on else ""
+    offset = len(rest) - len(token) if on else len(rest)
+    entries: list[Entry] = []
+    seen: set[str] = set()
+    for left in opened:
+        table = session.schema.table_by_name(left.dataset)
+        if table is None:
+            continue
+        constraints = [
+            (fk.columns, fk.target_columns) for fk in table.foreign_keys if fk.target_table == right.name
+        ] + [
+            (fk.target_columns, fk.columns) for fk in right.foreign_keys if fk.target_table == table.name
+        ]
+        for left_columns, right_columns in constraints:
+            if (not left_columns or len(left_columns) != len(right_columns)
+                    or not all(any(column.name == name for column in table.columns) for name in left_columns)
+                    or not all(any(column.name == name for column in right.columns) for name in right_columns)):
+                continue
+            predicate = " and ".join(
+                f"{left.identifier}.{a} = {identifier}.{b}" for a, b in zip(left_columns, right_columns)
+            )
+            if predicate in seen or match_rank(predicate, token) < 0:
+                continue
+            seen.add(predicate)
+            entries.append(Entry(prefix + predicate, prefix + predicate + " ", "foreign key"))
+    entries.sort(key=lambda entry: match_rank(entry.label.removeprefix("on "), token))
+    return View(start + offset, token, entries, phase="argument", end=len(line)) if entries else None
+
+
+def _default_group_columns(doc: str, schema: SchemaContext) -> str:
+    """Selected source columns in order, without replacing an explicit group."""
+    ast = parse_query(doc, schema=schema)
+    if ast.group_by or any(item.star or item.window or item.subquery for item in ast.select):
+        return ""
+    # Computed projections already group by their expression in the engine.
+    # Their input columns would change the grouping; output aliases are not
+    # source-column references accepted by the group clause.
+    return ", ".join(dict.fromkeys(item.column for item in ast.select if item.column))
+
+
 def view_for(
     session: Session, doc: str, line: str, column: int, *, parameters: Iterable[str] = (),
-    value_lookup: Callable[[str], list[str]] | None = None,
+    value_lookup: Callable[[str], list[str]] | None = None, row: int | None = None,
 ) -> View | None:
     """The palette view for the line text left of the caret, or `None`.
 
@@ -633,6 +756,11 @@ def view_for(
     has nothing to say about, or nothing left to suggest for what is typed.
     """
     schema = session.schema
+    if row is not None:
+        lines = doc.split("\n")
+        begin, stop = block_bounds(lines, row + 1)
+        doc = "\n".join(lines[begin:stop])
+        row -= begin
     before = line[:column]
     parameter = _parameter_token(before) if parameters else None
     if parameter is not None:
@@ -661,13 +789,31 @@ def view_for(
         if "(" in word:
             return None  # The name is complete; leave typed arguments untouched.
         entries = _command_entries(session, word, schema)
-        return View(start=slash, token=word, entries=entries,
-                    end=_token_end(line, slash, column)) if entries else None
+        end = _token_end(line, slash, column)
+        if not line[end:].strip():
+            for index, entry in enumerate(entries):
+                if entry.label == "\\group":
+                    group_doc = doc
+                    if row is not None and line[:slash].strip():
+                        # The accepted command will move to its own line. Do not
+                        # let its unfinished text corrupt the preceding select.
+                        block_lines = doc.split("\n")
+                        block_lines[row] = line[:slash] + line[end:]
+                        group_doc = "\n".join(block_lines)
+                    columns = _default_group_columns(group_doc, schema)
+                    if columns:
+                        entries[index] = Entry("\\group", f"\\group {columns} ", f"group selected columns · {columns}")
+                    break
+        return View(start=slash, token=word, entries=entries, end=end) if entries else None
 
     command = word.lower()
+    if command == "join":
+        joined = _join_view(session, doc, line, column, rest, slash + 1 + len(word) + len(gap), row=row)
+        if joined is not None:
+            return joined
     arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where", "drop"}
     if command in arguments:
-        token, offset = _where_token(rest) if command == "where" else _word(rest)
+        token, offset = (_where_token(rest) if command != "drop" else _word(rest))
     elif command == "select":
         position = _expression_position(rest)
         if position is None:
@@ -678,7 +824,10 @@ def view_for(
         segment, offset = _segment(rest)
         token = segment.strip()
     start = slash + 1 + len(word) + len(gap) + offset
-    end = _token_end(line, start, column)
+    end = _token_end(line, start, column, relation=(
+        command in DATASET_COMMANDS | SET_OP_COMMANDS
+        or relation_parts(token.rpartition(".")[0]) is not None
+    ))
 
     if command == "temp":
         # A temp table's name is new text, not a choice — nothing to offer.
@@ -697,7 +846,8 @@ def view_for(
             # stray Enter cannot append a second one.
             return None
         rows = [
-            (0, name, detail, f"{name} ")
+            (0, name, detail, session.table_insert(doc, name, schema=schema)
+             if command in DATASET_COMMANDS and not line[end:].strip() else f"{name} ")
             for name, detail in session.dataset_entries(doc, schema=schema)
         ]
         if command in SET_OP_COMMANDS and not modifier:
@@ -705,7 +855,7 @@ def view_for(
             rows += [(1, name, detail, f"{name} ") for name, detail in SET_OP_MODIFIERS]
         # Saved functions complete here too — accepted as a `name()` call with
         # the caret inside the parens — after the datasets, in match order.
-        entries = _offers(rows, token) + _fn_call_entries(session, token, schema)
+        entries = _history_offers(session, doc, rows, token, category="dataset") + _fn_call_entries(session, token, schema)
     elif command == "select":
         if fn is not None:
             entries = _call_argument_entries(
@@ -713,11 +863,19 @@ def view_for(
                 arithmetic=position.arithmetic,
                 close=position.close and not line[end:].lstrip().startswith((")", ",", "\\where", *ARITHMETIC_PRECEDENCE)),
                 numeric_result=position.numeric_result,
+                result_kind=position.result_kind,
             )
         else:
             entries = _select_entries(session, doc, token, schema, arithmetic=position.arithmetic)
     elif command in COLUMN_COMMANDS:
         entries = _column_offers(session, doc, token, schema)
+        if command == "group" and not rest.strip() and not line[column:].strip():
+            columns = _default_group_columns(doc, schema)
+            if columns:
+                entries = [Entry(columns, f"{columns} ", "all selected non-aggregate columns"),
+                           *(entry for entry in entries if entry.label != columns)]
+        elif command == "group" and rest.strip() and not token and not rest.rstrip().endswith(","):
+            return None  # A completed group lets Enter start the next clause.
     elif command == "where":
         entries = _where_entries(session, doc, rest[:offset], token, schema, value_lookup)
     else:
@@ -760,7 +918,7 @@ def _where_entries(
         return _column_offers(session, doc, token, schema)
     head = where_head(piece.strip())
     if head is None:
-        if len(words) == 1 and _COL_PATTER.match(words[0]):
+        if _COL_PATTER.fullmatch(piece.strip()):
             return _offers([(0, op, "operator", f"{op} ") for op in ops], token)
         # A column plus partial operator words (`amount is`, `amount n`): the
         # multi-word operators those words begin, offered as the remainder of
@@ -861,7 +1019,7 @@ class CommandPalette(OptionList):
         self.parameters = parameters
         self.editor = None
         self._view: View | None = None
-        self._labels: list[str] = []
+        self._preferred_width = 24
         # True after Escape: the offers stay shut until a `\` (or Escape) lifts it.
         self._dismissed = False
         self._value_key: tuple[int, str, str, int] | None = None
@@ -879,6 +1037,13 @@ class CommandPalette(OptionList):
     def attach(self, editor) -> None:
         """Bind this palette to the editor whose text and caret it follows."""
         self.editor = editor
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Textual otherwise focuses a scrollable ancestor of this unfocusable
+        # popup, dismissing it before the click can select a row.
+        if self.editor is not None:
+            self.editor.focus()
+        event.stop()
 
     def reset_values(self) -> None:
         """Drop the current transient response after cache settings/clear change."""
@@ -958,6 +1123,7 @@ class CommandPalette(OptionList):
                 view_for(
                     self.session, editor.text, line, column,
                     parameters=self.parameters() if self.parameters is not None else (),
+                    row=row,
                     value_lookup=value_lookup,
                 )
                 if self.session.intellisense and not self._dismissed
@@ -972,42 +1138,74 @@ class CommandPalette(OptionList):
             view = View(view.start, view.token, [e for e in view.entries if not e.action], view.phase, view.end)
             if not view.entries:
                 view = None
+        if (view is not None and view.phase == "argument"
+                and (len(view.entries) == 1 or line[:column].endswith((" ", "\t")))
+                and (view.end is None or view.end == column)
+                and any(not entry.cursor_back and not entry.insert.startswith("\\")
+                        and view.highlighted_is_typed(index)
+                        for index, entry in enumerate(view.entries))):
+            # A completed leaf has no next choice. Keep calls, table aliases,
+            # operators and other genuine continuations, not the accepted field.
+            view = None
         if view is None:
             self.close()
             return
-        if view.labels != self._labels:
+        previous = self._view
+        if previous is None or view.entries != previous.entries:
             self.clear_options()
-            self.add_options(
-                [
-                    Option(prompt(entry.label, entry.detail), id=f"opt-{index}")
-                    for index, entry in enumerate(view.entries)
-                ]
-            )
-            self._labels = view.labels
+            prompts = [prompt(entry.label, entry.detail) for entry in view.entries]
+            self._preferred_width = min(62, max(24, max(item.cell_length for item in prompts) + 5))
+            self.add_options([Option(item, id=f"opt-{index}") for index, item in enumerate(prompts)])
             self.highlighted = 0
         elif self.highlighted is None:
             self.highlighted = 0
         self._view = view
-        self._place()
+        placed = self._place()
+        self.styles.visibility = "visible" if placed else "hidden"
         if not self.is_open:
             self.add_class("open")
             self.scroll_to_highlight()
+        if not placed:
+            # A just-shown editor has no usable geometry until layout finishes.
+            # Keep its current offers, but never paint them at an old position.
+            self.call_after_refresh(self.reposition)
 
-    def _place(self) -> None:
-        """Float the popup just under the caret, no taller than the pane allows."""
+    def _place(self) -> bool:
+        """Fit up to six single-line offers beside the actual rendered caret."""
         pane = self.parent
         editor = self.editor
         if editor is None or pane is None:
-            return
-        caret_row = editor.cursor_location[0] - int(editor.scroll_offset.y)
-        top = min(max(caret_row + 2, 1), max(pane.content_size.height - 3, 1))
-        self.styles.offset = (1, top)
-        self.styles.max_height = max(pane.content_size.height - top - 1, 4)
+            return False
+        visible = editor.content_region.intersection(pane.content_region).intersection(self.screen.region)
+        caret = editor.cursor_screen_offset
+        if caret not in visible:
+            return False
+        desired_height = min(self.option_count, 6) + 2
+        below = visible.bottom - caret.y - 1
+        above = caret.y - visible.y
+        place_below = below >= desired_height or below >= above
+        height = min(desired_height, below if place_below else above)
+        if height < 3 or visible.width < 8:
+            return False
+        width = min(self._preferred_width, visible.width)
+        left = max(visible.x, min(caret.x, visible.right - width))
+        top = caret.y + 1 if place_below else caret.y - height
+        self.styles.offset = (left - pane.content_region.x, top - pane.content_region.y)
+        self.styles.width = width
+        self.styles.height = height
+        return True
+
+    def reposition(self) -> None:
+        """Follow wrapping, scrolling and resizing without reopening a dismissed list."""
+        if self.is_open:
+            if self._place():
+                self.styles.visibility = "visible"
+            else:
+                self.close()
 
     def close(self) -> None:
         """Hide the palette without touching the document."""
         self._view = None
-        self._labels = []
         self.remove_class("open")
 
     def escape(self) -> None:
@@ -1037,12 +1235,14 @@ class CommandPalette(OptionList):
 
     # -- accepting ----------------------------------------------------------
 
-    def accept_highlighted(self) -> bool:
+    def accept_highlighted(self, *, newline: bool = False) -> bool:
         """Accept the highlighted row; False when there is nothing to accept."""
+        if not self.is_open:
+            self.sync(respect_dismissal=True)
         index = self.highlighted
-        return False if index is None else self.accept(index)
+        return False if index is None else self.accept(index, newline=newline)
 
-    def accept(self, index: int) -> bool:
+    def accept(self, index: int, *, newline: bool = False) -> bool:
         """Apply row `index`; False when accepting it would change nothing.
 
         The palette is not closed on the way out: the accept ends by syncing to
@@ -1059,7 +1259,16 @@ class CommandPalette(OptionList):
             return False
         entry = view.entries[index]
         row, column = editor.cursor_location
+        if newline and view.phase == "argument" and entry.label == view.token.strip():
+            before = editor.document[row][:column]
+            slash, _ = _command_context(before)
+            word, _, _ = _split(before[slash + 1:])
+            if word.lower() in DATASET_COMMANDS:
+                # A fully typed table followed by Enter is a newline, not an
+                # implicit completion choice. Tab/click still select an alias.
+                return False
         if (not entry.action and view.highlighted_is_typed(index)
+                and (newline or not entry.insert.startswith("\\"))
                 and (view.end is None or view.end == column)):
             return False
         if entry.action:
@@ -1069,7 +1278,7 @@ class CommandPalette(OptionList):
         else:
             command = entry.insert.strip()
             if command.startswith("\\") and view.phase == "command":
-                name = command[1:].lower()
+                name = entry.label[1:].lower()
                 # Saved call offers are source clauses, just like \from.
                 self._take_clause(editor, row, column, view,
                                   name if name in CLAUSE_NAMES else "from", entry)
@@ -1145,6 +1354,27 @@ class EditorPane(Vertical):
 
     def on_mount(self) -> None:
         self.palette.attach(self.editor)
+        self.watch(self.editor, "scroll_x", self._queue_palette_placement, init=False)
+        self.watch(self.editor, "scroll_y", self._queue_palette_placement, init=False)
+
+    def _queue_palette_placement(self) -> None:
+        self.call_after_refresh(self.palette.reposition)
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._resize_palette)
+
+    def _resize_palette(self) -> None:
+        if self.app.focused is self.editor:
+            self.editor.scroll_cursor_visible()
+        self.palette.reposition()
+
+    def on_descendant_blur(self, event: events.DescendantBlur) -> None:
+        if event.widget is self.editor:
+            self.call_after_refresh(self._close_unfocused_palette)
+
+    def _close_unfocused_palette(self) -> None:
+        if self.app.focused is not self.editor:
+            self.palette.close()
 
     @on(TextArea.Changed)
     def _editor_changed(self) -> None:
@@ -1182,7 +1412,7 @@ class EditorPane(Vertical):
         closes and Enter means what it always means.
         """
         palette = self.palette
-        if palette.is_open and palette.accept_highlighted():
+        if palette.is_open and palette.accept_highlighted(newline=True):
             return
         palette.close()
         editor = self.editor
@@ -1201,4 +1431,4 @@ class EditorPane(Vertical):
 
     def action_palette_tab(self) -> bool:
         """Accept an offer without moving focus; report whether it changed the document."""
-        return self.palette.is_open and self.palette.accept_highlighted()
+        return self.palette.accept_highlighted()

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Literal
 
-ArgumentKind = Literal["string", "integer", "any"]
-ResultKind = Literal["string", "integer", "boolean", "date", "time", "timestamp", "any"]
+ArgumentKind = Literal["string", "integer", "any", "json_input", "json_key"]
+ResultKind = Literal["string", "integer", "float", "boolean", "date", "time", "timestamp", "json", "any"]
 
 ARITHMETIC_PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2}
 MAX_EXPRESSION_DEPTH = 32
@@ -21,6 +22,7 @@ class ScalarFunction:
     minimum: int
     result: ResultKind = "string"
     variadic: bool = False
+    result_argument: int | None = None
 
     def accepts(self, count: int) -> bool:
         return count >= self.minimum and (self.variadic or count <= len(self.parameters))
@@ -30,11 +32,44 @@ class ScalarFunction:
             return self.parameters[index]
         return self.parameters[-1] if self.variadic else None
 
+    def result_type(self, arguments: Sequence[str] = ()) -> str:
+        if self.result_argument is not None and self.result_argument < len(arguments):
+            return arguments[self.result_argument]
+        if self.result == "integer":
+            return "int64"
+        if self.result == "float":
+            return "float64"
+        return self.result
+
+    def accepts_result(self, kind: ArgumentKind) -> bool:
+        # Argument-dependent calls can produce any of their input's accepted types.
+        result = self.result_type()
+        return result == "any" or accepts_type(kind, result)
+
+
+def accepts_type(kind: ArgumentKind, dtype: str) -> bool:
+    """Shared catalog type families for completion; engine checks Ibis dtypes."""
+    dtype = dtype.removeprefix("!")
+    if kind == "any":
+        return True
+    if kind == "json_input":
+        return dtype in {"string", "json", "jsonb"}
+    if kind == "json_key":
+        return dtype == "string" or dtype.startswith(("int", "uint"))
+    if kind == "integer":
+        return dtype.startswith(("int", "uint"))
+    return dtype == kind
+
 
 SCALAR_FUNCTIONS: dict[str, ScalarFunction] = {
     "string": ScalarFunction(("any",), 1),
-    "coalesce": ScalarFunction(("any", "any"), 2, "any", variadic=True),
-    "nullif": ScalarFunction(("any", "any"), 2, "any"),
+    "coalesce": ScalarFunction(("any", "any"), 2, "any", variadic=True, result_argument=0),
+    "nullif": ScalarFunction(("any", "any"), 2, "any", result_argument=0),
+    "json_get": ScalarFunction(("json_input", "json_key"), 2, "json", variadic=True),
+    "json_text": ScalarFunction(("json_input", "json_key"), 1, "string", variadic=True),
+    "json_int": ScalarFunction(("json_input", "json_key"), 1, "integer", variadic=True),
+    "json_float": ScalarFunction(("json_input", "json_key"), 1, "float", variadic=True),
+    "json_bool": ScalarFunction(("json_input", "json_key"), 1, "boolean", variadic=True),
     "concat": ScalarFunction(("string", "string"), 2, variadic=True),
     "concat_ws": ScalarFunction(("string", "string"), 2, variadic=True),
     "lower": ScalarFunction(("string",), 1),
@@ -68,6 +103,8 @@ SCALAR_FUNCTIONS: dict[str, ScalarFunction] = {
     "as_timestamp": ScalarFunction(("string", "string"), 2, "timestamp"),
     "convert_base": ScalarFunction(("string", "integer", "integer"), 3),
 }
+
+JSON_FUNCTIONS: tuple[str, ...] = tuple(fn for fn in SCALAR_FUNCTIONS if fn.startswith("json_"))
 
 # The five URL accessors, in catalog order: renderable where a backend has a
 # rule (the local SQLite backend registers UDFs for them; DuckDB in this ibis

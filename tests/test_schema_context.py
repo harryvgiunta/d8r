@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from d8r.engine.execute import execute
-from d8r.query import Capabilities, ColumnDef, FnDef, SchemaContext, TableDef, parse_query, payload_from_ast
+from d8r.query import Capabilities, ColumnDef, FnDef, ForeignKey, SchemaContext, TableDef, parse_query, payload_from_ast
 from d8r.tui.palette import view_for
 from d8r.tui.session import Session
 
@@ -58,7 +58,10 @@ def test_captured_context_survives_function_replacement_deletion_and_source_swit
 def test_constructor_inputs_cannot_mutate_a_schema_snapshot():
     values = ["active"]
     columns = [ColumnDef("status", "string", values=values)]
-    tables = [TableDef("events", columns=columns)]
+    key_columns = ["status"]
+    target_columns = ["code"]
+    foreign_keys = [ForeignKey(key_columns, "statuses", target_columns)]
+    tables = [TableDef("events", columns=columns, foreign_keys=foreign_keys)]
     params = ["value"]
     functions = [FnDef("sample", params, "\\from events\n\\select @value as marker")]
     aggregates = ["count"]
@@ -72,6 +75,9 @@ def test_constructor_inputs_cannot_mutate_a_schema_snapshot():
 
     values.append("injected")
     columns.clear()
+    key_columns.clear()
+    target_columns.clear()
+    foreign_keys.clear()
     tables.clear()
     params[0] = "undeclared"
     functions.clear()
@@ -86,6 +92,7 @@ def test_constructor_inputs_cannot_mutate_a_schema_snapshot():
     assert ast.errors == []
     assert ast.from_.body.select[0].literal.value == "kept"
     assert context.table_by_name("events").columns[0].values == ("active",)
+    assert context.table_by_name("events").foreign_keys == (ForeignKey(("status",), "statuses", ("code",)),)
     assert context.column_by_name("status").values == ("active",)
     assert context.capabilities.aggregates == ("count",)
     assert context.capabilities.functions["string"] == ("upper",)
@@ -96,7 +103,8 @@ def test_constructor_inputs_cannot_mutate_a_schema_snapshot():
 
 def test_snapshot_records_and_nested_containers_reject_mutation():
     context = SchemaContext(
-        [TableDef("events", columns=[ColumnDef("status", "string", values=["active"])])],
+        [TableDef("events", columns=[ColumnDef("status", "string", values=["active"])],
+                  foreign_keys=[ForeignKey(["status"], "statuses", ["code"])])],
         Capabilities("snapshot", ["count"], {"string": ["upper"]}, ["="], supports={"regex": True}),
         [FnDef("sample", ["value"], "\\from events\n\\select @value as marker")],
     )
@@ -106,6 +114,14 @@ def test_snapshot_records_and_nested_containers_reject_mutation():
         context.tables[0].name = "renamed"
     with pytest.raises(FrozenInstanceError):
         context.tables[0].columns[0].type = "int64"
+    with pytest.raises(FrozenInstanceError):
+        context.tables[0].foreign_keys[0].target_table = "injected"
+    with pytest.raises(TypeError):
+        context.tables[0].foreign_keys[0].columns[0] = "injected"
+    with pytest.raises(TypeError):
+        context.tables[0].foreign_keys[0].target_columns[0] = "injected"
+    with pytest.raises(TypeError):
+        context.tables[0].foreign_keys[0] = ForeignKey((), "injected", ())
     with pytest.raises(FrozenInstanceError):
         context.fns[0].body = "\\from missing"
     with pytest.raises(FrozenInstanceError):

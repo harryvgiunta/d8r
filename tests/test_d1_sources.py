@@ -31,6 +31,7 @@ from d8r.engine import (
     expression,
 )
 from d8r.engine.make_data import write_d1_snapshot
+from d8r.query import ForeignKey
 from tests.conftest import DATA_DIR
 
 SNAPSHOT_TABLES = {"orders", "customers"}
@@ -45,7 +46,7 @@ def sqlite_file(tmp_path):
     con.executescript(
         """
         create table customers(id integer primary key, region text);
-        create table orders(id integer primary key, customer_id integer, amount real);
+        create table orders(id integer primary key, customer_id integer references customers(id), amount real);
         create table _cf_meta(x integer);
         insert into customers values (1, 'emea'), (2, 'amer');
         insert into orders values (1, 1, 10.0), (2, 1, 5.0), (3, 2, 7.5);
@@ -68,6 +69,8 @@ def test_snapshot_source_reports_its_datasets(sqlite_file):
     assert source.display == "D1 prod"
     assert set(source.datasets) == SNAPSHOT_TABLES
     assert {name: e["rows"] for name, e in source.datasets.items()} == {"customers": 2, "orders": 3}
+    assert source.datasets["customers"]["foreign_keys"] == ()
+    assert source.datasets["orders"]["foreign_keys"] == (ForeignKey(("customer_id",), "customers", ("id",)),)
 
 
 def test_snapshot_source_filters_internal_objects(sqlite_file):
@@ -152,6 +155,10 @@ def test_bundled_snapshot_opens():
         assert source.con.table("readings").columns == (
             "reading_id", "station_id", "temperature_c",
         )
+        assert source.datasets["readings"]["foreign_keys"] == (
+            ForeignKey(("station_id",), "stations", ("station_id",)),
+        )
+        assert source.datasets["stations"]["foreign_keys"] == ()
         stations = execute(source.con, {
             "dataset": "stations",
             "orderBy": [{"target": "station_id", "direction": "asc"}],
@@ -505,7 +512,7 @@ def test_lazy_metadata_is_selective_quoted_and_cached(sqlite_cloudflare):
     name = 'order\'s "details'
     sent.clear()
     assert source.con.table(name).schema().names == ("id", "amount")
-    assert len(sent) == 1
+    assert all("sqlite_schema" in sql and "m.name in" in sql for sql in sent)
     assert source.con.list_tables() == [name]
     sent.clear()
     assert source.con.table(name).schema().names == ("id", "amount")
@@ -525,6 +532,86 @@ def test_lazy_metadata_is_selective_quoted_and_cached(sqlite_cloudflare):
     for hidden in ("_cf_meta", "sqlite_sequence", "absent"):
         with pytest.raises(KeyError):
             source.con.table(hidden)
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["snapshot", "live"])
+def test_foreign_keys_preserve_pairs_and_resolve_implicit_primary_keys(sqlite_cloudflare, tmp_path, live):
+    database, client, sent = sqlite_cloudflare
+    database.executescript('''
+        create table "parent's key" (
+            second integer, first integer, primary key(first, second), unique(second, first)
+        );
+        create table child (
+            first_ref integer, second_ref integer,
+            foreign key(first_ref, second_ref) references "parent's key",
+            foreign key(second_ref, first_ref) references "parent's key"(second, first)
+        );
+        create table unresolved (ref integer references missing);
+        create table mismatched (ref integer references "parent's key");
+    ''')
+    expected = (
+        ForeignKey(("second_ref", "first_ref"), "parent's key", ("second", "first")),
+        ForeignKey(("first_ref", "second_ref"), "parent's key", ("first", "second")),
+    )
+    if live:
+        # Introspection remains possible even when all user-row reads are denied.
+        def authorize(action, table, column, schema, trigger):
+            if action == sqlite3.SQLITE_READ and table in {"child", "parent's key", "unresolved", "mismatched"}:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        database.set_authorizer(authorize)
+        source = add_d1_live_source("fk-live", client=client, **LIVE_ARGS)
+        source.con.table("child")
+        assert source.con.list_tables() == ["child"]
+        sent.clear()
+        assert source.con.foreign_keys("child") == expected
+        assert source.con.foreign_keys("unseen") == ()
+        assert sent == []
+        schemas = client.schemas()
+        source.con.seed(schemas)
+        keys = {name: source.con.foreign_keys(name) for name in source.con.list_tables()}
+    else:
+        path = tmp_path / "foreign-keys.sqlite"
+        with closing(sqlite3.connect(path)) as snapshot:
+            database.backup(snapshot)
+        source = add_sqlite_source("fk-snapshot", str(path))
+        keys = {name: entry["foreign_keys"] for name, entry in source.datasets.items()}
+    try:
+        assert keys["child"] == expected
+        assert keys["parent's key"] == ()
+        assert keys["unresolved"] == (ForeignKey(("ref",), "missing", ()),)
+        assert keys["mismatched"] == (ForeignKey(("ref",), "parent's key", ()),)
+    finally:
+        if not live:
+            source.con.disconnect()
+
+
+def test_foreign_key_discovery_failure_does_not_publish_partial_metadata(sqlite_cloudflare, monkeypatch):
+    database, client, _ = sqlite_cloudflare
+    database.executescript('''
+        create table parent (id integer primary key);
+        create table child (ref integer references parent);
+        create table unseen (ref integer references parent);
+    ''')
+    source = add_d1_live_source("fk-failure", client=client, **LIVE_ARGS)
+    source.con.table("child")
+    known = source.con.foreign_keys("child")
+    query = client.query
+
+    def fail_constraints(sql):
+        if "pragma_foreign_key_list" in sql:
+            raise D1Error("constraint metadata unavailable")
+        return query(sql)
+
+    monkeypatch.setattr(client, "query", fail_constraints)
+    with pytest.raises(D1Error, match="constraint metadata unavailable"):
+        source.con.table("unseen")
+    with pytest.raises(D1Error, match="constraint metadata unavailable"):
+        client.schemas()
+    assert source.con.list_tables() == ["child"]
+    assert source.con.foreign_keys("child") == known == (ForeignKey(("ref",), "parent", ("id",)),)
+    assert not source.schema_indexed
 
 
 @pytest.mark.parametrize("failure", ["auth", "transport"])

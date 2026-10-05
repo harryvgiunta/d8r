@@ -35,6 +35,7 @@ from .ast import (
     WindowOrder,
     WithClause,
 )
+from .identifiers import is_relation_name, relation_basename, relation_name
 from .parser import (
     NULL_OPS,
     REGEX_OPS,
@@ -63,6 +64,7 @@ from .schema import (
     Capabilities,
     ColumnDef,
     DtypeFamily,
+    ForeignKey,
     OpenTable,
     PoolColumn,
     SchemaContext,
@@ -91,6 +93,7 @@ __all__ = [
     "EMPTY_SCHEMA",
     "FrameBounds",
     "FrameKind",
+    "ForeignKey",
     "FromClause",
     "GroupTerm",
     "JoinClause",
@@ -127,6 +130,9 @@ __all__ = [
     "dtype_family",
     "effective_alias",
     "is_identifier",
+    "is_relation_name",
+    "relation_basename",
+    "relation_name",
     "open_tables_of",
     "param_spans",
     "parse_body",

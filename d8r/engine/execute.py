@@ -48,7 +48,7 @@ def execute(con, payload: dict, dialect: str | None = None, tables: dict | None 
     expr = expression.build(con, payload, tables=tables)
     sql = expression.compile_sql(expr, dialect=dialect)
     started = time.perf_counter()
-    frame = expr.execute()
+    frame = expression.lower_for_backend(expr, con.name).execute()
     return _result(frame, sql, dialect, started)
 
 
@@ -65,6 +65,7 @@ def materialize(
     expr = expression.build(con, payload, tables=tables)
     sql = expression.compile_sql(expr, dialect=dialect)
     started = time.perf_counter()
+    expr = expression.lower_for_backend(expr, con.name)
     tx.create_temp(con, name, expr)
     frame = tx.temp_handle(con, name, expr.schema()).execute()
     return _result(frame, sql, dialect, started)

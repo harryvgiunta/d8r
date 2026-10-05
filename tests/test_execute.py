@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+import ibis
 
 from d8r.engine import add_sqlite_source, expression
 from d8r.engine.execute import execute
@@ -44,6 +45,91 @@ def test_purchases_payload_executes(con):
     assert result.shape[0] == 1
     assert float(result["revenue"][0]) > 0
     assert result["event_type"][0] == "purchase"
+
+
+def test_qualified_registry_compiles_selected_physical_schema():
+    selected = ibis.table({"id": "int64"}, name="dataset_symbol", database="etl")
+    tables = {"etl.dataset_symbol": selected}
+    for operand in ("etl.dataset_symbol", "dataset_symbol"):
+        ast = parse_query(f"\\from {operand}\n\\select {operand}.id", settled=True)
+        assert ast.errors == []
+        expr = expression.build(None, payload_from_ast(ast), tables=tables)
+        sql = expression.compile_sql(expr, dialect="postgres")
+        assert '"etl"."dataset_symbol"' in sql
+        assert '"public"' not in sql
+
+    public = ibis.table({"id": "int64"}, name="dataset_symbol", database="public")
+    tables["public.dataset_symbol"] = public
+    with pytest.raises(expression.PayloadError, match="ambiguous dataset"):
+        expression.build(None, {"dataset": "dataset_symbol"}, tables=tables)
+    exact = expression.build(None, {"dataset": "etl.dataset_symbol"}, tables=tables)
+    assert '"etl"."dataset_symbol"' in expression.compile_sql(exact, dialect="postgres")
+
+
+def test_registry_bare_exact_and_cte_precedence(count_source):
+    events = count_source.table("usage_events")
+    selected = events.filter(events.id == 11).select("id")
+    temporary = events.filter(events.id == 12).select("id")
+    cte = events.filter(events.id == 13).select("id")
+    tables = {"etl.symbols": selected, "symbols": temporary}
+    assert expression.build(count_source, {"dataset": "symbols"}, tables=tables).execute()["id"].tolist() == [12]
+    assert expression.build(count_source, {"dataset": "symbols"}, {"symbols": cte}, tables).execute()["id"].tolist() == [13]
+    assert expression.build(count_source, {"dataset": "etl.symbols"}, {"symbols": cte}, tables).execute()["id"].tolist() == [11]
+
+
+def test_schema_qualified_engine_aliases_are_strict(count_source):
+    tables = {"etl.symbols": count_source.table("usage_events")}
+    for ref in ("etl.symbols.id", "symbols.id"):
+        with pytest.raises(expression.PayloadError, match="unknown column"):
+            expression.build(count_source, {
+                "dataset": "etl.symbols", "alias": "s", "select": [{"column": ref}],
+            }, tables=tables)
+    ast = parse_query("\\from etl.symbols s\n\\select s.id\n\\where s.id = 11", settled=True)
+    assert expression.build(count_source, payload_from_ast(ast), tables=tables).execute()["id"].tolist() == [11]
+
+
+def test_qualified_join_nested_set_and_lateral_execute(count_source):
+    tables = {
+        "etl.usage_events": count_source.table("usage_events"),
+        "etl.projects": count_source.table("projects"),
+    }
+    ast = parse_query(
+        "\\from etl.usage_events\n"
+        "\\join etl.projects on etl.usage_events.project_id = etl.projects.id\n"
+        "\\select etl.usage_events.id\n\\where etl.projects.name = Paid\n"
+        "\\union (\\from etl.usage_events \\select etl.usage_events.id \\where id = 11)\n"
+        "\\order id", settled=True,
+    )
+    assert ast.errors == []
+    result = expression.build(count_source, payload_from_ast(ast), tables=tables).execute()
+    assert result["id"].tolist() == [11, 14]
+
+    lateral = parse_query(
+        "\\from etl.projects\n"
+        "\\join lateral (\\from etl.usage_events "
+        "\\where etl.usage_events.project_id = etl.projects.id) matched\n"
+        "\\select matched.id\n\\where etl.projects.name = Paid", settled=True,
+    )
+    assert lateral.errors == []
+    result = expression.build(count_source, payload_from_ast(lateral), tables=tables).execute()
+    assert result["id"].tolist() == [14]
+
+
+def test_quoted_relation_registry_resolves_bare_and_full_names(count_source):
+    from d8r.query import relation_name
+
+    dataset = relation_name('etl."quoted schema', "symbols")
+    tables = {dataset: count_source.table("usage_events")}
+    ast = parse_query(
+        f"\\from {dataset}\n\\select {dataset}.id + 1 as next_id\n\\where {dataset}.id = 11",
+        settled=True,
+    )
+    assert ast.errors == []
+    result = expression.build(count_source, payload_from_ast(ast), tables=tables).execute()
+    assert result["next_id"].tolist() == [12]
+    ast = parse_query("\\from symbols\n\\select id\n\\where id = 11", settled=True)
+    result = expression.build(count_source, payload_from_ast(ast), tables=tables).execute()
+    assert result["id"].tolist() == [11]
 
 
 def test_like_is_the_sql_pattern_match_and_ilike_ignores_case(con):
@@ -313,6 +399,58 @@ def test_join_inner_row_conservation(con):
     )
     assert frame.shape[0] == 100  # every events.user_id exists in users
 
+
+
+@pytest.mark.parametrize("right_source", [
+    "parents p",
+    "(\\from parents \\select tenant_id, id, name) p",
+])
+def test_compound_join_matches_every_foreign_key_column(tmp_path, right_source):
+    path = tmp_path / "composite.sqlite"
+    with sqlite3.connect(path) as raw:
+        raw.execute("create table parents (tenant_id integer, id integer, name text)")
+        raw.executemany(
+            "insert into parents values (?, ?, ?)",
+            [(1, 10, "one"), (2, 10, "two"), (2, 20, "other")],
+        )
+        raw.execute("create table children (id integer, tenant_id integer, parent_id integer)")
+        raw.executemany(
+            "insert into children values (?, ?, ?)",
+            [(11, 1, 10), (12, 2, 10), (13, 3, 10), (14, 1, 20)],
+        )
+    raw.close()
+    source = add_sqlite_source("composite", str(path))
+    try:
+        ast = parse_query(
+            "\\from children c\n\\join " + right_source
+            + " on c.parent_id = p.id AND p.tenant_id = c.tenant_id\n"
+            "\\select c.id as child, p.name\n\\order child",
+            settled=True,
+        )
+        assert ast.errors == []
+        payload = json.loads(json.dumps(payload_from_ast(ast)))
+        assert execute(source.con, payload)["rows"] == [[11, "one"], [12, "two"]]
+    finally:
+        source.con.disconnect()
+
+
+@pytest.mark.parametrize("extra, message", [
+    ({"keys": None}, "join keys"),
+    ({"keys": "user_id = user_id"}, "join keys"),
+    ({"keys": [["user_id"]]}, "join key pair"),
+    ({"keys": [["user_id", "user_id", "score"]]}, "join key pair"),
+    ({"keys": [{"left": "user_id", "right": "user_id"}]}, "join key pair"),
+    ({"keys": [["user_id", None]]}, "join key pair"),
+    ({"keys": [["user_id", ""]]}, "join key pair"),
+    ({"keys": [["user_id", "ghost"]]}, "unknown join key"),
+    ({"keys": [["ghost.user_id", "user_id"]]}, "unknown join key"),
+    ({"keys": [["user_id", "user_id"]], "op": "or"}, "unknown fields"),
+    ({"keys": [["user_id", "user_id"]], "lateral": True}, "compound ON keys"),
+])
+def test_compound_join_payload_refuses_malformed_or_ignored_constraints(con, extra, message):
+    spec = {"dataset": "users", "left": "user_id", "right": "user_id", **extra}
+    with pytest.raises(expression.PayloadError, match=message):
+        expression.build(con, {"dataset": "events", "joins": [spec]})
 
 def test_join_payload_errors(con):
     with pytest.raises(expression.PayloadError, match="unknown dataset"):

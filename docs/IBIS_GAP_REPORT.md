@@ -346,6 +346,11 @@ table comments, no foreign keys anywhere: a grep over the entire installed
 via ibis" is not an ibis gap at all; D8R's `TableDef.doc`/`ColumnDef.doc`
 fields (`d8r/query/schema.py:27-44`) are its own catalog text and can stay so.
 
+D8R now supplements Ibis dtype metadata with declared constraints from PostgreSQL
+`pg_catalog` and SQLite/D1 pragma catalogs. Immutable `TableDef.foreign_keys`
+snapshots drive qualified join-key completion, including composite constraints;
+no relationship is guessed from column names and completion performs no I/O.
+
 | capability | ibis surface | D8R status | where it would hook in | effort | recommendation |
 | --- | --- | --- | --- | --- | --- |
 | column profiling | `Column.value_counts()`, `Column.topk(k)`, `Column.histogram(bins)`, `Table.describe()` (compiles on duckdb/postgres/snowflake, fails on sqlite/athena via missing Quantile/Mode rules — verified), `Table.info()` | **missing** — the Schema pane shows names/types/D8R docs; the value pool (`datasources.column_values`, `.distinct()` capped at `VALUE_POOL_LIMIT=1000`) is the only statistics that exist | Schema-pane "profile column": `session` runs `col.value_counts().limit(n)` through the existing execute seam | M | recommended — it's the IDE's "what is in this column" moment |

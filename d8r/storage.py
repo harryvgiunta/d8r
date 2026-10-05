@@ -127,13 +127,17 @@ def _settings(value: object) -> dict:
     """Validate editable settings and fill omitted keys without retaining aliases."""
     defaults = {
         "version": 1, "intellisense": True,
-        "panes": {"results": True, "sql": True, "history": True, "schema": True},
-        "pane_sizes": {"explorer": 36, "ai": 44, "editor": 18},
+        "entry_screen": False,
+        "panes": {"results": True, "sql": True, "history": True, "schema": True,
+                  "agents": True, "ai": False},
+        "pane_sizes": {"explorer": 36, "ai": 44, "editor": 22},
         "source": "demo", "dialect": "duckdb",
         "default_rows": 50,
         "value_cache_enabled": True,
         "value_cache_limit": 1000,
         "ai_auto_accept": False,
+        "ai_allow_sample_data": False,
+        "ai_allow_schema_refreshes": True,
         "ai": asdict(AIConfig()),
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
@@ -143,8 +147,13 @@ def _settings(value: object) -> dict:
         raise ValueError("unsupported settings version (expected 1)")
     if type(document["intellisense"]) is not bool:
         raise ValueError("intellisense must be a boolean")
+    if type(document["entry_screen"]) is not bool:
+        raise ValueError("entry_screen must be a boolean")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes"):
+        if type(document[field]) is not bool:
+            raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
         raise ValueError("Cache column values must be a boolean.")
     if type(document["value_cache_limit"]) is not int or not 1 <= document["value_cache_limit"] <= 10_000:
@@ -397,7 +406,7 @@ def _workspace_document(value: object) -> dict:
         _text(document[name], f"workspace {name}")
     if document["dialect"] and document["dialect"] not in DIALECT_BY_NAME:
         raise ValueError("unsupported workspace dialect")
-    if document["explorer_tab"] not in ("schema", "pages"):
+    if document["explorer_tab"] not in ("schema", "pages", "agents"):
         raise ValueError("invalid explorer tab")
     if not isinstance(document["pages"], list):
         raise ValueError("invalid query pages")

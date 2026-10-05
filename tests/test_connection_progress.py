@@ -230,8 +230,8 @@ def test_add_timeout_restores_form_without_saving_and_retry_can_succeed(sources,
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("interrupt", ["cancel", "new-page"])
-def test_interrupted_run_connection_cannot_register_or_execute_late(
+@pytest.mark.parametrize("interrupt", ["cancel", "new-page", "switch"])
+def test_interrupted_startup_connection_cannot_register_or_execute_late(
     sources, tmp_path, monkeypatch, pending_source, interrupt,
 ):
     from d8r.tui.app import D8RApp
@@ -251,21 +251,22 @@ def test_interrupted_run_connection_cannot_register_or_execute_late(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             app.editor.load_text("\\from orders")
-            app.action_run()
             assert await asyncio.to_thread(pending.started.wait, 2)
             await pilot.pause()
             assert not isinstance(app.screen, AddSourceModal)
             if interrupt == "cancel":
                 await pilot.click(".connection-cancel")
-            else:
+            elif interrupt == "new-page":
                 app._new_page()
+            else:
+                app.select_source("demo")
             app.editor.load_text("replacement draft")
             pending.release.set()
             assert await asyncio.to_thread(pending.closed.wait, 2)
             await app.workers.wait_for_complete()
             await pilot.pause()
-            assert session.source_key() == target
-            assert not session.source_connected()
+            assert session.source_key() == ("demo" if interrupt == "switch" else target)
+            assert not session.source_connected(target)
             assert not session.history
             assert app.editor.text == "replacement draft"
             assert pending.disconnects == [True]
@@ -325,6 +326,7 @@ def indexing_d1(sources, tmp_path, monkeypatch):
 
 
 async def run_while_indexing(app, pilot, state, document):
+    assert await asyncio.to_thread(state.started.wait, 3), "startup did not start schema discovery"
     state.raw.clear()
     app.editor.load_text(document)
     await pilot.press("f5")
@@ -343,10 +345,11 @@ def test_run_and_compile_do_not_wait_for_full_schema_index(indexing_d1):
     async def scenario():
         app = D8RApp(state.session)
         async with app.run_test(size=(140, 45)) as pilot:
-            assert not state.requests  # restored credentials do not connect at startup
-            await run_while_indexing(app, pilot, state, "\\from orders\n\\select id")
             assert await asyncio.to_thread(state.started.wait, 2)
-            assert state.query_preceded_index
+            assert not state.raw.is_set()  # Startup connects and indexes, but never runs a document.
+            assert not state.session.history
+            assert app.query_one("#results-table", DataTable).row_count == 0
+            await run_while_indexing(app, pilot, state, "\\from orders\n\\select id")
             assert not state.release.is_set()
             assert app.query_one("#schema-index").display
             assert app.query_one("#schema-index-dots", LoadingIndicator).display

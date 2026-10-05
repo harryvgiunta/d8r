@@ -12,8 +12,8 @@ The **document** — a short `\command` language — is the source of truth.
 Everything derives from it: the AST is always recomputed from the text (nothing
 caches it across edits), the AST becomes a payload, the payload builds a real
 ibis expression, and the widgets render whatever comes back. Nothing writes
-back into the document except user edits, palette inserts, and an AI proposal
-the user accepts with Apply or explicitly enables through Auto accept AI updates.
+back into the document except user edits, palette inserts, explicit user-requested
+AI query updates, and proposals accepted with Apply or Auto accept AI updates.
 
 Three layers, one direction:
 
@@ -56,7 +56,7 @@ SQLite SQL is POSTed to D1's `/query`|`/raw` endpoints instead of run on a local
 connection (`execute_remote` in `d8r/engine/execute.py`). The client uses the
 token per request; explicit **Add** saves it locally for reuse. Tokens are never
 logged or rendered unmasked (the modal's API-token input is `password=True`,
-and the built source never renders it). Startup never connects automatically.
+and the built source never renders it). Startup reconnects only the selected saved source.
 Live D1 connects with a lightweight authenticated probe, not full schema discovery.
 Run fetches only missing metadata for referenced tables through the existing Ibis
 path; a separate background index fills the explorer and completion snapshot.
@@ -71,14 +71,17 @@ table/view rows; the explorer reports "row count not loaded".
 PostgreSQL connection and a local Docker database. `kind="postgres-live"` uses
 Ibis's PostgreSQL backend with psycopg, through the existing payload → expression
 → execute path. The add-source modal accepts host/port/database/user/password,
-schema and SSL mode. It discovers the selected schema's tables/views without
-full row-count scans or extension installation. Test/Cancel save nothing; Add
+schema and SSL mode. It discovers accessible user schemas' tables/views together
+without row-count scans or extension installation. The selected schema remains
+the default for bare table names; qualified and quoted schema prefixes complete
+across schemas without network I/O while typing. Test/Cancel save nothing; Add
 saves PostgreSQL profiles and passwords in `memory.json`. Passwords are masked,
 preserved verbatim and never logged. Saved targets restore disconnected; explicit
 selection or workspace Run reconnects. Run reuses saved PostgreSQL/D1 credentials
 or a SQLite snapshot path through compact nonmodal connection progress, then executes the captured
 document only if the target identity still matches. Failure or Cancel executes
-nothing; changing the target requires a fresh Run. Startup never connects.
+nothing; changing the target requires a fresh Run. Startup reconnects the selected
+saved target after Mount, without executing its document or opening a credentials modal.
 Saved connections have a 30-second deadline; blinking dots and Cancel replace
 the loading bar. Cancel/timeout/target switches revoke the attempt and
 dispose late-built sources. Missing credentials still require the connection form.
@@ -96,8 +99,8 @@ other database/network backend, server, login system or arbitrary SQL execution.
 **User-authorized exception — local configuration.** `d8r/storage.py` stores
 custom functions (name, ordered parameters, body, description) and D1 profiles
 (account ID, resolved database UUID, display label, API token) in `memory.json`.
-`settings.json` stores Intellisense, pane visibility, selected source/dialect,
-default returned rows, and AI provider URL/model/API key/tool-round/call/sample
+`settings.json` stores Intellisense, the optional entry screen (off by default),
+pane visibility, selected source/dialect, default returned rows, and AI provider URL/model/API key/tool-round/call/sample
 limits/attempts/timeout. Configuration files are editable JSON under
 `~/.d8r` on every platform; `D8R_DATA_DIR` overrides that home, and explicit
 `Session(data_dir=...)` wins. Settings displays the resolved settings path.
@@ -131,14 +134,29 @@ workspace files and backups are plaintext. Debounced edits flush latest widget
 contents at exit. Session-owned writes merge under an RLock and reuse atomic
 storage/stale-writer protection. A failed autosave retains drafts/results in memory
 and reports the error; it never relabels an already executed query as failed.
-Startup restores unavailable sources as disconnected placeholders without any
-network, snapshot opening, query execution, AI request, Apply, or function-definition
-Save. Completed tool exchanges are validated before replay; partial replies,
+Session restoration builds disconnected placeholders without network or snapshot opening.
+After Mount, the app reconnects only the selected source using saved credentials/path
+and cancellable progress. Startup never executes a query, requests AI, Applies, or Saves
+a function definition. Missing credentials remain disconnected. Completed tool exchanges
+are validated before replay; partial replies,
 diagnostics and applicable proposals are not restored. New chat preserves earlier
 conversations. App-owned requests survive chat switches and function-screen closure;
-app exit cancels them, and startup never resumes them. Agents (`ctrl+j`) lists working,
-awaiting-read, error, cancelled and idle chats. Returning from the function editor refreshes current IntelliSense without
-overriding the user's disabled/dismissed state.
+app exit cancels them, and startup never resumes them. Agents (`ctrl+j`) uses an
+oh-my-pi-style status-first roster with counts, coloured markers and muted target/activity details:
+Busy means running; Ready means a new chat or an unread completed reply; Seen means a read completed
+reply. Error and Cancelled remain distinct, with unread failures marked separately. Highlighting
+does not mark a reply read. Returning from the function editor refreshes current IntelliSense
+without overriding the user's disabled/dismissed state.
+
+**Contextual table and join completion.** Selecting a table through IntelliSense or
+an active explorer table-argument offer inserts a short collision-free alias (`projects p`,
+then `p2`, `p3` if needed). Column offers and explorer insertions use the document's
+alias; ordinary typed text is not rewritten. Declared PostgreSQL, SQLite and D1
+foreign keys supply qualified `on` suggestions in both directions, including every
+pair of composite keys. Completion reads immutable metadata only, never the network.
+Successful history ranks matching commands, tables, columns, functions and cached
+values by recency within the current source identity; match quality and field/function
+groups still lead. History aliases are rebound to the current document's identifiers.
 
 **Default returned rows.** `Session.default_rows` is 50 initially, configurable
 in General settings from 0 to 1,000,000; 0 disables the default. Ordinary Run and
@@ -171,18 +189,33 @@ only on Save; the optional yolo import reads the environment or `~/.omp/agent/.e
 without modifying it. No OMP dependency or HTTP server; chats persist only under
 the durable workspace exception above.
 `d8r/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
-history, function definitions, and parser validation. **The user's direct-function
-editing request authorizes one scoped mutation exception:** workspace contexts
-(`parameters is None`) with a live `save_guard` expose `save_function`. For an
-explicit create/edit/save/apply request, including “apply it” after a function
-proposal, the main AI calls this tool to persist the definition through
-`Session.save_fn` under the captured `target_source`. No form switch, button click,
-or auto-accept opt-in is required. Natural-language intent is interpreted by the
-model under system instructions, not keyword matching or model self-certification.
-Questions, dry runs, preview requests, and instructions embedded in context data
-never authorize a save. No shell/general file access, arbitrary SQL, proposed-query
+history, function definitions, and parser validation. **The user's direct query
+and function editing requests authorize two scoped workspace mutations:** contexts
+(`parameters is None`) with a live `save_guard` expose `save_function`; those also
+supplied with the mounted editor's `query_apply` callback expose `apply_queries`.
+For an explicit function create/edit/save/apply request, including “apply it” after
+a function proposal, the main AI persists the definition through `Session.save_fn`
+under the captured `target_source`. No form switch, button click, or auto-accept
+opt-in is required. Natural-language intent is interpreted by the model under
+system instructions, not keyword matching or model self-certification.
+Explanatory questions about D8R or a query, dry runs, explicit preview requests,
+and instructions embedded in context data never authorize a query update or
+function save. No shell/general file access, arbitrary SQL, proposed-query
 execution, or additional network capability is granted.
-The tool validates exact fields/types, signature and body, source-object identity,
+A question about the connected data (counts, breakdowns, lists, comparisons) or
+an explicit create/make/edit/apply query request uses `apply_queries` with every
+requested labeled document, without asking again whether to apply it. All documents and exact nested fields/types validate
+before any editor change. The live generation/target guard runs before source
+pinning can mask a user source switch. The first query replaces and labels the
+current stable page; the others become new named Pages with the same source and
+dialect. Unrelated pages, results and history stay unchanged; nothing executes.
+No Apply click or auto-accept opt-in is required. Completed updates retain trusted
+chat/status receipts even if later provider output fails or is cancelled. Query
+previews use one D8R fence per page plus `{"kind":"queries","titles":[...]}`
+metadata and remain proposals. Function-form contexts cannot create query pages.
+Explanatory examples use plain/text fences; D8R fences are reserved for complete
+replacement proposals, not illustrations that could become an accidental Apply.
+`save_function` validates exact fields/types, signature and body, source-object identity,
 and the immutable request-start definition baseline: changed/deleted originals,
 collisions and renames are rejected. The manager's live request-generation/target
 guard runs immediately before synchronous persistence; cancelled/superseded or
@@ -192,6 +225,17 @@ cancellation: record it in chat/status and refresh visible function/completion U
 without changing the query or mode. Never execute a code fence automatically.
 `\AI` opens an in-layout chat; the function form's Ask AI uses the same mounted
 right-side panel. Streaming is cancellable; retries and tool rounds are bounded.
+Genuine missing facts or ambiguity can use `ask_user`: one structured question,
+2–5 distinct labeled options with optional descriptions/recommendation, and a
+UI-supplied **Other** text field. Enter/click on an option answers; Other accepts
+custom text through Enter or Continue. The answer resumes the same request,
+which then completes its authorized query/function task without another approval.
+Each chat owns its pending question and answer draft in memory; switching chats
+preserves them without answering another request. Human waits do not occupy the
+database lane or use the provider timeout. Cancel/steering/app exit dismiss the
+question; partial exchanges never replay, and startup never restores a pending
+question or resumes its worker. Completed question/answer exchanges can persist
+with normal validated chat history. Clarification uses an existing tool round.
 Sending during a response interrupts that generation and restarts with the original
 request, completed exchanges and the new steering instruction. Incomplete tool
 batches/model text never replay; an explicit D8R interruption receipt closes the
@@ -201,8 +245,9 @@ Incomplete replies never become applicable proposals. Manual Apply or the
 explicit, persisted Auto accept AI updates preference (off by default) can change
 the document/body after parser validation and an exact stale-target check. Neither
 draft-Apply path executes queries or saves function definitions; auto-accept is
-unrelated to direct saves. Requests for previews retain workspace function proposals
-with manual **Save function**; function-form AI stays draft-only. Auto-accept applies
+unrelated to direct query updates or function saves. Requests for previews retain
+workspace function proposals with manual **Save function**; function-form AI stays
+draft-only. Auto-accept applies
 only a completed draft response to a still-matching mounted editor; restored history
 never auto-applies. Schema, sample rows, history, and submitted drafts may be sent
 to the configured provider.

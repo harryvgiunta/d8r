@@ -45,8 +45,8 @@ class Row:
 
     label: str
     detail: str = ""
-    # pane | intellisense | default-rows | value-cache | value-limit | clear-values |
-    # source | dialect | ai | ai-auto-accept | add-source.
+    # pane | intellisense | entry-screen | default-rows | value-cache | value-limit | clear-values |
+    # source | dialect | ai | ai-auto-accept | ai-sample-data | ai-schema-refreshes | add-source.
     action: str = ""
     value: str = ""
 
@@ -142,7 +142,7 @@ class SettingsScreen(ModalScreen[None]):
             menu.highlighted = min(max(highlight, 0), len(self.rows) - 1)
         self.query_one("#settings-heading", Static).update(MENUS[self.menu])
         descriptions = {
-            "general": "Control editor completion and default query rows. Row changes require Save in the editor.",
+            "general": "Control editor completion, the startup entry screen and default query rows. Row changes require Save in the editor.",
             "menus": "Show or hide workspace panes without changing your document.",
             "values": "Autocomplete and the schema explorer share a memory-only value cache. "
                       "Values are fetched lazily on the first read of a column; there is no startup scan "
@@ -150,7 +150,7 @@ class SettingsScreen(ModalScreen[None]):
                       "at exit. Only these preferences are saved. Changing them clears cached values.",
             "sources": "Connect a new Cloudflare D1 database or select an existing source. Selecting a source refreshes its schema and completion.",
             "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
-            "ai": "Provider changes require Save. Auto accept toggles immediately: validated proposals update unchanged drafts only; queries never run and functions are never saved automatically.",
+            "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. Disabling reads does not remove data already shared in chat.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
         self.query_one("#settings-description", Static).update(
@@ -214,13 +214,17 @@ class SettingsScreen(ModalScreen[None]):
                 Row("Sample records per read", str(config.sample_rows), "ai", "ai-sample-rows"),
                 Row("Maximum attempts", str(config.max_attempts), "ai", "ai-attempts"),
                 Row("Request timeout", f"{config.timeout:g} seconds", "ai", "ai-timeout"),
-                Row("Auto accept AI updates", "on · validated drafts only" if self.session.ai_auto_accept else
+                Row("Allow Sample Data", "on" if self.session.ai_allow_sample_data else "off", "ai-sample-data"),
+                Row("Allow Schema Refreshes", "on" if self.session.ai_allow_schema_refreshes else "off", "ai-schema-refreshes"),
+                Row("Automatically Apply AI Edits", "on · validated drafts only" if self.session.ai_auto_accept else
                     "off · review and Apply manually", "ai-auto-accept"),
             ]
         return [
             Row("Intellisense", "on" if self.session.intellisense else "off", "intellisense"),
             Row("Default rows returned", str(self.session.default_rows) if self.session.default_rows else
                 "0 · no default limit", "default-rows"),
+            Row("Entry screen", "on · shown at next startup" if self.session.entry_screen else
+                "off · open workspace directly", "entry-screen"),
         ]
 
     def _dialect_detail(self, name: str) -> str:
@@ -263,8 +267,14 @@ class SettingsScreen(ModalScreen[None]):
             self.ide.toggle_pane(row.value)
         elif row.action == "intellisense":
             self.ide.update_settings(intellisense=not self.session.intellisense)
+        elif row.action == "entry-screen":
+            self.ide.update_settings(entry_screen=not self.session.entry_screen)
         elif row.action == "ai-auto-accept":
             self.ide.update_settings(ai_auto_accept=not self.session.ai_auto_accept)
+        elif row.action == "ai-sample-data":
+            self.ide.update_settings(ai_allow_sample_data=not self.session.ai_allow_sample_data)
+        elif row.action == "ai-schema-refreshes":
+            self.ide.update_settings(ai_allow_schema_refreshes=not self.session.ai_allow_schema_refreshes)
         elif row.action == "value-cache":
             self.ide.update_settings(value_cache_enabled=not self.session.value_cache_enabled)
         elif row.action == "clear-values":
@@ -463,8 +473,8 @@ class AIProviderScreen(ModalScreen[None]):
             yield Static(
                 f"Save writes provider settings and the API key to {self.ide.session.settings_path}. "
                 "Settings and connection backups contain plaintext secrets; keep them private. "
-                "Completed chats and drafts are saved locally. Sending a message shares the document and requested schema, "
-                "samples and history with this provider. Use HTTPS for remote providers.", markup=False,
+                "Completed chats and drafts are saved locally. Sending a message shares the document, "
+                "history and permitted schema/sample reads with this provider. Use HTTPS for remote providers.", markup=False,
             )
             yield Static("Base URL (including /v1), or full /chat/completions URL")
             yield Input(config.base_url, placeholder="https://yolo-auto.com/v1", id="ai-base-url")
@@ -486,8 +496,10 @@ class AIProviderScreen(ModalScreen[None]):
             yield Input(str(config.max_attempts), type="integer", id="ai-attempts")
             yield Static("1 initial attempt + remaining attempts as shared retries per message, "
                          "independent of the round budget.", markup=False)
-            yield Static("Request timeout in seconds (including streaming)")
+            yield Static("Request timeout in seconds (without stream progress)")
             yield Input(str(config.timeout), type="number", id="ai-timeout")
+            yield Static("Active streams may take longer; keepalive comments do not count as progress. "
+                         "Each context-tool read still has this total deadline.", markup=False)
             yield Static("", id="ai-settings-error", markup=False)
             with Horizontal(id="ai-settings-buttons"):
                 yield Button("Save", id="ai-settings-save", variant="primary")

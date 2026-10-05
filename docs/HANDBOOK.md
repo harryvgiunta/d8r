@@ -32,7 +32,7 @@ flowchart LR
     EX -->|compile_sql dialect| SQL[SQL text]
     EX -->|execute| ROWS[Rows]
     ROWS -->|render| W[Textual widgets]
-    W -->|edits, palette accepts, Apply| DOC
+    W -->|edits, palette accepts, requested AI updates, Apply| DOC
 ```
 
 The invariants that make this shape safe (enforced structurally, by tests —
@@ -43,8 +43,8 @@ see `tests/test_tui.py::test_the_tui_reaches_no_http_server`):
   engine is pure payload → ibis. The TUI consumes both and re-implements
   neither.
 - **One-way data flow.** Results are inputs to UI state. Only user edits,
-  palette inserts, and an explicitly-accepted AI proposal ever change the
-  document.
+  palette inserts, explicit user-requested AI updates, and accepted AI proposals
+  ever change the document.
 - **Schema state lives at one seam.** `d8r/query/schema.py` defines the
   immutable `SchemaContext`; `Session.refresh_schema()` replaces the
   session-owned snapshot on any source/schema/function change. No
@@ -876,7 +876,7 @@ suggests `duckdb`; the mocks suggest their vendor's own; D1 sources suggest
   its referenced tables' metadata; full discovery is independent background work.
 - **`add_postgres_source(source_id, *, host, port=5432, database, user, password,
   schema="public", sslmode="prefer", display=None)`** — connect to PostgreSQL and
-  discover exactly one schema without scanning rows (§7).
+  discover accessible user schemas without scanning rows (§7).
 
 ---
 
@@ -928,8 +928,12 @@ own reading of the document (verified: `\union all` of `events` with itself gave
 #### 2.2 Table resolution and the `tables` handle-passing design
 
 `get_table(con, dataset, ctes, tables)` resolves in priority order: **a built CTE
-shadows everything**, then the caller's `tables` map, then `con.table(dataset)`,
-and a failure there becomes `PayloadError(f"unknown dataset: {dataset}")`.
+shadows everything**, then an exact entry in the caller's `tables` map, then a
+unique decoded relation-name or basename match. Unregistered PostgreSQL
+`schema.table` operands use `con.table(table, database=(None, schema))`, keeping
+quoted schema components intact instead of treating the dot as part of the table
+name. Other operands retain `con.table(dataset)`; lookup failures become
+`PayloadError(f"unknown dataset: {dataset}")`.
 
 The `tables` parameter is a deliberate design decision, not an optimization
 hint: it is the source's datasets **already resolved to expressions**, handed
@@ -938,8 +942,9 @@ over by whoever owns the registry (`Session.tables()` builds it as
 The docstring states the reason: on a backend that introspects when asked for a
 table by name — SQLite's `con.table()` reads the schema **inside a transaction
 of its own** — asking by name would silently commit the session's open
-transaction. So the engine never asks a SQLite or PostgreSQL connection for a
-table by name during a run. The same reasoning is why `tx.temp_handle` takes an
+transaction. Registered handles avoid that lookup and repeated metadata reads.
+Unregistered PostgreSQL references use Ibis's metadata lookup, whose savepoints
+preserve an explicit session transaction. `tx.temp_handle` still takes an
 explicit schema instead of calling `con.table()` (§4).
 
 #### 2.3 Frames and `col` — reference resolution
@@ -1761,7 +1766,7 @@ exactly like every other source.
 PostgreSQL is a real connection with Ibis owning all compilation and execution.
 `add_postgres_source(source_id, *, host, port=5432, database, user, password,
 schema="public", sslmode="prefer", display=None)` connects explicitly and
-discovers exactly one schema **without scanning rows**.
+discovers accessible user schemas **without scanning rows**.
 
 **Validation first** (plain `ValueError`s — the add-source modal catches
 `ValueError` alongside `D1Error`/`PayloadError`/`OSError`/`RuntimeError`, so both
@@ -1787,19 +1792,28 @@ timezone, never creating extensions. The schema is then selected as connection
 state, not query SQL, with `psycopg.sql.SQL("SET search_path TO {}")` and
 `psycopg.sql.Identifier(schema)` — identifier quoting is what makes commas, quotes
 and dots a single schema name rather than a `search_path` expression. Availability
-is confirmed against ibis' `list_databases()`
-(`"selected schema is unavailable"`).
+is confirmed through an Ibis query of `pg_catalog.pg_namespace`, excluding system
+schemas and requiring `has_schema_privilege(name, 'USAGE')` for the current role.
 
 **Discovery without peeking.** ibis 12's `list_tables("public")` also unions
 *temporary* names even when a schema was requested, so the engine queries
 `information_schema.tables` instead — built as an ibis `ops.DatabaseTable` over an
 explicit schema and `namespace=ops.Namespace(database="information_schema")`,
-filtered on `table_catalog == database`, `table_schema == schema`, and
+filtered on `table_catalog == database`, usable non-system schemas, and
 `table_type in ("BASE TABLE", "VIEW", "FOREIGN")`, selecting and ordering
-`table_name`. Each hit registers
-`con.table(name, database=(database, schema))` with `"rows": None` — counts are
-never fetched, so a large schema costs no scans and another session's temp objects
-are never visible.
+`table_schema, table_name`. PostgreSQL's information schema retains table privilege
+visibility. Each hit registers `con.table(name, database=(database, schema))`
+under its canonical qualified name with `"rows": None`; no table rows are scanned.
+Declared foreign keys across these schemas retain qualified targets and composite
+column order, supporting cross-schema join completion.
+
+The immutable PostgreSQL context remains partial for newly created/unindexed
+relations. Run and Compile may inspect their missing metadata but Compile never
+reads query rows. `SchemaContext.default_schema` and the session's resolved table
+bindings preserve selected-schema precedence for bare names; exact temp names win.
+Qualified names remain explicit even when the connection's search path changes.
+IntelliSense matches `etl.` and `"etl".` against the same table names and offers
+fully qualified columns when the user types a relation prefix without an alias.
 
 **Credentials at the engine level.** The password is *never* stored on the
 `DataSource`: `source.postgres` holds only `host`/`port`/`database`/`user`/
@@ -1884,17 +1898,18 @@ Module map:
 | `layout.py` | `PaneSplitter`: draggable/focusable persistent pane dimensions with viewport clamping. |
 | `add_source.py` | `AddSourceModal`: D1-live / D1-snapshot / PostgreSQL credential form. |
 | `splash.py` | The 6-second boot animation (pure stdlib). |
-| `ai.py` | App-owned `AIChats`/`AIChat` runtime, `AgentsPane`/`AgentsScreen`, and editor-owned `AIPanel` views — the AI & Storage chapter describes their lifecycle. |
+| `ai.py` | App-owned `AIChats`/`AIChat` runtime, the explorer's `AgentsPane`, and editor-owned `AIPanel` views — the AI & Storage chapter describes their lifecycle. |
 | `app.tcss` | The whole layout. |
 
 Entry point: `d8r/__main__.py` → `d8r.tui.app.main()`.
 
 ```python
 def main() -> None:
-    """`python -m d8r` — play the boot splash, then run the app."""
-    if splash.should_play():
+    """`python -m d8r` — optional entry animation, then the IDE."""
+    session = Session()
+    if session.entry_screen and splash.should_play():
         splash.play()
-    D8RApp().run()
+    D8RApp(session).run()
 ```
 
 ---
@@ -2009,7 +2024,8 @@ Ordering matters, and it is what makes a session always parseable:
 ### 1.8 `update_settings(**changes)`
 
 Keyword-only: `intellisense`, `panes`, `pane_sizes`, `source`, `dialect`, `ai`,
-`default_rows`, `ai_auto_accept`, `value_cache_enabled`, `value_cache_limit`.
+`default_rows`, `ai_auto_accept`, `ai_allow_sample_data`, `ai_allow_schema_refreshes`,
+`value_cache_enabled`, `value_cache_limit`, `entry_screen`.
 **Save-before-apply**: it copies `self._settings.document`, applies only the
 explicitly-passed keys, calls `self._settings.save(document)`, and only then mirrors
 them onto the live session (`set_active` for `source`, `pane_visibility` re-read from
@@ -2315,7 +2331,7 @@ on the IDE screen copies the selection instead of the framework's help/quit prom
 | App (priority) | `f6` | `compile` | Compile (hidden) |
 | App (priority) | `ctrl+o` | `add_source` | Open the add-source modal |
 | App (priority) | `ctrl+comma` | `settings` | Open the Settings screen — the way back when the Intellisense switch has the palette shut (`\settings` itself needs the popup) |
-| App (priority) | `ctrl+j` | `agents` | Open active agents and saved chat history |
+| App (priority) | `ctrl+j` | `agents` | Reveal and focus the left agents tab without leaving the active editor |
 | App | `ctrl+q` | `back_or_quit` | Return from function mode, otherwise quit |
 | Textual `App` | `ctrl+c` | `help_quit` | Present on the framework list; on `IdeScreen` the screen's `screen.copy_text` claim takes it |
 | `IdeScreen` | `tab` | `noop` | Next field in function mode; consume in query mode |
@@ -2371,9 +2387,12 @@ False`, `_workspace_snapshot = {}`, `_autosave_error = ""`, `run_busy = False`,
 Horizontal #header: title, source/dialect pickers, backend, reconnect, Agents
 Horizontal #body
   Vertical #explorer-slot
-    Vertical #schema-pane: Schema / Pages tabs (query mode)
-    FnExplorer #fn-list-pane: function list and parameter guide (function mode)
-    AgentsPane #workspace-agents
+    TabbedContent #explorer-tabs: Schema / Pages / agents
+      TabPane #tab-schema
+        Vertical #schema-pane: schema tree (query mode)
+        FnExplorer #fn-list-pane: function list and parameter guide (function mode)
+      TabPane #tab-pages: query-page actions and drafts
+      TabPane #tab-agents: AgentsPane #workspace-agents
   PaneSplitter #explorer-splitter (width)
   Vertical #work-bench
     Vertical #editor-slot
@@ -2403,6 +2422,10 @@ flushes the current draft, restores its stable identity/caret/source/dialect, an
 retargets chat without connecting or executing. `\pages`/`\queries` reveal Pages
 or hide the explorer when Pages is already selected. Legacy query history seeds
 the initial page collection without replaying it.
+The agents tab fills the explorer with the chat list; there is no separate lower
+agents pane or modal. **Agents** / `ctrl+j` reveals and focuses the tab in either
+editor mode. The selected tab persists; restoration falls back to Schema if the
+remembered agents tab is hidden.
 
 `_sync_layout` swaps visible contents, not slots or screens. Hidden query widgets
 retain text, cursor, results and completion state. The shared AI retargets chats
@@ -2416,9 +2439,11 @@ Pane registries on the class:
 
 ```python
 TAB_PANES   = {"results": "tab-results", "sql": "tab-sql", "history": "tab-history"}
-PANES       = {**TAB_PANES, "schema": "#schema-pane"}
+PANES       = {**TAB_PANES, "schema": "#schema-pane",
+               "agents": "tab-agents", "ai": "#workspace-ai"}
 PANE_TITLES = {"results": "Results pane", "sql": "SQL pane",
-               "history": "History pane", "schema": "Schema pane"}
+               "history": "History pane", "schema": "Schema pane",
+               "agents": "agents tab", "ai": "AI pane (right)"}
 ```
 
 ### 2.5 `on_mount` sequence
@@ -2430,8 +2455,9 @@ Apply saved pane visibility (only where it differs), `_refresh_header()`,
 `workspace["cursor"]`, set `_workspace_ready = True`, `ai_panel.target_changed()`,
 status `ready · {source} · {dialect}`, escalate `memory_error` (status + 15 s error
 notification titled "Saved data could not be loaded"), focus the editor, queue one
-workspace save, and — when `workspace["active_view"] == "function"` — reopen the
-function library via `call_after_refresh(action_fn)`.
+workspace save, then dispatch `_restore_startup_view` after refresh: reopen a saved
+function view first, then reconnect only the selected header source once. Missing
+credentials leave it disconnected without a modal; startup never executes the draft.
 
 `on_unmount`: `_closing = True`, flush the workspace, and if `run_busy` is set but
 `_run_task` is `None`, release both flags (a run whose callback can no longer land
@@ -2499,21 +2525,24 @@ document.
   the widget when empty and shows it bold `$error` otherwise.
 - `_show_tab(tab_id)` — reveals a result tab, but a pane the user **hid** is never
   forced back: it returns early when the tab maps to a hidden pane name.
-- `pane_visible(name)` — for `schema`, `widget.display`; for a tab,
-  `TabbedContent.get_tab(id).display`.
-- `set_pane(name, visible)` — `schema` just flips `display`. For tabs:
-  `show_tab` **and** `active = pane_id` (showing a pane means wanting to see it, so it
-  comes to the front), or `hide_tab` (hiding the active tab makes Textual move to a
-  visible one). Both paths finish with `_fit_result_tabs()`.
-- `_fit_result_tabs()` — when no result tab remains visible, the `#work-bench` gets
-  class `no-tabs`, and `app.tcss` hides `#result-tabs` and gives the editor
-  `height: 1fr` — hiding all three tabs is a legitimate choice and the strip should
-  not hold half the screen.
+- `pane_visible(name)` — the saved explorer preference for `schema`, live panel
+  display for `ai`, or `TabbedContent.get_tab(id).display` on the corresponding
+  explorer/result tab container.
+- `set_pane(name, visible)` — `schema` synchronizes the explorer layout; `ai`
+  opens or closes the mounted assistant. Tabs use `show_tab` **and**
+  `active = pane_id`, or `hide_tab` (hiding the active tab moves to a visible one).
+  Layout synchronization hides splitters with their panes.
+- `_fit_result_tabs()` calls `_sync_layout()`: when no result tab remains visible,
+  hide the output slot and its splitter and give the editor `height: 1fr`.
 - `toggle_pane(name)` — compute the flip, persist via
   `update_settings(panes={...})`; if saving failed return `None` and change nothing on
   screen; else apply and return the new visibility. `toggle_pane` is the shared path
   for both the `\results`/`\sql`/`\history`/`\schema` actions and the Settings
   menu's Show/Hide rows.
+  **agents tab** hides only the explorer tab; **AI pane (right)** hides the panel
+  and splitter. These preferences survive restart and hiding never cancels a
+  request or discards a chat draft. Explicit chat selection / Ask AI reopens the
+  right pane; hidden state otherwise survives target and mode changes.
 - `_modal_open()` — `isinstance(self.screen, ModalScreen)`: nearly every action
   returns early when a modal owns the keyboard.
 - `refuse_busy(action)` — when `session.busy` is non-empty, status + warning notify
@@ -2552,7 +2581,8 @@ The callback `_run_after_connect` registers the returned source, then resumes on
 if its stable target identity matches the submitted target. Cancellation never
 runs; edited connection fields that select another target require a fresh Run.
 Saved profiles and SQLite paths connect in the background without a credential
-window. Missing credentials require the form. Startup and Compile remain offline.
+window. Missing credentials require the form on an explicit action. Startup reconnects
+only the selected saved source after Mount; Compile remains offline.
 
 `_start_run(document)` reserves the session and dispatches the captured text:
 
@@ -2605,7 +2635,7 @@ revealed (respecting a hidden pane).
   the source until successful handoff; cancellation/timeout/stale attempts dispose
   late results, even after event-loop shutdown. App generation, source, screen and
   function-target guards prevent stale callbacks. Page/source/mode changes cancel
-  the attempt. Only an explicit action starts a connection; startup never does.
+  the attempt. Startup also uses this path for the selected source only, never Run.
 - `_start_schema_index` / `_index_schema`: a separate, bounded worker indexes each
   explicitly connected D1 source without setting `Session.busy`. The schema pane
   shows blinking dots and "Indexing schema…". Run can finish, and load additional
@@ -2665,12 +2695,20 @@ edit request. Main chat saves directly; preview proposals retain **Save function
 - One `AIPanel #workspace-ai` sits beside `#work-bench` with a persisted, resizable
   width. `_ai_target()` routes to the active document or function draft snapshot.
 - `_apply_ai_document` routes function-mode proposals to `_apply_ai_draft`. In query
-  mode, document proposals replace only text; explicit function proposals save via
-  `Session.save_fn`, refresh the library/completion, and leave query and mode alone.
+  mode, single-document proposals replace text; labeled query batches replace the
+  current stable page and add the other named Pages, retaining source/dialect and
+  unrelated drafts. Function proposals save via `Session.save_fn`, refresh the
+  library/completion, and leave query and mode alone.
 - Explicit workspace-chat function mutation requests instead call `save_function`
   directly, with no Apply click or form switch. The manager guards the live request
   and target; successful saves refresh function/completion UI without changing the
   query or mode, even if a later provider response fails or is cancelled.
+- Workspace data questions and explicit query create/edit/apply requests call
+  `apply_queries` directly, independently of auto-accept. Every document validates before any page changes.
+  The live target guard precedes source pinning, so a source switch cannot be
+  hidden by temporarily selecting the captured source. Pages are revealed, while
+  results/history stay unchanged and no query executes. Completed changes retain
+  chat/status receipts even when subsequent provider output fails or is cancelled.
 - Every document change calls `ai_panel.target_changed()` (identity drift retires a
   pending proposal), and `action_run_or_chat` forwards `ctrl+enter` to the panel when
   its input owns focus.
@@ -2678,6 +2716,9 @@ edit request. Main chat saves directly; preview proposals retain **Save function
 - The AI context tool owns the `session.busy` reservation
   `"AI context lookup running"`, which is what makes `refuse_busy` hold off Run/Compile
   while the assistant is reading schema or samples.
+- `ask_user` instead waits on a per-chat answer without reserving the shared
+  connection. Its in-chat card offers labeled options plus Other; answering resumes
+  the same request, while Cancel or steering abandons only that generation.
 
 ---
 
@@ -2912,12 +2953,34 @@ condition wants:
   resolve via `column.split(".")[-1]`); once closed → `_joiners` (`and`/`or`,
   detail `"join conditions"`), which is what lets one `\where` line keep growing.
 
+
+Table completion inserts a short collision-free alias (`projects p`, then `p2`
+when needed); column suggestions and explorer inserts qualify through that alias.
+Fully typed table names followed by Enter still get a newline; Tab/click selects
+the aliased offer. Existing explicit aliases are preserved. Within CTE bodies,
+completion uses the parser's owning-block bounds. `\join` offers complete declared
+FK predicates in both directions, including `and`-joined composite equality pairs.
+FK discovery is catalog-only for PostgreSQL, SQLite and D1; completion never performs
+network reads. Successful history ranks equal-quality offers within their existing
+groups by recency, scoped to source identity and rebound to the current aliases.
+
+Group completion reads the owning block's current AST. Without an existing
+explicit group, accepting `\group` inserts the ordered, deduplicated plain
+source-column projections from `\select`; an empty `\group ` offers that same
+complete list first. Output aliases, aggregate arguments (including arithmetic
+and filtered reductions), constants and computed-expression inputs are not keys
+for this insertion. Computed projections keep their existing implicit engine
+grouping. Star/window/scalar-subquery projections do not receive an automatic
+group clause. Existing groups are left untouched, and function bodies share the
+same completion path. A completed group closes its popup; comma or a new column
+prefix resumes individual-column completion.
+
 ### 3.7 `CommandPalette` widget
 
 State: `session`, `source_id` (which source the offers should read — the function
 editor's own target), `workspace_actions` (False strips action rows so a nested editor
 never offers to run the workspace), `parameters` (a callable, only in the function
-body), `editor`, `_view`, `_labels`, `_dismissed`.
+body), `editor`, `_view`, `_preferred_width`, `_dismissed`.
 
 `is_open` is the presence of the `open` CSS class; `view` exposes the displayed `View`.
 `attach(editor)` binds it to the editor whose text and caret it follows.
@@ -2934,13 +2997,17 @@ change, caret move, tree insert, and accept:
   hard off: nothing opens while it is off, and `ctrl+comma` is the way back).
 - With `workspace_actions=False`, action entries are filtered out and an emptied view
   closes the popup.
-- Options are rebuilt only when `view.labels` differ from `_labels` (each
-  `Option(prompt(label, detail), id="opt-{i}")`); otherwise the highlight is only
-  rescued when it went `None`. `prompt(label, detail)` assembles the label with the
-  detail dim-styled after two spaces.
-- `_place()` floats the popup under the caret: `top = min(max(caret_row + 2, 1),
-  max(pane_height - 3, 1))`, `offset = (1, top)`,
-  `max_height = max(pane_height - top - 1, 4)`.
+- Completed argument leaves close instead of continuing to offer themselves.
+  Calls, aliases, and genuine next-argument choices remain available.
+- Options are rebuilt when the entries change, including detail and insertion
+  text, not just labels. `prompt(label, detail)` assembles the label with dim
+  details after two spaces; unchanged entries retain the highlight.
+- `_place()` uses `TextArea.cursor_screen_offset`, including the editor's header,
+  gutter, wrapping and scroll offset. Up to six single-line options plus borders
+  fit below the caret, or above when there is more room there. Width follows the
+  content, capped at 62 cells and the visible editor width. Long details ellipsize.
+  The popup never covers the caret; offscreen carets close it. Scroll and resize
+  placement waits for layout, and resizing keeps the active caret visible.
 - Opening also calls `scroll_to_highlight()`.
 
 `close()` hides without touching the document. `escape()` is both directions: open ⇒
@@ -2949,17 +3016,17 @@ dismissal and `sync()`. `move(delta)` wraps at both ends.
 
 `accept(index)`:
 
-- Refuses (`False`) when the entry is not an action and `highlighted_is_typed` — an
-  accept that would change nothing is not an accept.
+- Refuses (`False`) when acceptance would change nothing. Tab/click still complete
+  an exact command name to its argument position (`\from` → `\from `); Enter on
+  an exact command retains newline behavior. Disabled/dismissed completion stays off.
 - Action: `editor.replace("", (row, view.start), (row, column))` erases the `\ …`
   span, caret returns to `view.start`, and `ActionPerformed(action)` is posted.
 - Clause command (`insert` starts with `\` and the name is in `CLAUSE_NAMES`):
   `_take_clause`.
 - Otherwise: replace `view.start..(view.end or column)` with `insert` and place the
   caret at `start + len(insert) - cursor_back`.
-- Finally `sync()` — **the palette is not closed on the way out**: the accept ends by
-  re-syncing to the caret it just moved, so `\sel` completes to `\select ` with the
-  fields the new clause takes, and `sum(` keeps offering its argument.
+- Finally `sync()` refreshes the new context: `\sel` completes to `\select ` with
+  fields, and `sum(` keeps offering its argument. A completed field closes the list.
 
 `_take_clause(editor, row, column, view, name)` — the line-jump rule. `target =
 clause_line(editor.text, row + 1, name)` (the Language layer's lookup, scoped to the
@@ -2986,7 +3053,9 @@ selecting rows in the results table and every other widget keeps its keys.
 
 All six bindings are `priority=True, show=False` (see the table in §2.2).
 
-- `on_mount` → `palette.attach(editor)`.
+- `on_mount` attaches the editor and watches its scrolling for deferred placement.
+- Resize keeps the active caret visible and repositions; leaving editor focus
+  closes the popup. Popup mouse-down retains editor focus so the click can finish.
 - `TextArea.Changed` → `palette.sync()`; `TextArea.SelectionChanged` → `sync()` only
   while open (caret moves alone shouldn't open it out of nowhere).
 - `OptionList.OptionSelected` (a click on a row) → `event.stop()`, `accept(index)`,
@@ -3124,6 +3193,7 @@ clear-values | source | dialect | ai | add-source`.
 | --- | --- | --- |
 | Intellisense | `on` / `off` | `intellisense` — flips `not session.intellisense` through `update_settings` |
 | Default rows returned | the number, or `0 · no default limit` | `default-rows` → push `DefaultRowsScreen` |
+| Entry screen | `on` / `off` (initially off) | `entry-screen` — persists `entry_screen`; terminal-only animation on next launch |
 
 **Show/Hide Menus** — one row per `PANE_TITLES` entry (`Results pane`, `SQL pane`,
 `History pane`, `Schema pane`) with detail `visible`/`hidden`, action `pane` →
@@ -3159,11 +3229,17 @@ value; every row opens the same `AIProviderScreen` focused on that field:
 `ai-api-key`), `AI turns/tool rounds` (`ai-tool-rounds`), `Tool calls per round`
 (`ai-tool-calls`), `Sample records per read` (`ai-sample-rows`), `Maximum attempts`
 (`ai-attempts`), `Request timeout` (`{timeout:g} seconds`, `ai-timeout`).
-The ninth row, **Auto accept AI updates**, toggles immediately and persists a boolean
-preference (off by default). Complete draft proposals apply only after validation
+Three additional rows toggle immediately and persist boolean preferences:
+**Allow Sample Data** (off by default), **Allow Schema Refreshes** (on by default),
+and **Automatically Apply AI Edits** (off by default, stored as `ai_auto_accept`).
+Read permissions control the AI's `sample_rows` and `schema` tools, not IDE indexing.
+Disabled tools are omitted from new requests and denied in existing contexts;
+disabling samples discards pending sample results too. Enabling a tool takes effect
+on the next message. Previously shared context remains in chat history.
+Complete draft proposals apply only after validation
 and an exact unchanged-target check; neither automatic nor manual draft Apply runs
 queries or saves functions. The toggle is unrelated to explicit user-requested
-workspace `save_function` calls or manual **Save function** on preview proposals.
+workspace `apply_queries`/`save_function` calls or manual **Save function** on previews.
 
 **Keybindings** — `binding_rows()`, read-only. Each row is the actual `Binding` an app
 class carries, grouped `app`, `document`, `results`, `settings`, `functions`, `add source`,
@@ -3231,8 +3307,8 @@ error line carries the validator's message. `Import yolo key` calls
 `import_yolo_config()` and fills base URL / model / API key **into the form only**,
 reporting `Imported into this form only; Save persists these settings and the API
 key.` The header names what leaves the machine: saving writes provider settings and
-the key to `settings_path`; sending a message shares the document, requested schema,
-samples and history with the provider; use HTTPS for remote providers.
+the key to `settings_path`; sending a message shares the document, history and
+permitted schema/sample reads with the provider; use HTTPS for remote providers.
 
 ---
 
@@ -3504,7 +3580,8 @@ and invalidates too.
 ### 8. `splash.py` — the boot animation
 
 Pure stdlib: no server, no socket, no engine. A keystroke never reaches it.
-`main()` plays it once, before the app's first frame.
+`main()` plays it before the app's first frame only when General → Entry screen is
+enabled (off by default) and the output stream is a terminal.
 
 Timing: `FRAME_MS = 50`, `TOTAL_FRAMES = 120` ⇒ exactly 6.000 s. Geometry: 8 rows ×
 62 columns; wordmark box 5 rows at cols 20..40; dozer art 19×5 on rows 3..7; the data
@@ -3622,17 +3699,17 @@ layers: base; }`.
   alone decides which of them match what is typed and where the accept writes.
 ## The AI Layer & Local Persistence
 
-The AI side has bounded read-only context tools plus one user-authorized mutation:
-directly saving a requested function definition from workspace chat. Persistence is
-*atomic, validated, owner-only*. Three packages are in scope:
+The AI side has bounded read-only context tools plus two user-authorized workspace
+mutations: applying requested labeled query drafts and saving requested function
+definitions. Persistence is *atomic, validated, owner-only*. Three packages are in scope:
 
 | Module | Role |
 | --- | --- |
 | `d8r/ai/client.py` | OpenAI-compatible streaming transport: SSE framing, size caps, retries, tool loop |
 | `d8r/ai/config.py` | The one and only key-import path (`YOLO_AUTO_API_KEY`); writes nothing |
-| `d8r/ai/context.py` | Five read-only context tools, guarded workspace `save_function`, language guides, proposal decode/validate |
+| `d8r/ai/context.py` | Five read-only context tools, guarded workspace `apply_queries`/`save_function`, language guides, proposal decode/validate |
 | `d8r/ai/diagnostics.py` | Bounded, redacted, in-memory log behind the **Logs** button |
-| `d8r/tui/ai.py` | Concurrent target-scoped chats, agent status/history views, streaming, cancellation, guarded direct saves and manual/automatic draft Apply |
+| `d8r/tui/ai.py` | Concurrent target-scoped chats, agent status/history views, streaming, cancellation, guarded direct updates/saves and manual/automatic draft Apply |
 | `d8r/storage.py` | `memory.json`, `settings.json`, `workspace.json`: schemas, atomic write, locks |
 
 Nothing here parses or executes D8R documents itself — it calls into the Language layer
@@ -3791,9 +3868,10 @@ never appended to the caller's list and never turned into a second system messag
 templates accept only one leading system turn, and copies keep retries/rounds/later turns free of
 accumulated guidance. If `messages[0]` is not a system turn, a fresh system message is prepended
 to the payload copy only. With `remaining = max_tool_rounds - rounds > 0` the guidance states the
-remaining rounds, the per-round call ceiling, and instructs reuse/batching; when `remaining == 0`
-it sets `tool_choice: "none"` and demands a final answer from collected context, explicitly
-forbidding pretending success or inventing unsupported queries.
+remaining rounds, the per-round call ceiling, and instructs reuse/batching while reserving a
+round for authorized `apply_queries` or `save_function` instead of redundant pre-validation
+or another approval. When `remaining == 0`, it sets `tool_choice: "none"` and demands a final
+answer from collected context, explicitly forbidding pretending success or inventing unsupported queries.
 
 #### 2.4 SSE framing — `_sse`
 
@@ -3885,7 +3963,8 @@ generator returns — that is the *only* signal of a complete answer.
 
 Otherwise, before executing anything: `if rounds >= max_tool_rounds: raise AIError("The AI
 requested context tools after they were disabled; no final answer is available.")`. Each call is
-executed **sequentially** inside `asyncio.timeout(config.timeout)`; a raising tool yields
+executed **sequentially** inside `asyncio.timeout(config.timeout)`, except `ask_user`:
+human waits are cancellable but have no provider timeout. A raising tool yields
 `Tool <id> (<name>) failed: <ExceptionClassName>; details withheld.` and aborts the turn with
 `"An AI context tool failed; no final answer is available."` — exception text is never forwarded.
 A result that is not `str`, or exceeds `MAX_TOOL_RESULT_BYTES`, is
@@ -3908,7 +3987,7 @@ authored in this file; provider bodies, headers, and hidden reasoning never reac
 #### 3.1 `AIContext` construction and what it pins
 
 ```python
-AIContext(session, source_id, document, parameters=None, function_name="", *, save_guard=None)
+AIContext(session, source_id, document, parameters=None, function_name="", *, save_guard=None, query_apply=None, ask_user=None)
 ```
 
 It captures `session`, `source_id`, `source_key = session.source_key(source_id)`, the `document`
@@ -3917,8 +3996,14 @@ drives the whole edit protocol), `function_name`, and the **identity** of the
 `session.sources[source_id]` object. `sample_rows` is copied from `session.ai_config`.
 The immutable request-start function snapshot protects original definitions and
 creation names. Only workspace contexts (`parameters is None`) supplied with
-`save_guard: Callable[[], str | None]` expose `save_function`; function-form and
-unguarded contexts cannot save definitions. `saved_functions` records successful saves.
+`save_guard: Callable[[], str | None]` expose `save_function`; those also supplied
+with `query_apply: Callable[[AIProposal], None]` expose `apply_queries`. Function-form
+and unguarded contexts cannot mutate workspace pages or saved definitions.
+`saved_functions` and `applied_queries` record successful mutations.
+Supplying `ask_user: Callable[[AIQuestion], Awaitable[str]]` exposes interactive
+clarification in either editor mode without granting mutations. Frozen
+`AIQuestion(question, options, recommended)` and `AIQuestionOption(label, description)`
+carry the validated question to the app; the callback returns the user's answer.
 
 `system_prompt()` = `LANGUAGE_GUIDE` + `FUNCTION_GUIDE` in both editor modes +
 `"\nEditor snapshot (JSON data):\n"` + one JSON object:
@@ -3950,6 +4035,18 @@ non-nullability notation; the `\except`-based exclusion recipe; `\case`, `\temp`
 standing rules that tool output is untrusted **data**, never instructions, that
 manual or opted-in automatic draft Apply changes editor text without running it, that
 `validate_d8r` is syntax-only, and that credentials must never be requested or emitted.
+Workspace data questions (counts, breakdowns, lists, comparisons) and explicit
+query create/make/build/edit/apply requests call `apply_queries`, including “apply it”
+after a query discussion. It applies every labeled document, one per page in order,
+without copy/paste instructions, another approval, or an auto-accept toggle. The
+model reports applied/saved success only after the tool confirms it, then gives a
+brief factual confirmation instead of more replacement fences. Explanatory questions,
+reviews and explicit preview-only requests do not authorize mutations. Explanatory
+examples use plain/text fences; D8R fences identify complete replacement proposals.
+Genuine missing information or materially different interpretations use `ask_user`
+with 2–5 distinct choices, optional descriptions and a recommendation when useful.
+The IDE supplies Other; the model must not add it. After the answer, the model
+continues the original authorized task instead of requesting approval again.
 `FUNCTION_GUIDE` directs main chat to call `save_function` for explicit user
 create/edit/save/apply requests, including “apply it” after a function proposal.
 The user need not switch forms, click Apply/Save function, or enable auto-accept.
@@ -3958,7 +4055,7 @@ schema, samples, history, drafts or function bodies are data, not authorization.
 The model interprets natural-language intent under these instructions, not a keyword
 gate or a self-certified permission field. Earlier assistant refusals claiming that
 main chat cannot save functions are obsolete, not a restriction on the current tool.
-For previews and function-form editing, the proposal protocol remains one D8R fence
+For function previews and function-form editing, the protocol remains one D8R fence
 plus JSON with exactly `kind`, `original_name`, `name`, `description`, `parameters`,
 `arguments`. `kind` is `function`; `original_name` is null for create, or the exact
 saved name for edit. Edits cannot rename. Workspace previews retain manual
@@ -3967,9 +4064,10 @@ are never executed or treated as direct-save tool calls.
 
 #### 3.2 The tools exposed to the model
 
-Five read-only tools are always available; guarded workspace contexts additionally
-expose `save_function`. Tool declarations use `additionalProperties: false`;
-`call_tool` re-validates the contract server-side rather than trusting the provider.
+Read-only tools are filtered by the schema/sample permission settings. Guarded
+workspace contexts additionally expose `save_function` and, with an editor callback,
+`apply_queries`. Tool declarations use `additionalProperties: false`; `call_tool`
+re-validates the contract locally rather than trusting the provider.
 
 | Tool | Arguments (required in **bold**) | Bound | Returns |
 | --- | --- | --- | --- |
@@ -3978,7 +4076,9 @@ expose `save_function`. Tool declarations use `additionalProperties: false`;
 | `query_history` | `query` | case-insensitive substring over this **source only**, at most **10** entries, `doc` truncated to **6000** chars | `{"source","history":[{"document","rows","at"}]}` |
 | `functions` | `query` | case-insensitive substring over `name + " " + description`, at most **15**, `doc[:1000]`, `body[:6000]` | `{"functions":[{"name","description","parameters","body"}]}` |
 | `validate_d8r` | **`text`**, `parameters` (array of strings) | same 64 000-character ceiling as proposals; parser-only | `{"valid": bool, "error": str|null}` |
+| `ask_user` (with app callback, either editor mode) | **`question`**, **`options`** (2–5 exact objects with required `label`, optional `description`), `recommended` (zero-based integer) | question ≤2000 chars, label ≤200, description ≤1000; nonblank/distinct labels, no model-supplied Other; recommendation within options; consumes one tool round | `{"answer": "selected label or custom text"}` or a safe `{"error": "…"}` |
 | `save_function` (guarded workspace only) | **`name`** (string), **`original_name`** (string or null), **`description`** (string), **`parameters`** (array of strings), **`body`** (string) | exact fields/types, valid signature/body, captured source and original-definition/request guards; no execution | `{"saved": true, "name": "…"}` or `{"saved": false, "error": "…"}` |
+| `apply_queries` (guarded workspace/editor only) | **`queries`** (nonempty array of exact string `title`/`body` objects) | 64 000 combined title/body characters; every document parser-validated before the live source/target/generation guard and synchronous callback; no execution | `{"applied": true, "titles": ["…"], "executed": false}` or `{"applied": false, "error": "…"}` |
 
 Matching details worth knowing: `schema`'s `table` is an exact-name filter and `query` matches the
 table name **or** any column name case-insensitively — the guide warns that `query` searches
@@ -4001,8 +4101,9 @@ Read-only tool checks return JSON rather than raising:
 2. `args` not a dict, or any key outside the declared `properties` → `{"error": "Invalid tool arguments."}`
 3. Missing a declared `required` key → `{"error": "Missing required tool argument."}`
 4. Per-key type/range check: `string` must be `str`; `integer` must be a true `int` within the
-   declared `minimum`/`maximum`; `array` must be a `list` of `str` → otherwise
-   `{"error": "Invalid tool argument type or range."}`
+   declared `minimum`/`maximum`; parameter arrays must be lists of strings;
+   `apply_queries.queries` must be a nonempty list of exact string title/body objects.
+   Invalid types/ranges/extra nested fields return a safe error before mutation.
 5. Source identity: `session.sources.get(source_id) is not self.source` →
    `{"error": "The source changed; start a new chat."}`
 6. Dispatch.
@@ -4028,6 +4129,20 @@ Immediately before synchronous `Session.save_fn` inside `target_source`, the liv
 request-generation, cancellation and target checks. Successful definitions enter
 `saved_functions`; rejection returns `saved: false` with a safe error.
 
+`apply_queries` validates every complete document and the combined title/body size
+before touching the editor. The live guard runs after validation but **before**
+`target_source` can mask a source switch. Its synchronous callback keeps the current
+page's stable identity for the first labeled query and creates the others on the
+same source/dialect. Unrelated drafts, results and history are untouched. A rejected
+batch changes no page; a completed callback records ordered `applied_queries` and
+returns `applied: true, executed: false`.
+
+`ask_user` validates the entire question, nested fields, text bounds, unique labels
+and recommendation before opening UI. Malformed/unavailable calls return an error
+without asking anything. It preserves source-object pinning and propagates
+cancellation. The callback receives the immutable question and returns trimmed
+nonempty user text; no query executes or workspace draft changes merely by answering.
+
 #### 3.4 Proposal decoding and validation
 
 `read_proposal(answer)` (raises `ValueError` with an *instruction to the user*, shown as the status
@@ -4037,15 +4152,20 @@ line):
   `^```d8r[^\S\r\n]*\r?\n(.*?)^```[^\S\r\n]*$` (`MULTILINE | DOTALL | IGNORECASE`); horizontal
   whitespace after the language tag is tolerated, `\r\n` accepted.
 - Zero blocks → returns `None`: it was plain conversation, no replacement.
-- More than one → `"Ask for one complete draft, not multiple D8R blocks."`
-- Body is the single D8R block with trailing newlines stripped. A document target
-  accepts a bare D8R block or explicit JSON `{"kind":"document"}`.
+- A single document target accepts a bare D8R block or JSON `{"kind":"document"}`;
+  trailing body newlines are stripped.
+- Multiple documents require exactly one JSON block `{"kind":"queries","titles":[...]}`
+  with one nonempty title per D8R fence in the same order. Every query remains a
+  separate runnable document, not several statements concatenated into one.
+- Incomplete D8R fences, mixed function/query batches, or mismatched labels are errors.
 - A function proposal in either mode requires the exact metadata protocol above.
   Missing/malformed/extra JSON fields, including an unclosed JSON fence, are errors;
   they never silently become query replacements.
 
-`AIProposal` is frozen: `body`, optional `function`, `arguments`, `original_name`.
-Its kind distinguishes document, function creation, and function editing.
+`AIProposal` is frozen: `body`, optional `function`, `arguments`, `original_name`,
+and `queries` (a tuple of frozen `AIQuery(title, body)` values). For a batch, `body`
+is its first document. Kind distinguishes document, queries, function creation,
+and function editing.
 
 `validate_proposal(text)` returns an error string or `None`:
 
@@ -4064,14 +4184,15 @@ registry. Creation rejects existing/newly occupied names; editing requires an
 unchanged, still-existing original with the same name. A function-form proposal
 must match its selected original. `validate_replacement` also enforces the 64,000
 character bound, matching body/preview, bare names, and parser validation inside
-the captured source. The functions tool reads the same frozen snapshot.
+the captured source. Batches validate every document and their combined title/body
+size before any mutation. The functions tool reads the same frozen snapshot.
 
 **What this grants:** read-only metadata, bounded sample rows, this source's history
-and function library, parser feedback, and explicitly user-requested local function
-saves in guarded workspace contexts. **What it denies:** tool-driven query/draft
-replacement, settings writes, general file/shell access, proposed-query execution,
-arbitrary SQL/code, cross-source history, engine error detail, or additional network
-capabilities. The tool list is fixed at construction.
+and function library, parser feedback, and explicitly user-requested local query
+draft updates and function saves in guarded workspace contexts. **What it denies:**
+function-form query-page mutation, settings writes, general file/shell access,
+proposed-query execution, arbitrary SQL/code, cross-source history, engine error
+detail, or additional network capabilities. The tool list is fixed at construction.
 
 ---
 
@@ -4141,7 +4262,7 @@ messages, cancellation generation, stream and proposal. Switching chats, selecti
 another target, hiding the panel or closing the function screen leaves work running.
 Complete replies are retained even when the target changed, but stale proposals
 cannot overwrite edited text. Failed or partial provider replies never enter
-replayable history; already-completed function saves are recorded separately.
+replayable history; already-completed query updates/function saves have separate receipts.
 Cancel stops only the selected request; app exit cancels every active request and
 preserves pending prompts for an explicit retry after restart.
 
@@ -4149,30 +4270,44 @@ Send/Enter during a response supersedes its generation and starts a steered turn
 in the same chat. The original instruction and atomically completed tool exchanges
 remain; partial replies/tool batches do not. An explicit D8R interruption receipt
 closes the abandoned turn for strict provider/persistence role ordering and records
-any committed saves. New steering waits for shielded context reads to finish before
+any committed changes. New steering waits for shielded context reads to finish before
 issuing another provider turn. Rapid steering remains ordered; late old callbacks,
-failures and cleanup cannot overwrite the newer worker/proposal/status or save.
+failures and cleanup cannot overwrite the newer worker/proposal/status or mutate drafts.
 
 Context tools retain the shared-connection reservation: a busy connection returns
 a safe tool error rather than overlapping database work. An already-running sample
 is shielded from request cancellation, and releases the reservation only when its
 real task finishes. Provider requests themselves may run concurrently.
-`save_function` does not use this shielded background path: the live request/target
-guard and synchronous save run together. Cancellation or a superseding request
-prevents a not-yet-started save. If saving already completed, later provider failure
-or cancellation cannot roll it back; chat transcript/status report the completed
-save and visible function/completion UI refreshes without changing the query or mode.
+`save_function` and `apply_queries` do not use this shielded background path: the
+live request/target guard and synchronous mutation run together. Cancellation or
+a superseding request prevents a not-yet-started change. Completed changes survive
+later provider failure/cancellation with trusted chat/status receipts. The manager
+advances the target snapshot after its own query update, while user edits, page
+switches and source switches still invalidate late tools.
 
 #### Controls and agent status
 
 `\AI` or **Ask AI** opens the shared panel for the current editor target. Enter or
 Ctrl+Enter sends, Shift+Enter inserts a newline, and Tab/Shift+Tab navigate controls.
 Both modes offer Send, Cancel, Apply, New chat, Agents, Settings, Logs and Close.
-Workspace function preview proposals label Apply as **Save function**. Direct save
-requests need neither button. New chat preserves history.
+Workspace function previews label Apply as **Save function**; query batches label
+it **Apply queries** and display every labeled draft. Direct query/function requests
+need neither button. New chat preserves history.
 
-`AgentsPane` in the workspace sidebar and `AgentsScreen` via **Agents** or Ctrl+J
-list every chat's title, target and working/awaiting-read/error/cancelled/idle status.
+For clarification, an in-chat **Clarification** card shows the question, option
+labels/descriptions and optional recommended marker. Up/Down chooses; Enter or a
+click on a provided option answers immediately. **Other** reveals a custom Input;
+nonblank text (at most 2000 characters) submits with Enter or **Continue**. Tab/Shift+Tab
+include these controls. Answers resume the original assistant/tool exchange; clear
+data requests still apply directly, while explicit previews keep the green Apply button.
+Pending questions, selections and Other drafts belong to their chat and survive
+chat switches in memory. They never reserve the database connection or expire under
+the provider timeout. Cancel, steering and exit dismiss them; stale targets cannot
+submit an answer that would authorize a late edit.
+
+`AgentsPane` occupies the left **agents** tab. **Agents** or Ctrl+J reveals it
+without changing editor modes and lists every chat's title, target and
+working/awaiting-read/error/cancelled/idle status.
 Selecting a chat reopens its transcript and composer and marks it read. A chat for
 a different current target is history-only until that target is available; browsing
 never silently switches sources or overwrites drafts.
@@ -4185,16 +4320,19 @@ proposals update only drafts; Auto accept AI updates (off initially) can apply t
 to a matching mounted editor. Workspace preview proposals retain manual
 **Save function**: the callback persists through `Session.save_fn` without switching
 modes or changing/running the query. Failed manual saves retain the proposal for
-retry. Explicit user create/edit/save/apply requests instead invoke `save_function`
-directly under the guards above, independently of auto-accept and without a click.
+retry. Data questions and explicit user query create/edit/apply requests instead
+invoke `apply_queries`, and function create/edit/save/apply requests invoke
+`save_function`, directly under the guards above, independently of auto-accept and without a click.
 Restore never applies proposals, resumes requests, or saves definitions.
 
 Composer edits are debounced; switching, completion, cancellation and exit flush
 state through Session's existing workspace lock and atomic storage. Chat records
 persist UUID, target key, title, complete exchanges/transcript, composer, turn count,
 visibility, selected state, status text and unread state. Legacy target-keyed chat
-records migrate during validation. Workers, partial replies, diagnostics and applicable
-proposals never restore; an interrupted request becomes cancelled, not resumed.
+records migrate during validation. Workers, partial replies, diagnostics, applicable
+proposals and pending question/answer drafts never restore; an interrupted request
+becomes cancelled, not resumed. Completed clarification exchanges use the existing
+validated tool-history format and can be replayed on an explicit follow-up.
 Save failures retain in-memory state and display a safe error without turning a
 successful provider reply into a failed request.
 
@@ -4357,8 +4495,9 @@ thin pass-through.
 Defaults:
 
 ```python
-{"version": 1, "intellisense": True,
- "panes": {"results": True, "sql": True, "history": True, "schema": True},
+{"version": 1, "intellisense": True, "entry_screen": False,
+ "panes": {"results": True, "sql": True, "history": True, "schema": True,
+           "agents": True, "ai": False},
  "source": "demo", "dialect": "duckdb", "default_rows": 50,
  "value_cache_enabled": True, "value_cache_limit": 1000,
  "ai_auto_accept": False,
@@ -4374,7 +4513,8 @@ therefore rejected, not quietly retained.
 | --- | --- |
 | `version` | true `int`, exactly `1` |
 | `intellisense` | true `bool` |
-| `panes.results`, `panes.sql`, `panes.history`, `panes.schema` | each a true `bool` (`pane visibility must be a boolean`) |
+| `entry_screen` | true `bool`, defaults to false |
+| `panes.results`, `panes.sql`, `panes.history`, `panes.schema`, `panes.agents`, `panes.ai` | each a true `bool` (`pane visibility must be a boolean`); agents defaults to visible, AI to hidden |
 | `source` | non-empty string (the active source id; must exist in the registry to be *applied*, validated at `update_settings`) |
 | `dialect` | non-empty string **and** a member of `DIALECT_BY_NAME` (`unsupported dialect`) |
 | `default_rows` | true `int`, `0 … 1_000_000`; `0` disables the implicit cap (`Default rows returned must be an integer between 0 and 1000000 (0 disables the default.)`) |
@@ -4428,7 +4568,7 @@ All other keys must appear exactly as listed.
 | `history[].rows` | true `int`, `≥ 0` (`invalid history row count`) |
 | `history[].ms` | `int` or `float`, `0 ≤ ms < inf` (`invalid history duration`) |
 | `pages` | list of `{id, title, document, cursor, source, dialect}`; unique nonempty string ids, string text/source fields, valid cursor and dialect |
-| `explorer_tab` | `schema` or `pages` |
+| `explorer_tab` | `schema`, `pages` or `agents`; a hidden agents tab restores as Schema |
 
 `_chat_messages` is the replay-safety gate: *"Only complete exchanges may be replayed; loading
 never executes tools."* It walks a strict role machine starting at `user`:

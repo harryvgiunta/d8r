@@ -155,9 +155,10 @@ def test_source_and_mode_isolation_and_durable_new_chat(monkeypatch):
             panel.action_close()
             app.session.set_active("demo")
             panel.target_changed()
-            assert panel.display
+            assert not panel.display  # Closing the right pane applies across targets.
             assert panel.messages[0]["content"] == "Demo question"
             assert panel.query_one("#ai-input", TextArea).text == "Demo draft"
+            panel.open()
             panel.action_clear()
             assert not panel.messages
             assert panel.query_one("#ai-input", TextArea).text == ""

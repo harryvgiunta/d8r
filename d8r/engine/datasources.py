@@ -30,10 +30,12 @@ import ibis.expr.operations as ops
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from d8r.query.functions import DUCKDB_UNRENDERABLE, SCALAR_FUNCTIONS, URL_ACCESSORS
+from d8r.query import relation_name
+from d8r.query.functions import DUCKDB_UNRENDERABLE, JSON_FUNCTIONS, SCALAR_FUNCTIONS, URL_ACCESSORS
+from d8r.query.schema import ForeignKey
 
-from .d1api import CloudflareD1, schema_connection
-from .expression import PayloadError, compile_sql
+from .d1api import CloudflareD1, schema_connection, sqlite_foreign_keys
+from .expression import PayloadError, _json_call, compile_sql, lower_for_backend
 
 ENGINE_DIR = Path(__file__).resolve().parent
 DATA_DIR = ENGINE_DIR / "data"
@@ -68,6 +70,7 @@ CAPABILITIES: dict = {
             fn for fn in SCALAR_FUNCTIONS
             if fn not in {"string", "coalesce", "nullif"} and fn not in DUCKDB_UNRENDERABLE
         ],
+        "json": list(JSON_FUNCTIONS),
         # `coalesce`/`nullif` are cross-type: any dtype, any backend (both
         # compile to plain SQL everywhere this app reaches).
         "any": ["string", "coalesce", "nullif"],
@@ -202,7 +205,11 @@ def _unrenderable_on(con) -> frozenset[str]:
     try:
         t = con.sql("SELECT 1", schema={"a": "int64", "s": "string"})
     except Exception:
-        return frozenset(calls)
+        return frozenset((*calls, *JSON_FUNCTIONS))
+    for fn in JSON_FUNCTIONS:
+        calls[fn] = lambda fn=fn: lower_for_backend(
+            _json_call(fn, t.s, [ibis.literal("nested.key"), ibis.literal(0)]), con.name,
+        )
     dead = set()
     for name, make in calls.items():
         if not _probe_compile(con, lambda make=make: make().name("x")):
@@ -344,7 +351,8 @@ def capabilities_for(source: "DataSource") -> dict:
     flags = {k: v for k, v in probed.items() if k != "dead"}
     return {
         **caps,
-        "functions": {**caps["functions"], "string": string_fns},
+        "functions": {**caps["functions"], "string": string_fns,
+                      "json": [fn for fn in caps["functions"]["json"] if fn not in dead]},
         "supports": {**caps["supports"], **flags},
     }
 
@@ -759,6 +767,13 @@ def _ingest_sqlite(source: DataSource) -> DataSource:
     raw = sqlite3.connect(str(source.dir), check_same_thread=False, isolation_level=None)
     try:
         source.con = ibis.sqlite.from_connection(raw)
+
+        def query_metadata(sql: str) -> list[dict]:
+            cursor = raw.execute(sql)
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        foreign_keys = sqlite_foreign_keys(query_metadata)
         for name in source.con.list_tables():
             if name.startswith("sqlite_") or name.startswith("_cf_"):
                 continue
@@ -767,6 +782,7 @@ def _ingest_sqlite(source: DataSource) -> DataSource:
                 "table": table,
                 "doc": f"{name} · {source.dir.name}",
                 "rows": int(table.count().execute()),
+                "foreign_keys": foreign_keys.get(name, ()),
             }
         if not source.datasets:
             raise RuntimeError(f"database {source.dir} has no user tables")
@@ -833,6 +849,43 @@ def add_d1_live_source(
         raise
 
 
+@ibis.udf.scalar.builtin(name="has_schema_privilege", database="pg_catalog")
+def _postgres_has_schema_privilege(schema: str, privilege: str) -> bool:
+    """Check schema access for the connection's current PostgreSQL role."""
+
+
+def _postgres_foreign_keys(raw, schemas: list[str]) -> dict[str, tuple[ForeignKey, ...]]:
+    """Catalog discovered schemas' constraints, paired by key ordinality."""
+    if not schemas:
+        return {}
+    with raw.cursor() as cursor:
+        rows = cursor.execute(
+            "select src_ns.nspname, src.relname, dst_ns.nspname, dst.relname, "
+            "array_agg(src_col.attname order by keys.position), "
+            "array_agg(dst_col.attname order by keys.position) "
+            "from pg_catalog.pg_constraint c "
+            "join pg_catalog.pg_class src on src.oid = c.conrelid "
+            "join pg_catalog.pg_namespace src_ns on src_ns.oid = src.relnamespace "
+            "join pg_catalog.pg_class dst on dst.oid = c.confrelid "
+            "join pg_catalog.pg_namespace dst_ns on dst_ns.oid = dst.relnamespace "
+            "join lateral unnest(c.conkey, c.confkey) with ordinality "
+            "as keys(source_number, target_number, position) on true "
+            "join pg_catalog.pg_attribute src_col "
+            "on src_col.attrelid = src.oid and src_col.attnum = keys.source_number "
+            "join pg_catalog.pg_attribute dst_col "
+            "on dst_col.attrelid = dst.oid and dst_col.attnum = keys.target_number "
+            "where c.contype = 'f' and src_ns.nspname = any(%s) "
+            "group by c.oid, c.conname, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname "
+            "order by src_ns.nspname, src.relname, c.conname, c.oid",
+            (schemas,),
+        ).fetchall()
+    tables: dict[str, list[ForeignKey]] = {}
+    for schema, table, target_schema, target_table, columns, targets in rows:
+        target = relation_name(target_schema, target_table)
+        tables.setdefault(relation_name(schema, table), []).append(ForeignKey(columns, target, targets))
+    return {table: tuple(keys) for table, keys in tables.items()}
+
+
 def add_postgres_source(
     source_id: str,
     *,
@@ -845,7 +898,7 @@ def add_postgres_source(
     sslmode: str = "prefer",
     display: str | None = None,
 ) -> DataSource:
-    """Connect explicitly to PostgreSQL and discover one schema without scanning rows.
+    """Connect to PostgreSQL and discover accessible user schemas without scanning rows.
 
     Ibis owns all query compilation/execution. Supplying an existing autocommit
     psycopg connection avoids retaining its password in Ibis connection kwargs;
@@ -901,7 +954,13 @@ def add_postgres_source(
                     psycopg.sql.Identifier(metadata["schema"])
                 )
             )
-        if metadata["schema"] not in con.list_databases():
+        namespaces = con.table("pg_namespace", database=(metadata["database"], "pg_catalog"))
+        schemas = namespaces.filter(
+            ~namespaces.nspname.lower().startswith("pg_"),
+            namespaces.nspname.lower() != "information_schema",
+            _postgres_has_schema_privilege(namespaces.nspname, "USAGE"),
+        ).select("nspname").execute().nspname.tolist()
+        if metadata["schema"] not in schemas:
             raise ValueError("selected schema is unavailable")
 
         def public_text(value: str) -> str:
@@ -917,10 +976,9 @@ def add_postgres_source(
             con=con,
             postgres=metadata,
         )
-        location = (metadata["database"], metadata["schema"])
-        # Ibis 12 list_tables(public) also unions temporary names, even when
-        # a schema was requested. Discover exactly this schema through Ibis
-        # instead, without peeking at rows or other sessions' temp objects.
+        # information_schema applies PostgreSQL's table privilege visibility.
+        # Restrict it to usable user schemas: Ibis list_tables also includes
+        # temporary names, even when a particular schema was requested.
         relations = ops.DatabaseTable(
             "tables",
             ibis.schema({
@@ -934,14 +992,17 @@ def add_postgres_source(
         ).to_expr()
         names = relations.filter(
             relations.table_catalog == metadata["database"],
-            relations.table_schema == metadata["schema"],
+            relations.table_schema.isin(schemas),
             relations.table_type.isin(["BASE TABLE", "VIEW", "FOREIGN"]),
-        ).select("table_name").order_by("table_name").execute()
-        for name in names.table_name:
-            source.datasets[name] = {
-                "table": con.table(name, database=location),
-                "doc": public_text(f"{name} · {metadata['schema']}"),
+        ).select("table_schema", "table_name").order_by("table_schema", "table_name").execute()
+        foreign_keys = _postgres_foreign_keys(raw, names.table_schema.unique().tolist())
+        for namespace, name in names.itertuples(index=False, name=None):
+            qualified = relation_name(namespace, name)
+            source.datasets[qualified] = {
+                "table": con.table(name, database=(metadata["database"], namespace)),
+                "doc": public_text(f"{name} · {namespace}"),
                 "rows": None,
+                "foreign_keys": foreign_keys.get(qualified, ()),
             }
         return source
     except Exception:

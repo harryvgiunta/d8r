@@ -679,14 +679,12 @@ def test_palette_follows_the_caret_and_the_schema():
 
         await pilot.press("enter")
         assert app.editor.text == "\\from events\n\\select user_id "
-        assert app.palette.is_open is True  # accepting keeps the offers on
-        assert app.palette.view.labels == ["user_id"]  # the field it just landed on
+        assert app.palette.is_open is False  # no stale offer for the completed field
 
         # `\where` walks column → operator → that column's distinct values.
-        await pilot.press("escape")  # the offers stay on only until Escape says so
         await pilot.press("enter")  # the clause gets its own line, as it would
         await type_document(pilot, "\\where event_type")
-        assert app.palette.view.labels == ["event_type"]
+        assert not app.palette.is_open
         await type_document(pilot, " ")
         assert "=" in app.palette.view.labels
         await type_document(pilot, "= ")
@@ -701,7 +699,7 @@ def test_palette_follows_the_caret_and_the_schema():
         # document's own — and the next keystroke re-syncs it where it landed.
         app.editor.cursor_location = (1, len("\\select user_id "))
         await pilot.pause()
-        assert app.palette.is_open is True
+        assert app.palette.is_open is False
         await type_document(pilot, ", ")
         assert app.palette.view.labels[:2] == ["timestamp", "user_id"]
 
@@ -892,13 +890,13 @@ def test_string_completion_tracks_nested_arguments_and_quoted_commas():
     prefix = "\\select concat(upper(e.event_type), 'it''s, (text)', "
     line = prefix + "pa"
     view = view_for(session, doc + line, line, len(line))
-    assert line[:view.start] + view.entries[0].insert == prefix + "path"
+    assert line[:view.start] + view.entries[0].insert == prefix + "e.path"
 
     line = "\\select substr(e.path, "
     view = view_for(session, doc + line, line, len(line))
-    assert "user_id" in view.labels
-    assert "path" not in view.labels
-    assert "amount" not in view.labels
+    assert "e.user_id" in view.labels
+    assert "e.path" not in view.labels
+    assert "e.amount" not in view.labels
     assert "length" in view.labels
     assert "upper" not in view.labels
 
@@ -907,7 +905,7 @@ def test_string_completion_tracks_nested_arguments_and_quoted_commas():
 
     line = "\\select concat(e.path, string(us"
     view = view_for(session, doc + line, line, len(line))
-    assert line[:view.start] + view.entries[0].insert == "\\select concat(e.path, string(user_id)"
+    assert line[:view.start] + view.entries[0].insert == "\\select concat(e.path, string(e.user_id)"
 
 
 def test_string_completion_obeys_source_capabilities():
@@ -973,9 +971,8 @@ def test_clause_commands_take_their_own_line_or_the_line_they_have():
         await pilot.press("enter")
         assert app.editor.text == "\\from events\n\\select user_id\n\\where amount > 1"
         assert app.editor.cursor_location == (1, len("\\select user_id"))
-        # The jump is followed, not just made: the offers land at the clause too.
-        assert app.palette.is_open is True
-        assert app.palette.view.labels == ["user_id"]
+        # A completed target clause must not resurrect its stale field offer.
+        assert app.palette.is_open is False
 
         # Inside a CTE body the lookup stays in that block: the body's `\where`
         # is not the document's, so this one is written, not reused.
@@ -1100,12 +1097,10 @@ def test_tab_accepts_a_suggestion_and_never_moves_focus():
 
         await pilot.press("tab")
         assert app.editor.text == "\\from events\n\\select user_id "
-        assert app.palette.is_open is True  # intellisense stays on past the accept
-        assert app.palette.view.labels == ["user_id"]  # the field the caret landed on
+        assert app.palette.is_open is False
         assert app.focused is app.editor
 
         # Nothing to accept: Tab still does not move focus anywhere.
-        await pilot.press("escape")
         await pilot.press("tab")
         assert app.focused is app.editor
 
@@ -1257,11 +1252,12 @@ def test_settings_sidebar_preserves_category_when_returning_from_details():
         sidebar = screen.query_one("#settings-sidebar", OptionList)
         details = screen.query_one("#settings-menu", OptionList)
         assert sidebar.has_focus
+        visibility = {name: app.pane_visible(name) for name in app.PANES}
         assert sidebar.region.right < details.region.x
         await pilot.press("down")
         assert screen.menu == "menus"
         assert sidebar.has_focus
-        assert all(app.pane_visible(name) for name in app.PANE_TITLES)
+        assert {name: app.pane_visible(name) for name in app.PANES} == visibility
         await pilot.press("enter")
         assert details.has_focus
         await pilot.press("escape")
@@ -1275,18 +1271,12 @@ def test_settings_sidebar_preserves_category_when_returning_from_details():
 
 
 def test_settings_menus_submenu_flips_panes_at_once():
-    """Show/Hide Menus lists the three panes and hides one on the spot."""
+    """Visibility controls change the live panes, not the document or chats."""
 
     async def scenario(app, pilot):
         screen = await open_settings(app, pilot)
         await pick(pilot, app, "Show/Hide Menus")
-        assert [row.label for row in screen.rows] == [
-            "Results pane",
-            "SQL pane",
-            "History pane",
-            "Schema pane",
-        ]
-        assert [row.detail for row in screen.rows] == ["visible"] * 4
+        document = app.editor.text
 
         await pick(pilot, app, "SQL pane")
         assert app.pane_visible("sql") is False
@@ -1295,6 +1285,21 @@ def test_settings_menus_submenu_flips_panes_at_once():
         await pick(pilot, app, "SQL pane")
         assert app.pane_visible("sql") is True
         assert screen.rows[1].detail == "visible"
+
+        await pick(pilot, app, "agents")
+        assert not app.query_one("#explorer-tabs", TabbedContent).get_tab("tab-agents").display
+        await pick(pilot, app, "agents")
+        assert app.query_one("#explorer-tabs", TabbedContent).get_tab("tab-agents").display
+
+        await pick(pilot, app, "AI pane (right)")
+        assert app.ai_panel.display
+        chat = app.ai_panel.chat
+        await pick(pilot, app, "AI pane (right)")
+        assert not app.ai_panel.display
+        await pilot.pause()
+        assert not app.query_one("#ai-splitter").display
+        assert app.ai_panel.chat is chat
+        assert app.editor.text == document
 
         await pilot.press("escape")
         assert screen.query_one("#settings-sidebar", OptionList).has_focus
@@ -1336,6 +1341,24 @@ def test_settings_intellisense_switch_is_the_hard_off():
         assert app.palette.view.labels == ["user_id"]
 
     run_app(scenario)
+
+
+def test_general_entry_screen_toggle_persists_for_next_startup(tmp_path):
+    app = D8RApp(Session(data_dir=tmp_path))
+
+    async def scenario():
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert not app.session.entry_screen
+            app.action_settings()
+            await pilot.pause()
+            await pick(pilot, app, "Entry screen")
+            assert app.session.entry_screen
+            assert Session(data_dir=tmp_path).entry_screen
+            await pick(pilot, app, "Entry screen")
+            assert not Session(data_dir=tmp_path).entry_screen
+
+    asyncio.run(scenario())
 
 
 def test_settings_keybindings_come_from_the_running_widgets():
@@ -1396,7 +1419,8 @@ def test_settings_restore_hidden_panes_source_and_custom_dialect():
             await pilot.pause()
             assert not app.session.settings_path.exists()
             for name in app.PANES:
-                app.toggle_pane(name)
+                if app.pane_visible(name):
+                    app.toggle_pane(name)
             app.query_one("#source-select", Select).value = "postgres"
             await pilot.pause()
             app.query_one("#dialect-select", Select).value = "mysql"
@@ -1891,20 +1915,20 @@ def test_fn_body_completion_accepts_keys_and_clicks_without_editing_workspace():
         await pilot.press("escape")
         assert app.screen is screen
         assert not palette.is_open  # An empty body has nothing to offer, not a reason to leave.
-        await type_document(pilot, "\\fro")
+        await type_document(pilot, "\\from")
         await pilot.press("tab")
         assert body.text == "\\from "
         await type_document(pilot, "ev")
         await pilot.press("enter")
-        assert body.text == "\\from events "
+        assert body.text == "\\from events e "
         await pilot.press("enter")
         await type_document(pilot, "\\sel")
         await pilot.press("tab")
         await type_document(pilot, "us")
-        assert palette.view.labels == ["user_id"]
+        assert palette.view.labels == ["e.user_id"]
         await pilot.click("#fn-palette", offset=(3, 1))
         await pilot.pause()
-        assert body.text == "\\from events \n\\select user_id "
+        assert body.text == "\\from events e \n\\select e.user_id "
         assert app.focused is body
         await pilot.press("enter")
         await type_document(pilot, "\\")
@@ -1918,7 +1942,7 @@ def test_fn_body_completion_accepts_keys_and_clicks_without_editing_workspace():
         await pilot.press("escape")
         assert not palette.is_open
         await pilot.press("tab")
-        assert app.focused is screen.query_one("#fn-args", Input)
+        assert app.focused is screen.query_one("#fn-save", Button)
         await pilot.press("escape")
         assert app.screen is screen  # Escape in a form field never closes the library.
         await pilot.press("ctrl+q")
@@ -2119,7 +2143,7 @@ def test_cancel_pending_d1_connection_never_registers_or_remembers(monkeypatch):
     run_app(scenario)
 
 
-def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
+def test_d1_add_saves_token_and_reopens_masked_after_startup_connect(monkeypatch):
     from tests.test_d1_sources import LIVE_ARGS, SECRET, live_source
 
     connected = []
@@ -2154,8 +2178,11 @@ def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
         restored = D8RApp()
         async with restored.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            assert "orders-db" not in restored.session.sources
-            assert len(connected) == 1
+            await restored.workers.wait_for_complete()
+            await pilot.pause()
+            assert restored.session.source_connected()
+            assert not restored.session.history
+            assert len(connected) == 2
             await pilot.press("ctrl+o")
             modal = restored.screen
             modal.query_one("#d1-profile", Select).value = 0
@@ -2164,12 +2191,9 @@ def test_d1_add_saves_token_and_reopens_masked_without_connecting(monkeypatch):
             assert token.value == SECRET
             assert token.password
             assert SECRET not in str(modal.query_one("#add-source-message", Static).content)
-            assert len(connected) == 1
+            assert len(connected) == 2
             await pilot.press("escape")
             assert restored.session.storage_path.read_bytes() == saved
-            # The restored target is already selected; reconnect is an explicit action.
-            await pilot.click("#reconnect-source")
-            await restored.workers.wait_for_complete()
             await pilot.pause()
             assert restored.session.active_id == "orders-db"
             assert restored.query_one("#source-select", Select).value == "orders-db"
@@ -2208,7 +2232,10 @@ def test_run_reconnects_saved_d1_and_executes_once(monkeypatch, saved_d1_session
         app = D8RApp(session)
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
-            assert not calls
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not session.history
+            assert session.source_connected()
             app.editor.load_text("\\from orders\n\\select *\n\\limit 1")
             app.editor.move_cursor((0, 0))
             app.editor.move_cursor((1, len("\\select *")), select=True)
@@ -2467,21 +2494,88 @@ def test_the_splash_play_paces_every_frame_and_gives_the_cursor_back():
     assert "████" in naked            # …and still shows the mark
 
 
-def test_main_splashes_on_a_terminal_and_only_there(monkeypatch):
-    """The entry point shows the dozer first on a tty, and never on a pipe."""
+@pytest.mark.parametrize(("enabled", "tty"), [(False, True), (True, True), (True, False)])
+def test_main_entry_screen_is_opt_in_and_terminal_only(monkeypatch, enabled, tty):
+    """The real entry point only renders the saved opt-in splash on a terminal."""
+    session = Session()
+    if enabled:
+        session.update_settings(entry_screen=True)
 
-    class _Stub:
-        def run(self) -> None:
-            order.append("app")
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return tty
 
-    order: list[str] = []
-    monkeypatch.setattr("d8r.tui.app.D8RApp", _Stub)
-    monkeypatch.setattr(splash, "play", lambda **kw: order.append("splash"))
-    monkeypatch.setattr(splash, "should_play", lambda stream=None: True)
+    output = Terminal()
+    play = splash.play
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(splash, "play", lambda: play(sleep=lambda _seconds: None))
+    monkeypatch.setattr(D8RApp, "run", lambda self: None)
     app_main()
-    assert order == ["splash", "app"]
+    assert bool(output.getvalue()) is (enabled and tty)
 
-    order.clear()
-    monkeypatch.setattr(splash, "should_play", lambda stream=None: False)
-    app_main()
-    assert order == ["app"]
+
+def test_selected_aliases_and_composite_foreign_keys_execute(tmp_path):
+    path = tmp_path / "relationships.sqlite"
+    with sqlite3.connect(path) as raw:
+        raw.executescript("""
+            CREATE TABLE projects (tenant INTEGER, id INTEGER, title TEXT, PRIMARY KEY (tenant, id));
+            CREATE TABLE tasks (tenant INTEGER, project_id INTEGER, title TEXT,
+                FOREIGN KEY (tenant, project_id) REFERENCES projects (tenant, id));
+            INSERT INTO projects VALUES (1, 7, 'wrong tenant'), (2, 7, 'right tenant');
+            INSERT INTO tasks VALUES (2, 7, 'ship');
+        """)
+    source = add_sqlite_source("relationships", str(path))
+    session = Session({source.id: source})
+
+    async def scenario():
+        app = D8RApp(session)
+        async with app.run_test(size=(140, 45)) as pilot:
+            app.editor.load_text("\\from proj")
+            app.editor.cursor_location = (0, len(app.editor.text))
+            await pilot.pause()
+            await pilot.press("tab")
+            assert app.editor.text == "\\from projects p "
+            app.editor.load_text(app.editor.text.rstrip() + "\n\\join tas")
+            app.editor.cursor_location = (1, len("\\join tas"))
+            await pilot.pause()
+            await pilot.press("tab")
+            assert app.editor.text.endswith("\\join tasks t ")
+            await pilot.press("tab")
+            assert app.editor.text.endswith("on p.tenant = t.tenant and p.id = t.project_id ")
+            app.editor.load_text(app.editor.text.rstrip() + "\n\\select tit")
+            app.editor.cursor_location = (2, len("\\select tit"))
+            await pilot.pause()
+            assert app.palette.view.labels == ["p.title", "t.title"]
+            await pilot.press("tab", "ctrl+enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [str(cell) for cell in results_table(app).get_row_at(0)] == ["right tenant"]
+            assert results_table(app).row_count == 1
+
+    asyncio.run(scenario())
+    line = "\\join projects p2 on "
+    doc = "\\from tasks t\n" + line
+    view = view_for(session, doc, line, len(line))
+    assert view.labels == ["t.tenant = p2.tenant and t.project_id = p2.id"]
+    assert session.table_insert("\\from projects p\n\\join projects p2 on p.id = p2.id", "projects") == "projects p3 "
+
+
+def test_intellisense_recency_is_source_scoped_and_rebinds_aliases(sources, tmp_path):
+    other = replace(sources["demo"], id="other")
+    session = Session({"demo": sources["demo"], "other": other}, data_dir=tmp_path / "ranking")
+    session.set_active("other")
+    assert session.run("\\from users\n\\select region\n\\limit 1").error == ""
+    session.set_active("demo")
+    assert view_for(session, "\\from ", "\\from ", len("\\from ")).labels[:2] == ["events", "users"]
+    assert session.run("\\from events old\n\\select old.amount\n\\where old.event_type = 'purchase'\n\\limit 1").error == ""
+    doc = "\\from events fresh\n\\select "
+    assert set(view_for(session, doc, "\\select ", len("\\select ")).labels[:2]) == {"fresh.amount", "fresh.event_type"}
+    assert view_for(session, doc, "\\select am", len("\\select am")).labels[:2] == ["fresh.amount", "fresh.timestamp"]
+    session.distinct_values(session.source, "events", "event_type")
+    line = "\\where fresh.event_type = "
+    assert view_for(session, doc + line, line, len(line)).labels[0] == "purchase"
+    assert session.run("\\from events\n\\select timestamp\n\\limit 1").error == ""
+    assert view_for(session, doc, "\\select ", len("\\select ")).labels[0] == "fresh.timestamp"
+    session.save_workspace(document=doc, source="demo", dialect="duckdb")
+    restored = Session({"demo": sources["demo"], "other": other}, data_dir=tmp_path / "ranking")
+    assert view_for(restored, doc, "\\select ", len("\\select ")).labels[0] == "fresh.timestamp"

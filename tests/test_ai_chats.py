@@ -6,11 +6,10 @@ import json
 
 import httpx
 import pytest
-from textual.widgets import Button, OptionList, Static, TextArea
+from textual.widgets import Button, OptionList, Static, TabbedContent, TextArea
 
 from d8r.ai import client
 from d8r.ai.client import AIConfig
-from d8r.tui.ai import AgentsScreen
 from d8r.tui.app import D8RApp
 from d8r.tui.session import Session
 
@@ -91,12 +90,14 @@ def test_parallel_same_target_switching_preserves_drafts_and_marks_unread(tmp_pa
             assert panel.query_one("#ai-input", TextArea).text == "First composer draft"
             gates["second"].set()
             await _finished(second)
-            assert second.label == "awaiting read"
+            assert second.unread
             assert "Reply to second" not in str(panel.query_one("#ai-transcript", Static).content)
-            app.action_agents()
+            screen = app.screen
+            await pilot.press("ctrl+j")
             await pilot.pause()
-            assert isinstance(app.screen, AgentsScreen)
-            options = app.screen.query_one(OptionList)
+            assert app.screen is screen
+            assert app.query_one("#explorer-tabs", TabbedContent).active == "tab-agents"
+            options = app.query_one("#agents-list", OptionList)
             options.highlighted = options.get_option_index(second.id)
             options.focus()
             await pilot.press("enter")
@@ -109,7 +110,7 @@ def test_parallel_same_target_switching_preserves_drafts_and_marks_unread(tmp_pa
             assert first.worker is not None  # Hiding another view never cancels this request.
             gates["first"].set()
             await _finished(first)
-            assert first.label == "awaiting read"
+            assert first.unread
             panel.select_chat(first.id)
             assert "Reply to first" in str(panel.query_one("#ai-transcript", Static).content)
             assert not first.unread
@@ -230,7 +231,7 @@ def test_function_request_survives_close_and_error_agent_can_reopen(tmp_path, mo
             assert chat.status == "working"
             release.set()
             await _finished(chat)
-            assert chat.label == "awaiting read"
+            assert chat.unread
             app.open_ai_chat(chat.id)
             await pilot.pause()
             assert app.function_mode
@@ -244,7 +245,7 @@ def test_function_request_survives_close_and_error_agent_can_reopen(tmp_path, mo
             panel.action_close()
             app.action_agents()
             await pilot.pause()
-            options = app.screen.query_one(OptionList)
+            options = app.query_one("#agents-list", OptionList)
             options.highlighted = options.get_option_index(chat.id)
             options.focus()
             await pilot.press("enter")
@@ -406,5 +407,68 @@ def test_function_auto_accept_only_fills_unsaved_draft(tmp_path, monkeypatch):
             assert screen.query_one("#fn-name").value == "generated"
             assert not session.fns
             assert not session.history
+
+    asyncio.run(scenario())
+
+
+def test_deleting_waiting_chat_revokes_late_updates_and_does_not_restore_it(tmp_path, monkeypatch):
+    async def scenario():
+        calls = []
+        question = {"question": "Which records?", "options": [{"label": "Events"}, {"label": "Users"}]}
+        tool = {"index": 0, "id": "pending-question", "type": "function",
+                "function": {"name": "ask_user", "arguments": json.dumps(question)}}
+
+        def provider(request):
+            calls.append(request)
+            frame = {"choices": [{"index": 0, "delta": {"tool_calls": [tool]}, "finish_reason": None}]}
+            end = {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+            data = "data: " + json.dumps(frame) + "\n\ndata: " + json.dumps(end) + "\n\ndata: [DONE]\n\n"
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data.encode())
+
+        _install(monkeypatch, provider)
+        app = D8RApp(_session(tmp_path))
+        async with app.run_test(size=(150, 52)) as pilot:
+            original = app.editor.text
+            app.action_ai()
+            panel = app.ai_panel
+            panel.query_one("#ai-input", TextArea).load_text("Make the query after clarifying")
+            panel.action_send()
+            chat = panel.chat
+
+            async def waiting():
+                while chat.question_answer is None:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(waiting(), 5)
+            answer = chat.question_answer
+            context = chat.context
+            panel.query_one("#ai-input", TextArea).load_text("Unsent draft before deletion")
+            await pilot.pause(0.05)
+            app.action_agents()
+            listing = app.query_one("#agents-list", OptionList)
+            listing.highlighted = listing.get_option_index(chat.id)
+            listing.focus()
+            await pilot.press("delete")
+            await pilot.pause(0.4)
+            assert answer.cancelled()
+            assert panel.chat is None
+            assert panel.query_one("#ai-input", TextArea).text == ""
+            result = json.loads(await context.call_tool("apply_queries", {
+                "queries": [{"title": "Too late", "body": BODY}],
+            }))
+            assert result["applied"] is False
+            assert app.editor.text == original
+            assert not app.ai_chats.chats
+            assert not app.session.load_chats()
+            assert len(calls) == 1
+            panel.open()
+            assert not app.session.load_chats()
+            app.exit()
+        restored = D8RApp(_session(tmp_path))
+        async with restored.run_test(size=(150, 52)) as pilot:
+            await pilot.pause()
+            assert not restored.ai_chats.chats
+            assert restored.editor.text == original
+            assert len(calls) == 1
 
     asyncio.run(scenario())

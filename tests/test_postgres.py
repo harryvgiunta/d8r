@@ -1,4 +1,4 @@
-"""PostgreSQL safety edges and opt-in integration against a disposable test schema.
+"""PostgreSQL safety edges and opt-in integration against disposable test schemas.
 
 Set D8R_TEST_POSTGRES=1 and PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD to run
 against an explicitly chosen test database. The role needs CREATE SCHEMA;
@@ -16,6 +16,10 @@ from types import SimpleNamespace
 
 import ibis
 import pytest
+from sqlglot import exp, parse_one
+
+from d8r.query import ForeignKey, relation_name
+from d8r.query.identifiers import relation_parts
 
 from d8r.engine import (
     DataSource,
@@ -25,6 +29,8 @@ from d8r.engine import (
     execute,
     tx,
 )
+from d8r.tui.palette import view_for
+from d8r.tui.session import Session
 
 
 SECRET = "distinctive-password-do-not-print"
@@ -143,6 +149,9 @@ def postgres_database():
         admin.execute(sql.SQL(
             "CREATE VIEW {}.unreadable_rows AS SELECT id FROM {}.items WHERE 1 / (id - id) > 0"
         ).format(sql.Identifier(schema), sql.Identifier(schema))).close()
+        admin.execute(sql.SQL(
+            "CREATE VIEW {} AS SELECT id, region FROM {} WHERE 1 / (id - id) > 0"
+        ).format(sql.Identifier(other, "quoted.table"), sql.Identifier(other, "items"))).close()
         admin.execute(sql.SQL("CREATE TABLE {}.collision (id INTEGER)").format(
             sql.Identifier(schema)
         )).close()
@@ -168,12 +177,23 @@ def postgres_source(postgres_database):
         source.con.disconnect()
 
 
-def test_live_discovery_is_schema_scoped_and_never_counts(postgres_source, postgres_database):
+def test_live_discovery_spans_user_schemas_and_never_counts(postgres_source, postgres_database):
     source = postgres_source
-    assert set(source.datasets) == {"items", "selected_items", "unreadable_rows", "collision"}
+    schema = postgres_database[1]
+    other = schema + "_other"
+    expected = {
+        relation_name(schema, name)
+        for name in ("items", "selected_items", "unreadable_rows", "collision")
+    } | {relation_name(other, name) for name in ("items", "quoted.table")}
+    discovered = [relation_parts(name) for name in source.datasets]
+    assert all(parts is not None and len(parts) == 2 for parts in discovered)
+    assert all(not parts[0].lower().startswith("pg_") and parts[0].lower() != "information_schema"
+               for parts in discovered)
+    assert {name for name in source.datasets if relation_parts(name)[0] in (schema, other)} == expected
+    assert len(discovered) == len(set(discovered))
     assert all(entry["rows"] is None for entry in source.datasets.values())
     result = execute(source.con, {
-        "dataset": "items",
+        "dataset": relation_name(schema, "items"),
         "select": [{"column": "id"}],
         "where": {"column": "amount", "op": ">", "value": 15},
         "orderBy": [{"target": "id", "direction": "asc"}],
@@ -214,6 +234,42 @@ def test_live_discovery_is_schema_scoped_and_never_counts(postgres_source, postg
     assert "convert_base" not in offered
 
 
+def test_foreign_key_metadata_spans_schemas_and_preserves_pair_order(postgres_database):
+    options, schema, external, admin = postgres_database
+    sql = pytest.importorskip("psycopg").sql
+    for namespace in (schema, external):
+        admin.execute(sql.SQL(
+            "CREATE TABLE {}.parent (second INTEGER, first INTEGER, "
+            "PRIMARY KEY(first, second), UNIQUE(second, first))"
+        ).format(sql.Identifier(namespace))).close()
+    admin.execute(sql.SQL(
+        "CREATE TABLE {}.child (first_ref INTEGER, second_ref INTEGER, "
+        "CONSTRAINT a_explicit FOREIGN KEY(second_ref, first_ref) REFERENCES {}.parent(second, first), "
+        "CONSTRAINT b_implicit FOREIGN KEY(first_ref, second_ref) REFERENCES {}.parent, "
+        "CONSTRAINT c_external FOREIGN KEY(first_ref, second_ref) REFERENCES {}.parent)"
+    ).format(*(sql.Identifier(name) for name in (schema, schema, schema, external)))).close()
+    admin.execute(sql.SQL(
+        "CREATE TABLE {}.child (first_ref INTEGER, second_ref INTEGER, "
+        "FOREIGN KEY(first_ref, second_ref) REFERENCES {}.parent)"
+    ).format(sql.Identifier(external), sql.Identifier(schema))).close()
+    source = add_postgres_source("pg-foreign-keys", schema=schema, **options)
+    try:
+        assert source.datasets[relation_name(schema, "child")]["foreign_keys"] == (
+            ForeignKey(("second_ref", "first_ref"), relation_name(schema, "parent"), ("second", "first")),
+            ForeignKey(("first_ref", "second_ref"), relation_name(schema, "parent"), ("first", "second")),
+            ForeignKey(("first_ref", "second_ref"), relation_name(external, "parent"), ("first", "second")),
+        )
+        assert source.datasets[relation_name(schema, "parent")]["foreign_keys"] == ()
+        assert source.datasets[relation_name(schema, "items")]["foreign_keys"] == ()
+        assert source.datasets[relation_name(external, "child")]["foreign_keys"] == (
+            ForeignKey(("first_ref", "second_ref"), relation_name(schema, "parent"), ("first", "second")),
+        )
+        assert source.datasets[relation_name(external, "parent")]["foreign_keys"] == ()
+        assert all(entry["rows"] is None for entry in source.datasets.values())
+    finally:
+        source.con.disconnect()
+
+
 def test_numeric_values_serialize_as_plain_decimal_text(postgres_source):
     """A NUMERIC 30 arrives through ibis's arrow path as Decimal('3E+1').
 
@@ -221,7 +277,7 @@ def test_numeric_values_serialize_as_plain_decimal_text(postgres_source):
     show a corrupted money figure. Serialization must render every digit.
     """
     result = execute(postgres_source.con, {
-        "dataset": "items",
+        "dataset": relation_name(postgres_source.postgres["schema"], "items"),
         "select": [{"column": "amount"}],
         "where": {"column": "id", "op": "=", "value": 2},
     }, dialect="postgres", tables={
@@ -231,13 +287,30 @@ def test_numeric_values_serialize_as_plain_decimal_text(postgres_source):
     assert all(not (isinstance(v, str) and "E" in v.upper()) for row in result["rows"] for v in row)
 
 
-def test_empty_schema_connects_without_creating_extensions(postgres_database):
-    options, _, empty, admin = postgres_database
+@pytest.mark.parametrize("use_default_schema", [False, True])
+def test_empty_or_default_schema_offers_external_metadata_without_queries(
+    postgres_database, tmp_path, use_default_schema,
+):
+    options, schema, empty, admin = postgres_database
     with admin.cursor() as cursor:
         before = cursor.execute("SELECT extname FROM pg_extension ORDER BY extname").fetchall()
-    source = add_postgres_source("empty", schema=empty, **options)
+    selected = {} if use_default_schema else {"schema": empty}
+    source = add_postgres_source("external-metadata", **selected, **options)
     try:
-        assert source.datasets == {}
+        assert source.postgres["schema"] == ("public" if use_default_schema else empty)
+        with source.con.con.cursor() as cursor:
+            assert cursor.execute("SELECT current_schema()").fetchone()[0] == source.postgres["schema"]
+        assert not any(relation_parts(name)[0] == empty for name in source.datasets)
+        session = Session({source.id: source}, data_dir=tmp_path)
+        offered = {name for name, _ in session.dataset_entries("")}
+        assert {relation_name(schema, "items"), relation_name(schema + "_other", "items"),
+                relation_name(schema + "_other", "quoted.table")} <= offered
+        qualified = relation_name(schema + "_other", "quoted.table")
+        assert {name for name, _, _ in session.column_entries(f"\\from {qualified} t\n\\select ")} == {
+            "t.id", "t.region",
+        }
+        assert not session.history
+        assert all(entry["rows"] is None for entry in source.datasets.values())
         with admin.cursor() as cursor:
             assert cursor.execute("SELECT extname FROM pg_extension ORDER BY extname").fetchall() == before
     finally:
@@ -246,7 +319,8 @@ def test_empty_schema_connects_without_creating_extensions(postgres_database):
 
 def test_live_query_and_savepoints_preserve_outer_transaction(postgres_source):
     con = postgres_source.con
-    items = postgres_source.datasets["items"]["table"]
+    schema = postgres_source.postgres["schema"]
+    items = postgres_source.datasets[relation_name(schema, "items")]["table"]
     tx.begin(con)
     tx.create_temp(con, "kept", items.filter(items.id == 1))
     tx.savepoint(con, "Before")
@@ -255,7 +329,7 @@ def test_live_query_and_savepoints_preserve_outer_transaction(postgres_source):
     # A failing Ibis SELECT rolls back its nested savepoint, not the user's
     # transaction. Successful execution likewise must not commit that owner.
     with pytest.raises(Exception):
-        postgres_source.datasets["unreadable_rows"]["table"].execute()
+        postgres_source.datasets[relation_name(schema, "unreadable_rows")]["table"].execute()
     assert tx.temp_handle(con, "kept", items.schema()).id.execute().tolist() == [1]
     tx.rollback_to(con, "Before")
     tx.release(con, "Before")
@@ -270,8 +344,9 @@ def test_live_query_and_savepoints_preserve_outer_transaction(postgres_source):
 
 def test_temp_collision_handles_cannot_fall_back_to_persistent_table(postgres_source):
     con = postgres_source.con
-    persistent = postgres_source.datasets["collision"]["table"]
-    items = postgres_source.datasets["items"]["table"].select("id")
+    schema = postgres_source.postgres["schema"]
+    persistent = postgres_source.datasets[relation_name(schema, "collision")]["table"]
+    items = postgres_source.datasets[relation_name(schema, "items")]["table"].select("id")
     tx.drop_temp(con, "collision")
     tx.create_temp(con, "collision", items.filter(items.id == 1))
     handle = tx.temp_handle(con, "collision", items.schema())
@@ -295,7 +370,9 @@ def test_temp_collision_handles_cannot_fall_back_to_persistent_table(postgres_so
 def test_aborted_transaction_cannot_report_a_successful_commit(postgres_source):
     con = postgres_source.con
     tx.begin(con)
-    tx.create_temp(con, "uncommitted", postgres_source.datasets["items"]["table"])
+    tx.create_temp(con, "uncommitted", postgres_source.datasets[
+        relation_name(postgres_source.postgres["schema"], "items")
+    ]["table"])
     with pytest.raises(PayloadError):
         tx.release(con, "missing_savepoint")
     with pytest.raises(PayloadError, match="roll back"):
@@ -304,3 +381,93 @@ def test_aborted_transaction_cannot_report_a_successful_commit(postgres_source):
     assert "uncommitted" not in con.list_tables(database=(
         postgres_source.postgres["database"], con._session_temp_db
     ))
+
+
+def test_qualified_query_ignores_search_path_and_completes(postgres_source, postgres_database, tmp_path):
+    source = postgres_source
+    schema = postgres_database[1]
+    qualified = relation_name(schema, "items")
+    session = Session({source.id: source}, data_dir=tmp_path)
+    # A same-named table in another schema must never redirect a qualified query.
+    sql = pytest.importorskip("psycopg").sql
+    source.con.con.execute(sql.SQL("SET search_path TO {}").format(
+        sql.Identifier(schema + "_other")
+    )).close()
+    line = "\\from " + qualified[:-2]
+    view = view_for(session, line, line, len(line))
+    assert view.labels == [qualified]
+    document = "\\from " + view.entries[0].insert + "\n\\select i.id\n\\order i.id"
+    result = session.run(document)
+    assert result.error == ""
+    assert result.rows == [[1], [2], [3]]
+    result = session.run(f"\\from {qualified}\n\\select {qualified}.id\n\\order {qualified}.id")
+    assert result.error == ""
+    assert result.rows == [[1], [2], [3]]
+    # Existing bare documents still resolve to the registered selected schema.
+    result = session.run("\\from items\n\\select id\n\\order id")
+    assert result.error == ""
+    assert result.rows == [[1], [2], [3]]
+
+
+def test_qualified_queries_resolve_unindexed_schema(postgres_source, postgres_database, tmp_path):
+    source = postgres_source
+    other = postgres_database[1] + "_other"
+    qualified = relation_name(other, "items")
+    # Discovery now indexes both schemas. Remove this entry to exercise the
+    # lazy qualified-relation path rather than a cached metadata lookup.
+    source.datasets.pop(qualified)
+    session = Session({source.id: source}, data_dir=tmp_path)
+    document = f"\\select *\n\\from {qualified}"
+
+    compiled, message = session.compile(document)
+    assert compiled is not None, message
+    with source.con.raw_sql(compiled) as cursor:
+        assert [row[0] for row in cursor.fetchall()] == [777]
+    result = session.run(document)
+    assert result.error == ""
+    assert result.columns == ["id", "amount", "region"]
+    assert result.rows == [[777, "1", "other"]]
+    assert execute(source.con, {
+        "dataset": qualified, "select": [{"column": "id"}],
+    })["rows"] == [[777]]
+
+    # Lazy schema introspection must not commit an explicit transaction.
+    assert session.run("\\begin").ok
+    try:
+        assert session.run(document).rows == [[777, "1", "other"]]
+        assert source.con.con.info.transaction_status == pytest.importorskip("psycopg").pq.TransactionStatus.INTRANS
+    finally:
+        assert session.run("\\rollback").ok
+
+    # Resolving an external table must not redirect existing bare documents.
+    result = session.run("\\select id\n\\from items\n\\order id")
+    assert result.rows == [[1], [2], [3]]
+    result = session.run(
+        f"\\from items i\n\\join {qualified} o on i.id = o.amount\n"
+        f"\\select o.id as id\n\\union (\\from {qualified} \\select id)\n\\order id"
+    )
+    assert result.error == ""
+    assert result.rows == [[777]]
+    history = len(session.history)
+    assert not session.run(f"\\from {relation_name(other, 'missing')}").ok
+    assert len(session.history) == history
+
+
+def test_compiling_unindexed_qualified_view_never_reads_rows(postgres_source, postgres_database, tmp_path):
+    source = postgres_source
+    _, schema, _, admin = postgres_database
+    other = schema + "_other"
+    sql = pytest.importorskip("psycopg").sql
+    # Quoted table and schema components contain literal dots. Reading this
+    # view raises division by zero; introspection and compilation must not.
+    admin.execute(sql.SQL(
+        "CREATE VIEW {} AS SELECT id FROM {} WHERE 1 / (id - id) > 0"
+    ).format(sql.Identifier(other, "unreadable.rows"), sql.Identifier(other, "items"))).close()
+    session = Session({source.id: source}, data_dir=tmp_path)
+    compiled, message = session.compile(
+        f"\\select *\n\\from {relation_name(other, 'unreadable.rows')}"
+    )
+    assert compiled is not None, message
+    table = parse_one(compiled, read="postgres").find(exp.Table)
+    assert table is not None
+    assert (table.db, table.name) == (other, "unreadable.rows")

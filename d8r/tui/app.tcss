@@ -64,7 +64,7 @@ Screen {
     background: $surface;
 }
 
-#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages {
+#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages, #tab-agents {
     height: 1fr;
     padding: 0;
 }
@@ -90,11 +90,11 @@ Screen {
     height: auto;
 }
 
-#page-actions {
+#page-actions, #agents-actions {
     height: 1;
 }
 
-#page-actions Button {
+#page-actions Button, #agents-actions Button {
     height: 1;
     min-width: 0;
     margin-right: 1;
@@ -109,6 +109,13 @@ Screen {
     border: none;
 }
 
+#pages-hint {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+    background: $panel-darken-1;
+}
+
 #work-bench {
     width: 1fr;
     min-width: 0;
@@ -116,7 +123,7 @@ Screen {
 }
 
 #editor-slot {
-    height: 18;
+    height: 22;
     min-height: 0;
     layers: base overlay;
 }
@@ -183,7 +190,10 @@ CommandPalette {
        are only the values it starts from and the shape it keeps. */
     offset: 1 2;
     width: 62;
-    max-height: 12;
+    max-height: 8;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    scrollbar-size-vertical: 1;
     display: none;
     background: $panel;
     border: round $accent;
@@ -455,7 +465,9 @@ SettingsScreen {
 }
 
 #fn-body-pane {
-    height: 8;
+    /* Last row of the form: grows to fill whatever the fixed fields leave. */
+    height: 1fr;
+    min-height: 4;
     layers: base overlay;
 }
 
@@ -519,6 +531,43 @@ AIPanel #ai-status {
     max-height: 4;
     color: $text-muted;
     margin: 0;
+}
+
+AIPanel #ai-question {
+    display: none;
+    height: auto;
+    margin-top: 1;
+    padding: 0 1;
+    border: round $accent;
+    background: $panel;
+}
+
+AIPanel #ai-question-text {
+    height: auto;
+    margin: 1 0;
+    text-style: bold;
+}
+
+AIPanel #ai-question-options {
+    min-height: 4;
+    max-height: 16;
+    border: none;
+    background: $panel;
+}
+
+AIPanel #ai-question-other {
+    height: 3;
+    margin-top: 1;
+}
+
+AIPanel #ai-question-hint {
+    height: auto;
+    color: $text-muted;
+}
+
+AIPanel #ai-question-submit {
+    height: 1;
+    margin-top: 1;
 }
 
 AIPanel #ai-proposal {
@@ -603,26 +652,67 @@ AgentsPane OptionList {
     height: 1fr;
     border: none;
     background: $surface;
+    padding: 0 1;
 }
 
-#workspace-agents {
-    height: 40%;
-    border-top: solid $panel-lighten-2;
-}
-
-AgentsScreen {
-    align: center middle;
-    background: $background 60%;
-}
-
-#agents-screen {
-    width: 80%;
-    height: 85%;
+#agents-summary {
+    height: auto;
+    padding: 0 1 1 1;
     background: $surface;
-    border: round $accent;
-    padding: 1;
 }
 
-#agents-close {
-    height: 3;
+#agents-empty {
+    height: 1fr;
+    padding: 1;
+    color: $text-muted;
+    background: $surface;
+}
+
+#agents-hint {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+    background: $panel-darken-1;
+}
+
+AgentsPane .agents--busy {
+    color: $accent;
+    text-style: bold;
+}
+
+AgentsPane .agents--ready {
+    color: $success;
+    text-style: bold;
+}
+
+AgentsPane .agents--seen {
+    color: $text-muted;
+}
+
+AgentsPane .agents--error {
+    color: $error;
+    text-style: bold;
+}
+
+AgentsPane .agents--cancelled {
+    color: $warning;
+}
+
+AgentsPane OptionList > .option-list--option {
+    padding: 0 0 1 0;
+}
+
+AgentsPane OptionList > .option-list--option-highlighted {
+    color: $text;
+    background: $primary 15%;
+    text-style: none;
+}
+
+AgentsPane OptionList:focus > .option-list--option-highlighted {
+    background: $primary 25%;
+}
+
+AgentsPane OptionList > .option-list--option-hover {
+    background: $primary 10%;
+
 }

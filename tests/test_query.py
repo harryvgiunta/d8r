@@ -32,6 +32,10 @@ from d8r.query import (  # noqa: E402  (repo root added to sys.path above)
     SchemaContext,
     split_top,
     unquote,
+    is_identifier,
+    is_relation_name,
+    relation_basename,
+    relation_name,
 )
 
 TABLES = [
@@ -177,6 +181,120 @@ def test_window_partition_and_order_refs_are_checked(loaded):
         'unknown column "z.b" — "z" is not an open table: e',
     ]
 
+
+def test_qualified_relations_keep_full_names_in_nested_join_and_set_payloads():
+    schema = SchemaContext([
+        TableDef("etl.dataset_symbol", columns=[ColumnDef("id", "int64")]),
+        TableDef("etl.symbol_details", columns=[ColumnDef("id", "int64")]),
+    ])
+    ast = parse_query(
+        "\\with picked\n  \\open etl.dataset_symbol\n  \\select etl.dataset_symbol.id\n"
+        "\\from (\\from picked \\select id) p\n"
+        "\\join etl.symbol_details on p.id = etl.symbol_details.id\n"
+        "\\select etl.symbol_details.id\n"
+        "\\union all etl.dataset_symbol\n"
+        "\\intersect (\\from etl.dataset_symbol \\select etl.dataset_symbol.id)\n"
+        "\\except etl.symbol_details",
+        schema=schema, settled=True,
+    )
+    assert ast.errors == []
+    payload = json.loads(json.dumps(payload_from_ast(ast)))
+    assert payload["ctes"][0]["body"]["dataset"] == "etl.dataset_symbol"
+    assert payload["body"]["dataset"] == "picked"
+    assert payload["joins"][0]["dataset"] == "etl.symbol_details"
+    assert payload["joins"][0]["right"] == "etl.symbol_details.id"
+    assert payload["setOps"][0]["dataset"] == "etl.dataset_symbol"
+    assert payload["setOps"][1]["body"]["select"][0]["column"] == "etl.dataset_symbol.id"
+    assert payload["setOps"][2]["dataset"] == "etl.symbol_details"
+
+
+def test_schema_qualification_does_not_relax_alias_prefixes():
+    schema = SchemaContext([TableDef("etl.dataset_symbol")])
+    for reference in ("etl.dataset_symbol.id", "dataset_symbol.id"):
+        ast = parse_query(
+            f"\\from etl.dataset_symbol s\n\\select {reference}", schema=schema, settled=True,
+        )
+        assert has_error(ast, "is not an open table")
+    ast = parse_query("\\from etl.dataset_symbol s\n\\select s.id", schema=schema, settled=True)
+    assert ast.errors == []
+
+
+@pytest.mark.parametrize("clause", [
+    "\\from etl..dataset_symbol", "\\open .dataset_symbol", "\\from etl.dataset_symbol.",
+    "\\join catalog.etl.dataset_symbol on id", "\\union etl..dataset_symbol",
+    "\\intersect catalog.etl.dataset_symbol", "\\except etl.",
+    "\\select catalog.etl.dataset_symbol.id", "\\from etl.dataset_symbol as a.b",
+    "\\temp etl.snapshot", "\\drop etl.snapshot", "\\with etl.picked\n  \\from events",
+])
+def test_qualification_is_bounded_and_local_names_stay_bare(clause):
+    assert parse_query("\\from events\n" + clause, settled=True).errors
+
+
+def test_quoted_relations_preserve_components_and_column_expressions():
+    dataset = relation_name('etl."quoted schema', "dataset_symbol")
+    assert dataset == '"etl.""quoted schema".dataset_symbol'
+    assert relation_basename(dataset) == "dataset_symbol"
+    assert relation_basename(relation_name("etl", 'symbol."detail')) == 'symbol."detail'
+    assert is_relation_name(dataset)
+    assert not is_identifier(dataset)
+    ast = parse_query(
+        f"\\from {dataset}\n\\select coalesce({dataset}.id + 1, 0) as next_id\n"
+        f"\\group {dataset}.id\n\\order {dataset}.id",
+        schema=SchemaContext([TableDef(dataset)]), settled=True,
+    )
+    assert ast.errors == []
+    payload = payload_from_ast(ast)
+    assert payload["dataset"] == dataset
+    assert payload["groupBy"] == [f"{dataset}.id"]
+    assert payload["select"][0]["scalar"]["args"][0]["args"][0] == {"column": f"{dataset}.id"}
+
+
+def test_bare_registry_lookup_is_unique_and_exact_names_take_precedence():
+    selected = TableDef("etl.dataset_symbol", columns=[ColumnDef("id", "int64")])
+    other = TableDef("public.dataset_symbol")
+    temporary = TableDef("dataset_symbol", columns=[ColumnDef("local", "string")])
+    schema = SchemaContext([selected])
+    ast = parse_query("\\from dataset_symbol\n\\select dataset_symbol.id", schema=schema, settled=True)
+    assert ast.errors == []
+    assert payload_from_ast(ast)["dataset"] == "dataset_symbol"
+    assert schema.table_by_name("dataset_symbol") == selected
+    assert SchemaContext([selected, other]).table_by_name("dataset_symbol") is None
+    assert SchemaContext([selected, other]).table_by_name("etl.dataset_symbol") == selected
+    assert SchemaContext([selected, temporary]).table_by_name("dataset_symbol") == temporary
+
+
+def test_cte_can_share_a_qualified_physical_basename():
+    ast = parse_query(
+        "\\with dataset_symbol\n  \\from etl.dataset_symbol\n  \\select id\n"
+        "\\from dataset_symbol\n\\select dataset_symbol.id",
+        schema=SchemaContext([TableDef("etl.dataset_symbol")]), settled=True,
+    )
+    assert ast.errors == []
+    payload = payload_from_ast(ast)
+    assert payload["dataset"] == "dataset_symbol"
+    assert payload["ctes"][0]["body"]["dataset"] == "etl.dataset_symbol"
+
+
+def test_three_component_columns_are_shared_by_all_expression_clauses():
+    ast = parse_query(
+        "\\from etl.events\n"
+        "\\select etl.events.id, year(etl.events.ts), regexp_extract(etl.events.path, 'x')\n"
+        "\\select sum(etl.events.amount \\where etl.events.amount > 0) as total\n"
+        "\\select sum(etl.events.amount) over (partition by etl.events.id order by etl.events.ts) as running\n"
+        "\\where etl.events.amount between 1 and 5\n"
+        "\\group etl.events.id\n\\order etl.events.id\n"
+        "\\case flag = when etl.events.amount > 1 then yes else no",
+        schema=SchemaContext([TableDef("etl.events")]), settled=True,
+    )
+    assert ast.errors == []
+    assert ast.select[0].column == "etl.events.id"
+    assert ast.select[1].temporal.arg == "etl.events.ts"
+    assert ast.select[2].regex.arg == "etl.events.path"
+    assert ast.select[3].aggregate.where.column == "etl.events.amount"
+    assert ast.select[4].window.partition_by == ["etl.events.id"]
+    assert ast.select[4].window.order.column == "etl.events.ts"
+    assert ast.where.column == "etl.events.amount"
+    assert ast.cases[0].whens[0].column == "etl.events.amount"
 
 # --- typing-line error suppression ------------------------------------------
 
@@ -823,6 +941,46 @@ def test_join_qualified_on_names_any_open_table_at_its_clause(loaded):
     assert messages(ast) == ['unknown column "z.user_id" — "z" is not an open table: e, u, r']
 
 
+@pytest.mark.parametrize("tail", [
+    "e.user_id = u.user_id and",
+    "e.user_id = u.user_id and e.amount =",
+    "e.user_id = u.user_id and e.amount",
+    "e.user_id and e.amount = u.score",
+    "e.user_id = u.user_id or e.amount = u.score",
+    "e.user_id = u.user_id and e.amount != u.score",
+    "e.user_id = u.user_id and (e.amount = u.score)",
+])
+def test_compound_join_never_falls_back_to_an_incomplete_single_key(tail):
+    doc = "\\from events e\n\\join users u on " + tail
+    completed = parse_query(doc, settled=True)
+    assert completed.errors
+    assert completed.joins == []
+    typing = parse_query(doc)
+    assert typing.errors == []
+    assert typing.joins == []
+
+
+@pytest.mark.parametrize("extra", ["z.amount = u.score", "e.amount = z.score"])
+def test_compound_join_validates_every_qualified_operand(loaded, extra):
+    doc = "\\from events e\n\\join users u on e.user_id = u.user_id and " + extra
+    completed = parse_query(doc, schema=loaded, settled=True)
+    assert len(completed.errors) == 1
+    assert completed.errors[0].line == 2
+    assert "not an open table" in completed.errors[0].message
+    assert parse_query(doc, schema=loaded).errors == []
+
+
+def test_lateral_join_rejects_compound_on_keys():
+    ast = parse_query(
+        "\\from events e\n"
+        "\\join lateral (\\from users) u "
+        "on e.user_id = u.user_id and e.amount = u.score",
+        settled=True,
+    )
+    assert ast.errors
+    assert ast.joins == []
+
+
 # --- `\union` / `\intersect` / `\except` -------------------------------------
 
 
@@ -949,7 +1107,7 @@ def test_payload_maps_the_canonical_document():
         (op["op"], op["dataset"], op["distinct"], op["body"] is not None)
         for op in payload["setOps"]
     ] == [
-        ("union", "archived", True, False),
+        ("union", "etl.archived", True, False),
         ("union", "", False, True),
         ("intersect", "other", True, False),
         ("except", "", True, True),
@@ -1091,7 +1249,7 @@ def test_payload_maps_the_canonical_document():
     assert lateral["lateral"] is True
     assert lateral["alias"] == "last_two"
     assert lateral["left"] == "recent.campaign_id"
-    assert (lateral["body"]["dataset"], lateral["body"]["limit"]) == ("spend_log", 2)
+    assert (lateral["body"]["dataset"], lateral["body"]["limit"]) == ("etl.spend_log", 2)
     assert lateral["body"]["where"]["value"] == "recent.campaign_id"
 
     # A CTE body is a full payload whose own ctes list is empty (by grammar).
@@ -1099,7 +1257,7 @@ def test_payload_maps_the_canonical_document():
         {
             "name": "recent",
             "body": {
-                "dataset": "orders",
+                "dataset": "etl.orders",
                 "alias": None,
                 "body": None,
                 "joins": [],

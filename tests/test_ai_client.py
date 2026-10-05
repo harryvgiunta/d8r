@@ -480,7 +480,7 @@ def test_answer_limit_counts_utf8_bytes(transport, monkeypatch):
     assert messages == []
 
 
-def test_absolute_request_timeout_closes_idle_stream(transport):
+def test_stream_inactivity_timeout_closes_idle_stream(transport):
     class Idle(Parts):
         async def __aiter__(self):
             await asyncio.Event().wait()
@@ -493,6 +493,89 @@ def test_absolute_request_timeout_closes_idle_stream(transport):
         asyncio.run(collect(messages, config=replace(CONFIG, max_attempts=1, timeout=0.01)))
     assert stream.closed
     assert messages == []
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("tool_response", [False, True])
+def test_active_stream_can_outlive_timeout_without_replaying_or_losing_output(transport, tool_response):
+    arguments = json.dumps({"table": "events"})
+    pieces = arguments if tool_response else "Extract JSON."
+
+    class Gradual(Parts):
+        async def __aiter__(self):
+            yield event({"choices": [{"index": 0, "delta": {"role": "assistant"}}]})
+            for index, piece in enumerate(pieces):
+                await asyncio.sleep(0.02)
+                if tool_response:
+                    fragment = {"index": 0, "function": {"arguments": piece}}
+                    if index == 0:
+                        fragment.update(id="extract", type="function")
+                        fragment["function"]["name"] = "schema"
+                    yield event(delta(tools=[fragment]))
+                else:
+                    yield event(delta(piece))
+            yield event(delta(finish="tool_calls" if tool_response else "stop"))
+            yield b"data: [DONE]\n\n"
+
+    stream = Gradual()
+    calls = []
+
+    async def callback(name, args):
+        calls.append((name, args))
+        return '{"columns":["details_json"]}'
+
+    def handler(request):
+        if len(requests) == 1:
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=stream)
+        return stream_response(completed("JSON fields are available."))
+
+    requests = transport(handler)
+    messages = [{"role": "user", "content": "Extract JSON fields"}]
+    asyncio.run(collect(messages, config=replace(CONFIG, timeout=0.12),
+                        tools=TOOLS if tool_response else (), callback=callback))
+    assert stream.closed
+    if tool_response:
+        assert calls == [("schema", {"table": "events"})]
+        assert [message["role"] for message in messages] == ["user", "assistant", "tool", "assistant"]
+        assert messages[-1]["content"] == "JSON fields are available."
+        assert len(requests) == 2
+    else:
+        assert calls == []
+        assert messages[-1]["content"] == "Extract JSON."
+        assert len(requests) == 1
+
+
+def test_role_only_timeout_retries_without_replaying_an_incomplete_answer(transport, monkeypatch):
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr(ai.asyncio, "sleep", sleep)
+    stalled = stream_response(
+        event({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+        httpx.ReadTimeout(SECRET),
+    )
+    requests = transport(lambda request: stalled if len(requests) == 1 else stream_response(completed("Recovered.")))
+    messages = [{"role": "user", "content": "Extract JSON fields"}]
+    asyncio.run(collect(messages))
+    assert len(requests) == 2
+    assert messages == [{"role": "user", "content": "Extract JSON fields"},
+                        {"role": "assistant", "content": "Recovered."}]
+
+
+def test_keepalive_without_model_progress_still_times_out(transport):
+    class Keepalive(Parts):
+        async def __aiter__(self):
+            while True:
+                yield b": heartbeat\n\n"
+                await asyncio.sleep(0.002)
+
+    stream = Keepalive()
+    requests = transport(lambda request: httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=stream))
+    messages = [{"role": "user", "content": "Extract JSON fields"}]
+    with pytest.raises(ai.AIError):
+        asyncio.run(collect(messages, config=replace(CONFIG, max_attempts=1, timeout=0.03)))
+    assert stream.closed
+    assert messages == [{"role": "user", "content": "Extract JSON fields"}]
     assert len(requests) == 1
 
 

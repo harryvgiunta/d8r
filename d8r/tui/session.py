@@ -60,7 +60,9 @@ from d8r.query import (
     parse_body,
     parse_query,
     payload_from_ast,
+    relation_basename,
 )
+from d8r.query.identifiers import relation_parts
 from d8r.storage import MemoryStore, SettingsStore, WorkspaceStore
 
 PREVIEW_ROW_CAP = 10000
@@ -82,7 +84,8 @@ def tables_of(source: DataSource) -> list[TableDef]:
     for name, entry in source.datasets.items():
         schema = entry["table"].schema()
         columns = [ColumnDef(col, type_name(dtype)) for col, dtype in schema.items()]
-        tables.append(TableDef(name=name, doc=entry.get("doc", ""), columns=columns))
+        tables.append(TableDef(name=name, doc=entry.get("doc", ""), columns=columns,
+                               foreign_keys=entry.get("foreign_keys", ())))
     return tables
 
 
@@ -278,6 +281,7 @@ class Session:
         self.workspace_error = self._workspace.error
         self.workspace["document_id"] = self.workspace["document_id"] or uuid4().hex
         self.history = [HistoryEntry(**entry) for entry in self.workspace["history"]]
+        self._completion_usage: dict[str, tuple[int, tuple[TableDef, ...], dict[tuple[str, str, str], int]]] = {}
         if not self.workspace["pages"]:
             seen: set[tuple[str, str, str]] = set()
             for entry in reversed(self.history):
@@ -294,9 +298,14 @@ class Session:
         if self.workspace["source"]:
             self.restore_source(self.workspace["source"], self.workspace["dialect"] or None)
         else:
+            selected = settings["source"]
+            if (selected in self.sources or self.saved_source_profile(selected) is not None
+                    or selected in self.workspace["sources"]):
+                self.restore_source(selected, settings["dialect"])
+            else:
+                self.refresh_schema()
             self.workspace["source"] = self.source_key()
             self.workspace["dialect"] = self.dialect
-            self.refresh_schema()
 
     @property
     def storage_path(self) -> Path:
@@ -318,14 +327,32 @@ class Session:
         """Whether complete, validated AI proposals may update unchanged drafts."""
         return self._settings.document["ai_auto_accept"]
 
+    @property
+    def ai_allow_sample_data(self) -> bool:
+        """Whether AI tools may read sample records from the current source."""
+        return self._settings.document["ai_allow_sample_data"]
+
+    @property
+    def ai_allow_schema_refreshes(self) -> bool:
+        """Whether AI tools may look up source schema metadata."""
+        return self._settings.document["ai_allow_schema_refreshes"]
+
+    @property
+    def entry_screen(self) -> bool:
+        """Whether startup plays the optional terminal entry animation."""
+        return self._settings.document["entry_screen"]
+
     def update_settings(
         self, *, intellisense: bool | None = None,
         panes: dict[str, bool] | None = None, source: str | None = None,
         dialect: str | None = None, ai: AIConfig | None = None,
         default_rows: int | None = None, ai_auto_accept: bool | None = None,
+        ai_allow_sample_data: bool | None = None,
+        ai_allow_schema_refreshes: bool | None = None,
         pane_sizes: dict[str, int] | None = None,
         value_cache_enabled: bool | None = None,
         value_cache_limit: int | None = None,
+        entry_screen: bool | None = None,
     ) -> None:
         """Save explicit preference changes before applying them to the session.
 
@@ -335,6 +362,8 @@ class Session:
         document = dict(self._settings.document)
         if intellisense is not None:
             document["intellisense"] = intellisense
+        if entry_screen is not None:
+            document["entry_screen"] = entry_screen
         if panes is not None:
             document["panes"] = {**document["panes"], **panes}
         if pane_sizes is not None:
@@ -353,6 +382,10 @@ class Session:
             document["default_rows"] = default_rows
         if ai_auto_accept is not None:
             document["ai_auto_accept"] = ai_auto_accept
+        if ai_allow_sample_data is not None:
+            document["ai_allow_sample_data"] = ai_allow_sample_data
+        if ai_allow_schema_refreshes is not None:
+            document["ai_allow_schema_refreshes"] = ai_allow_schema_refreshes
         if value_cache_enabled is not None:
             document["value_cache_enabled"] = value_cache_enabled
         if value_cache_limit is not None:
@@ -432,6 +465,13 @@ class Session:
             else:
                 chats[key] = deepcopy(chat)
             self.save_workspace(chats=chats)
+
+    def delete_chats(self, keys: list[str]) -> None:
+        """Keep removals in memory on failure, so later autosaves cannot revive them."""
+        with self._workspace_lock:
+            removed = set(keys)
+            self.save_workspace(chats={key: chat for key, chat in self.workspace["chats"].items()
+                                       if key not in removed})
 
     def _record_history(self, entry: HistoryEntry, outcome: RunOutcome) -> None:
         with self._workspace_lock:
@@ -628,7 +668,9 @@ class Session:
         self.schema = SchemaContext(
             tables=tables_of(source), capabilities=capabilities_object(source),
             fns=tuple(self.fns.values()),
-            tables_complete=source.schema_indexed,
+            # Newly created relations may still be resolved on demand.
+            default_schema=source.postgres.get("schema"),
+            tables_complete=source.schema_indexed and source.kind != "postgres-live",
         )
 
     def sync_d1_schema(
@@ -646,7 +688,8 @@ class Session:
             source.con.seed(schemas)
             source.schema_indexed = True
         source.datasets = {
-            name: {"table": source.con.table(name), "doc": f"{name} · {source.display}", "rows": None}
+            name: {"table": source.con.table(name), "doc": f"{name} · {source.display}", "rows": None,
+                   "foreign_keys": source.con.foreign_keys(name)}
             for name in source.con.list_tables()
         }
         if self.source is source:
@@ -664,7 +707,7 @@ class Session:
         return open_tables_of(ast.from_, ast.joins)
 
     def column_entries(
-        self, doc: str, *, schema: SchemaContext | None = None,
+        self, doc: str, *, schema: SchemaContext | None = None, qualified: bool = False,
     ) -> list[tuple[str, str, str]]:
         """(column, dtype, detail) rows for the palette, open tables first.
 
@@ -676,12 +719,14 @@ class Session:
         open_tables = self.open_tables(doc, schema=schema)
         rows: list[tuple[str, str, str]] = []
         if open_tables:
-            for table_name in dict.fromkeys(t.dataset for t in open_tables):
-                table = schema.table_by_name(table_name)
+            for opened in open_tables:
+                table = schema.table_by_name(opened.dataset)
                 if table is None:
                     continue
                 for column in table.columns:
-                    rows.append((column.name, column.type, f"{column.type} · {table_name}"))
+                    name = (f"{opened.identifier}.{column.name}"
+                            if qualified or opened.identifier != opened.dataset else column.name)
+                    rows.append((name, column.type, f"{column.type} · {opened.dataset}"))
         else:
             rows = [
                 (col.name, col.type, f"{col.type} · {', '.join(col.tables)}") for col in schema.pool
@@ -708,6 +753,103 @@ class Session:
         ]
         ctes = [(cte.name, "cte") for cte in parse_query(doc, schema=schema).with_]
         return [*ctes, *datasets]
+
+    def table_insert(self, doc: str, name: str, *, schema: SchemaContext | None = None) -> str:
+        """A selected table gets a short, collision-free document identifier."""
+        schema = self.schema if schema is None else schema
+        taken = {table.identifier.lower() for table in self.open_tables(doc, schema=schema)}
+        taken.update(relation_basename(table.name).lower() for table in schema.tables)
+        base = relation_basename(name)[0].lower()
+        if not re.fullmatch(r"[a-z_]", base):
+            base = "t"
+        alias = base
+        suffix = 2
+        while alias in taken:
+            alias = f"{base}{suffix}"
+            suffix += 1
+        return f"{name} {alias} "
+
+    def column_reference(
+        self, doc: str, dataset: str, column: str, *, schema: SchemaContext | None = None,
+    ) -> str:
+        """Use the document's identifier when an explorer column is selected."""
+        target = self.schema if schema is None else schema
+        opened = next((table for table in self.open_tables(doc, schema=target)
+                       if (definition := target.table_by_name(table.dataset)) is not None
+                       and definition.name == dataset), None)
+        return (f"{opened.identifier}.{column}"
+                if opened is not None and opened.identifier != dataset else column)
+
+    def completion_usage(self) -> dict[tuple[str, str, str], int]:
+        """Successful target-scoped usage, newest first; never retains parsed ASTs."""
+        target = self.source_key()
+        cached = self._completion_usage.get(target)
+        if cached is not None and cached[0] == len(self.history) and cached[1] == self.schema.tables:
+            return cached[2]
+        usage: dict[tuple[str, str, str], int] = {}
+
+        def collect(node: object, opened: list[tuple[str, str | None]], rank: int) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    collect(item, opened, rank)
+            elif isinstance(node, dict):
+                if "from" in node:
+                    relations = ([node["from"]] if node["from"] else []) + node["joins"]
+                    opened = [(item.get("table", item.get("dataset", "")), item.get("alias"))
+                              for item in relations]
+                    for dataset, _ in opened:
+                        table = self.schema.table_by_name(dataset)
+                        usage.setdefault(("dataset", "", table.name if table else dataset), rank)
+                for key, value in node.items():
+                    if key in {"column", "arg", "left", "right", "target"} and isinstance(value, str):
+                        prefix, dot, name = value.rpartition(".")
+                        if not dot:
+                            name = value
+                        for dataset, alias in opened:
+                            table = self.schema.table_by_name(dataset)
+                            if ((not dot or prefix == (alias or dataset)) and table is not None
+                                    and any(column.name == name for column in table.columns)):
+                                usage.setdefault(("column", table.name, name), rank)
+                                if "op" in node:
+                                    for field in ("value", "low", "high"):
+                                        if node.get(field) is not None:
+                                            usage.setdefault(("value", f"{table.name}.{name}", str(node[field])), rank)
+                                break
+                    elif key == "fn" and isinstance(value, str):
+                        usage.setdefault(("function", "", value), rank)
+                    if key not in {"literal", "raw", "errors"}:
+                        collect(value, opened, rank)
+
+        for rank, entry in enumerate(self.history):
+            if (entry.target and entry.target != target) or (not entry.target and entry.source != self.active_id):
+                continue
+            ast = parse_query(entry.doc, settled=True)
+            collect(ast.to_json(), [], rank)
+            for command in re.findall(r"(?m)^\s*\\([A-Za-z_][A-Za-z0-9_]*)", entry.doc):
+                usage.setdefault(("command", "", command.lower()), rank)
+            unquoted = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", "", entry.doc)
+            for function in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", unquoted):
+                usage.setdefault(("function", "", function), rank)
+        self._completion_usage[target] = (len(self.history), self.schema.tables, usage)
+        return usage
+
+    def completion_ranks(self, doc: str, *, category: str) -> dict[str, int]:
+        """Map offered names to recency without parsing the document per row."""
+        usage = self.completion_usage()
+        if category != "column":
+            return {name: rank for (kind, _, name), rank in usage.items() if kind == category}
+        ranks = {name: rank for (kind, _, name), rank in usage.items() if kind == "function"}
+        for opened in self.open_tables(doc):
+            table = self.schema.table_by_name(opened.dataset)
+            if table is None:
+                continue
+            for column in table.columns:
+                name = (f"{opened.identifier}.{column.name}"
+                        if opened.identifier != opened.dataset else column.name)
+                rank = usage.get(("column", table.name, column.name))
+                if rank is not None:
+                    ranks.setdefault(name, rank)
+        return ranks
 
 
     # -- saved table-valued functions --------------------------------------
@@ -748,6 +890,7 @@ class Session:
             tables=schema.tables, capabilities=schema.capabilities,
             fns=tuple(functions.values()),
             tables_complete=schema.tables_complete,
+            default_schema=schema.default_schema,
         )
         messages = parse_body(body, fn.params, schema=candidate, function_name=name)
         if messages:
@@ -1051,6 +1194,15 @@ class Session:
         """
         source = self.source
         tables = {name: entry["table"] for name, entry in source.datasets.items()}
+        # Bare documents retain the selected schema even when other schemas
+        # expose the same basename. Exact temp names continue to win.
+        selected = source.postgres.get("schema")
+        if selected is not None:
+            for name, entry in source.datasets.items():
+                parts = relation_parts(name)
+                if parts is not None and len(parts) == 2 and parts[0] == selected:
+                    bare = parts[1] if is_identifier(parts[1]) else '"' + parts[1].replace('"', '""') + '"'
+                    tables.setdefault(bare, entry["table"])
         if source.d1 is not None:
             # Include metadata learned by a headless run before UI publication.
             for name in source.con.list_tables():
