@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from d8r.ai.client import AIConfig
 from d8r import storage
+from d8r.query import parse_query
+from d8r.tui.palette import view_for
 from d8r.tui.session import Session
 
 
@@ -51,8 +54,9 @@ def test_restoring_does_not_discard_functions_for_an_inactive_schema(sources):
     restored = Session(sources)
     assert restored.active_id == "demo"
     assert restored.memory_error == ""
-    assert restored.fns["products_copy"].body == body
+    assert "products_copy" not in restored.fns
     restored.set_active("mysql")
+    assert restored.fns["products_copy"].body == body
     result = restored.run("\\from products_copy()\n\\select *")
     assert result.error == ""
     assert result.total == 2
@@ -220,7 +224,7 @@ def test_stale_lock_is_taken_over_and_fresh_lock_stays_busy(tmp_path, kind):
     store = storage.MemoryStore(tmp_path) if kind == "memory" else storage.SettingsStore(tmp_path)
     if kind == "memory":
         def save():
-            store.save([{"name": "pair", "params": [], "body": "\\from events", "description": ""}], [])
+            store.save({"demo": [{"name": "pair", "params": [], "body": "\\from events", "description": ""}]}, [])
     else:
         def save():
             store.save({"intellisense": False})
@@ -237,7 +241,7 @@ def test_stale_lock_is_taken_over_and_fresh_lock_stays_busy(tmp_path, kind):
     assert not lock.exists()
     restored = type(store)(tmp_path)
     if kind == "memory":
-        assert [fn["name"] for fn in restored.document["functions"]] == ["pair"]
+        assert [fn["name"] for fn in restored.document["functions"]["demo"]] == ["pair"]
     else:
         assert restored.document["intellisense"] is False
 
@@ -351,7 +355,7 @@ def test_duplicate_memory_keys_do_not_expose_secret_text(tmp_path):
     assert store.error
     assert "secret-key" not in store.error
     with pytest.raises(ValueError):
-        store.save([], [])
+        store.save({}, [])
     assert path.read_bytes() == contents
 
 
@@ -418,10 +422,125 @@ def test_new_secret_files_and_directory_are_owner_only(tmp_path):
     directory = tmp_path / "private"
     memory = storage.MemoryStore(directory)
     settings = storage.SettingsStore(directory)
-    memory.save([], [{
+    memory.save({}, [{
         "account_id": "account", "database": DATABASE, "display": "Private", "api_token": "token",
     }])
     settings.save({"ai": {"base_url": "https://provider.example", "model": "m", "api_key": "key"}})
     assert directory.stat().st_mode & 0o777 == 0o700
     assert memory.path.stat().st_mode & 0o777 == 0o600
     assert settings.path.stat().st_mode & 0o777 == 0o600
+
+
+def test_function_libraries_isolate_parser_completion_names_and_deletion(sources, tmp_path):
+    session = Session(sources, data_dir=tmp_path)
+    demo_body = "\\from events\n\\select 'demo' as origin\n\\limit 1"
+    mysql_body = "\\from products\n\\select 'mysql' as origin\n\\limit 1"
+    demo = session.save_fn("shared", "", demo_body, "Demo definition")
+    session.save_fn("demo_only", "", demo_body, "")
+    frozen = session.schema
+    session.set_active("mysql")
+    assert session.fns == {}
+    assert parse_query("\\shared()", schema=session.schema, settled=True).errors
+    assert not parse_query("\\shared()", schema=frozen, settled=True).errors
+    line = "\\from demo_on"
+    offered = view_for(session, line, line, len(line))
+    assert offered is None or "demo_only()" not in offered.labels
+    assert session.fn_call_rows() == []
+    mysql = session.save_fn("shared", "", mysql_body, "MySQL definition")
+    assert session.run("\\shared()", record=False).rows == [["mysql"]]
+    session.set_active("demo")
+    assert session.fns["shared"] == demo
+    assert session.run("\\shared()", record=False).rows == [["demo"]]
+    assert "demo_only()" in view_for(session, line, line, len(line)).labels
+    session.delete_fn("shared")
+    restored = Session(sources, data_dir=tmp_path)
+    assert "shared" not in restored.fns
+    restored.set_active("mysql")
+    assert restored.fns == {"shared": mysql}
+    assert restored.run("\\shared()", record=False).rows == [["mysql"]]
+
+
+def test_temporary_function_targets_restore_schema_dialect_and_workspace(sources, tmp_path):
+    session = Session(sources, data_dir=tmp_path)
+    demo = session.save_fn("shared", "", "\\from events\n\\limit 1", "Demo")
+    session.save_workspace(document="untouched draft", cursor=[0, 3])
+    workspace = json.loads(json.dumps(session.workspace))
+    session.dialect = "sqlite"
+    with pytest.raises(RuntimeError, match="abandon target"):
+        with session.target_source("mysql"):
+            mysql = session.save_fn("shared", "", "\\from products\n\\limit 2", "MySQL")
+            with session.target_source("demo"):
+                assert session.fns == {"shared": demo}
+            assert session.fns == {"shared": mysql}
+            raise RuntimeError("abandon target")
+    assert (session.active_id, session.dialect) == ("demo", "sqlite")
+    assert session.fns == {"shared": demo}
+    assert session.schema.fns == (demo,)
+    assert session.workspace == workspace
+    assert Session(sources, data_dir=tmp_path).functions_for("mysql") == {"shared": mysql}
+
+
+@pytest.mark.parametrize("kind", ["d1", "postgres", "backend"])
+def test_credential_writes_preserve_every_source_function_library(sources, tmp_path, kind):
+    session = Session(sources, data_dir=tmp_path)
+    demo = session.save_fn("shared", "", "\\from events\n\\limit 1", "Demo")
+    with session.target_source("mysql"):
+        mysql = session.save_fn("shared", "", "\\from products\n\\limit 2", "MySQL")
+    if kind == "d1":
+        session.remember_d1("account", DATABASE, "D1", "rotated-token")
+    elif kind == "postgres":
+        session.remember_postgres({
+            "host": "localhost", "port": "5432", "database": "db", "user": "reader",
+            "password": "rotated-secret", "schema": "public", "sslmode": "prefer", "display": "PG",
+        })
+    else:
+        session.remember_backend({"backend": "sqlite", "options": {"database": ":memory:"}, "display": "SQLite"})
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.fns == {"shared": demo}
+    assert restored.functions_for("mysql") == {"shared": mysql}
+
+
+def test_function_library_survives_disconnected_target_reconnection(sources, tmp_path):
+    source = replace(sources["demo"], id="old-label", kind="d1", dir=tmp_path / "saved.sqlite")
+    session = Session({"demo": sources["demo"], source.id: source}, data_dir=tmp_path)
+    session.set_active(source.id)
+    saved = session.save_fn("local_events", "", "\\from events\n\\select 'snapshot' as origin\n\\limit 1", "Snapshot only")
+    key = session.source_key()
+    session.save_workspace(source=key, dialect="sqlite", document="\\local_events()")
+    restored = Session({"demo": sources["demo"]}, data_dir=tmp_path)
+    assert not restored.source_connected()
+    assert restored.fns == {"local_events": saved}
+    restored.register(replace(source, id="new-label"), activate=False)
+    assert restored.source_key() == key
+    assert restored.fns == {"local_events": saved}
+    assert not restored.functions_for("demo")
+    assert restored.run("\\local_events()", record=False).rows == [["snapshot"]]
+
+
+@pytest.mark.parametrize("selection", ["settings", "workspace"])
+def test_legacy_functions_belong_only_to_restored_selection(sources, tmp_path, selection):
+    definition = {"name": "legacy", "params": [], "body": "\\from products\n\\limit 1", "description": "kept"}
+    memory = tmp_path / "memory.json"
+    contents = json.dumps({"version": 1, "functions": [definition], "d1_profiles": []}).encode()
+    memory.write_bytes(contents)
+    storage.SettingsStore(tmp_path).save({"source": "mysql"})
+    owner = "mysql"
+    if selection == "workspace":
+        owner = f"saved-d1:account:{DATABASE}"
+        workspace = storage.WorkspaceStore(tmp_path)
+        workspace.save({**workspace.document, "source": owner, "dialect": "sqlite"})
+    session = Session(sources, data_dir=tmp_path)
+    assert session.source_key() == owner
+    assert session.fns["legacy"].body == definition["body"]
+    assert memory.read_bytes() == contents
+    assert session.functions_for("demo") == {}
+    if selection == "settings":
+        session.update_settings(source="demo")
+    else:
+        session.set_active("demo")
+        session.save_workspace(source="demo", dialect="duckdb", document="new draft")
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.source_key() == "demo"
+    assert restored.fns == {}
+    assert restored.functions_for(owner)["legacy"].body == definition["body"]
+    assert json.loads(memory.read_bytes())["functions"][owner] == [definition]

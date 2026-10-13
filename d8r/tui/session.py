@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -47,7 +47,9 @@ from d8r.engine import (
     temp_handle,
     type_name,
 )
+from d8r.engine.connectors import add_backend_source, profile_id, profile_secrets, validate_profile
 from d8r.engine.d1api import schema_connection
+from d8r.engine.expression import source_schemas
 from d8r.query import (
     Capabilities,
     ColumnDef,
@@ -59,6 +61,7 @@ from d8r.query import (
     open_tables_of,
     parse_body,
     parse_query,
+    parse_statements,
     payload_from_ast,
     relation_basename,
 )
@@ -105,7 +108,8 @@ def capabilities_object(source: DataSource) -> Capabilities:
 def default_dialect(source: DataSource) -> str:
     """The compile dialect a source suggests — or duckdb when it cannot render."""
     spec = DIALECT_BY_NAME.get(source.dialect)
-    return source.dialect if spec is not None and spec["compiles"] else "duckdb"
+    connected_backend = source.kind == "ibis" or bool(source.connection_key)
+    return source.dialect if spec is not None and (spec["compiles"] or connected_backend) else "duckdb"
 
 
 def _source_id(hint: str, taken) -> str:
@@ -199,6 +203,7 @@ class RunOutcome:
     ms: float = 0.0
     sql: str = ""
     schema_changed: bool = False
+    doc: str = ""
 
     @property
     def capped(self) -> bool:
@@ -252,22 +257,24 @@ class Session:
         self._value_cache: dict[tuple[int, str, str], tuple[DataSource, tuple[list[object], bool]]] = {}
         self._value_cache_lock = RLock()
         self.value_cache_epoch = 0
-        # Definitions load without schema-dependent validation: a D1 function
-        # remains available even while the bundled demo is the active source.
+        # Definitions load without parsing bodies or connecting to their source.
         self._memory = MemoryStore(data_dir)
-        self.fns: dict[str, FnDef] = {
-            item["name"]: FnDef(
+        saved_functions = self._memory.document["functions"]
+        self._source_functions: dict[str, dict[str, FnDef]] = {
+            key: {item["name"]: FnDef(
                 name=item["name"], params=item["params"], body=item["body"], doc=item["description"],
-            )
-            for item in self._memory.document["functions"]
+            ) for item in definitions}
+            for key, definitions in (saved_functions.items() if isinstance(saved_functions, dict) else ())
         }
         self.d1_profiles: list[dict[str, str]] = self._memory.document["d1_profiles"]
         self.postgres_profiles: list[dict[str, str]] = self._memory.document["postgres_profiles"]
+        self.backend_profiles: list[dict] = self._memory.document["backend_profiles"]
         self._settings = SettingsStore(self._memory.path.parent)
         settings = self._settings.document
         if settings["source"] in self.sources:
             self.active_id = settings["source"]
             self.dialect = settings["dialect"]
+        self.source_dialects: dict[str, str] = dict(settings["source_dialects"])
         self.intellisense: bool = settings["intellisense"]
         self.default_rows: int = settings["default_rows"]
         self.value_cache_enabled: bool = settings["value_cache_enabled"]
@@ -306,6 +313,44 @@ class Session:
                 self.refresh_schema()
             self.workspace["source"] = self.source_key()
             self.workspace["dialect"] = self.dialect
+        if isinstance(saved_functions, list) and saved_functions:
+            # Legacy global libraries belong only to the restored selected source.
+            self._source_functions[self.source_key()] = {
+                item["name"]: FnDef(name=item["name"], params=item["params"],
+                                    body=item["body"], doc=item["description"])
+                for item in saved_functions
+            }
+            self.refresh_schema()
+        source_workspaces = self.workspace["source_workspaces"]
+        draft = self.workspace["function_draft"]
+        draft_source = (draft["source"] or self.workspace["source"]) if draft is not None else None
+        source_workspaces.setdefault(self.workspace["source"], {
+            "document_id": self.workspace["document_id"], "function_draft": None,
+            "active_view": self.workspace["active_view"] if draft_source in (None, self.workspace["source"]) else "workspace",
+        })
+        if draft is not None:
+            draft = {**draft, "source": draft_source}
+            state = source_workspaces.setdefault(draft_source, {
+                "document_id": "", "function_draft": None, "active_view": self.workspace["active_view"],
+            })
+            if state["function_draft"] is None:
+                state["function_draft"] = deepcopy(draft)
+        selected_workspace = source_workspaces[self.workspace["source"]]
+        self.workspace["function_draft"] = deepcopy(selected_workspace["function_draft"])
+        self.workspace["active_view"] = selected_workspace["active_view"]
+
+    @property
+    def fns(self) -> dict[str, FnDef]:
+        """Definitions for the active source, including temporary target scopes."""
+        return self.functions_for()
+
+    def functions_for(self, source_id: str | None = None) -> dict[str, FnDef]:
+        """Read one stable target's library without switching the active source."""
+        key = self.source_key(source_id)
+        functions = self._source_functions.get(key)
+        if functions is None:
+            functions = self._source_functions[key] = {}
+        return functions
 
     @property
     def storage_path(self) -> Path:
@@ -342,6 +387,11 @@ class Session:
         """Whether startup plays the optional terminal entry animation."""
         return self._settings.document["entry_screen"]
 
+    @property
+    def theme(self) -> str:
+        """The saved application palette, independent of the current workspace."""
+        return self._settings.document["theme"]
+
     def update_settings(
         self, *, intellisense: bool | None = None,
         panes: dict[str, bool] | None = None, source: str | None = None,
@@ -353,6 +403,7 @@ class Session:
         value_cache_enabled: bool | None = None,
         value_cache_limit: int | None = None,
         entry_screen: bool | None = None,
+        theme: str | None = None,
     ) -> None:
         """Save explicit preference changes before applying them to the session.
 
@@ -364,6 +415,8 @@ class Session:
             document["intellisense"] = intellisense
         if entry_screen is not None:
             document["entry_screen"] = entry_screen
+        if theme is not None:
+            document["theme"] = theme
         if panes is not None:
             document["panes"] = {**document["panes"], **panes}
         if pane_sizes is not None:
@@ -372,10 +425,14 @@ class Session:
             if source not in self.sources:
                 raise ValueError("The selected data source is not registered.")
             if dialect is None:
-                dialect = default_dialect(self.sources[source])
-            document["source"] = source
+                dialect = self.remembered_dialect(self.sources[source])
+            selected = self.sources[source]
+            document["source"] = self.source_key(source) if selected.kind == "ibis" else source
         if dialect is not None:
             document["dialect"] = dialect
+            remembered_key = self.source_key(source) if source is not None else self.source_key()
+            remembered = {**document["source_dialects"], remembered_key: dialect}
+            document["source_dialects"] = remembered
         if ai is not None:
             document["ai"] = asdict(ai)
         if default_rows is not None:
@@ -390,7 +447,10 @@ class Session:
             document["value_cache_enabled"] = value_cache_enabled
         if value_cache_limit is not None:
             document["value_cache_limit"] = value_cache_limit
+        if source is not None:
+            self._persist_legacy_function_sources()
         self._settings.save(document)
+        self.source_dialects = dict(self._settings.document["source_dialects"])
         with self._value_cache_lock:
             enabled = self._settings.document["value_cache_enabled"]
             limit = self._settings.document["value_cache_limit"]
@@ -424,12 +484,28 @@ class Session:
                 page = next((page for page in document["pages"]
                              if page["id"] == document["document_id"]), None)
                 snapshot = {"id": document["document_id"], "title": page["title"] if page else "",
+                            "description": page.get("description", "") if page else "",
                             **{key: deepcopy(document[key]) for key in
                                ("document", "cursor", "source", "dialect")}}
                 document["pages"] = [snapshot if item["id"] == snapshot["id"] else item
                                      for item in document["pages"]]
                 if page is None:
                     document["pages"].append(snapshot)
+            source_workspaces = deepcopy(document["source_workspaces"])
+            state = source_workspaces.setdefault(document["source"], {
+                "document_id": "", "function_draft": None, "active_view": "workspace",
+            })
+            state["document_id"] = document["document_id"]
+            state["active_view"] = document["active_view"]
+            if "function_draft" in changes:
+                draft = document["function_draft"]
+                key = draft["source"] if draft is not None else document["source"]
+                state = source_workspaces.setdefault(key, {
+                    "document_id": "", "function_draft": None, "active_view": "workspace",
+                })
+                state["function_draft"] = deepcopy(draft)
+                state["active_view"] = document["active_view"]
+            document["source_workspaces"] = source_workspaces
             sources = dict(document["sources"])
             for source in self.sources.values():
                 if source.con is not None:
@@ -442,6 +518,7 @@ class Session:
             if document == self._workspace.document and not self.workspace_error:
                 return
             try:
+                self._persist_legacy_function_sources()
                 self._workspace.save(document)
             except ValueError as exc:
                 self.workspace_error = str(exc)
@@ -483,9 +560,18 @@ class Session:
                 # of potentially stateful work or throw away its result.
                 outcome.status += f" · history not saved: {exc}"
 
+    def remembered_dialect(self, source: DataSource) -> str:
+        """The dialect last chosen for this target, or the dialect it suggests."""
+        remembered = self.source_dialects.get(self.source_key(source.id))
+        if remembered is not None and remembered in DIALECT_BY_NAME:
+            return remembered
+        return default_dialect(source)
+
     def source_key(self, source_id: str | None = None) -> str:
         source_id = self.active_id if source_id is None else source_id
         source = self.sources.get(source_id)
+        if source is not None and source.connection_key:
+            return source.connection_key
         if source is None or source.con is None:
             return source_id
         if source.d1 is not None:
@@ -511,10 +597,15 @@ class Session:
             saved = self.workspace["sources"].get(key, {})
             profile = self.saved_source_profile(key)
             label = saved.get("display") or (profile["display"] if profile else key)
+            backend = profile.get("backend") if profile and profile.get("kind") == "ibis" else None
+            if backend:
+                for secret in profile_secrets(profile):
+                    label = label.replace(secret, "[redacted]")
             source_id = key
             self.sources[key] = DataSource(
                 id=key, display=f"{label} · disconnected", doc="Reconnect explicitly to use this target.",
-                kind="disconnected", dialect=dialect or ("postgres" if key.startswith("saved-postgres:") else "sqlite"), dir=Path(saved.get("path") or "."),
+                kind="disconnected", dialect=backend or dialect or ("postgres" if key.startswith("saved-postgres:") else "sqlite"),
+                dir=Path(saved.get("path") or "."), connection_key=key if backend else "",
             )
         if activate:
             self.set_active(source_id)
@@ -528,12 +619,22 @@ class Session:
             payload["limit"] = self.default_rows
         return payload
 
+    def _persist_legacy_function_sources(self) -> None:
+        """Bind legacy definitions before a saved selection can change their owner."""
+        functions = self._memory.document["functions"]
+        if isinstance(functions, list) and functions:
+            self._save_memory(self.fns, self.d1_profiles)
+
     def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]],
-                     postgres_profiles: list[dict[str, str]] | None = None) -> None:
-        self._memory.save([
+                     postgres_profiles: list[dict[str, str]] | None = None,
+                     backend_profiles: list[dict] | None = None) -> None:
+        functions = {**self._source_functions, self.source_key(): fns}
+        self._memory.save({key: [
             {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc}
-            for fn in fns.values()
-        ], profiles, self.postgres_profiles if postgres_profiles is None else postgres_profiles)
+            for fn in definitions.values()
+        ] for key, definitions in functions.items()}, profiles,
+            self.postgres_profiles if postgres_profiles is None else postgres_profiles,
+            self.backend_profiles if backend_profiles is None else backend_profiles)
 
     def remember_d1(
         self, account_id: str, database: str, display: str, api_token: str = "",
@@ -566,6 +667,20 @@ class Session:
         self._save_memory(self.fns, self.d1_profiles, profiles)
         self.postgres_profiles = profiles
 
+    def remember_backend(self, profile: dict) -> None:
+        """Save a normalized profile only after Add, without sharing nested options."""
+        profile = validate_profile(profile)
+        identity = profile_id(profile)
+        profiles = list(self.backend_profiles)
+        for index, saved in enumerate(profiles):
+            if profile_id(saved) == identity:
+                profiles[index] = profile
+                break
+        else:
+            profiles.append(profile)
+        self._save_memory(self.fns, self.d1_profiles, backend_profiles=profiles)
+        self.backend_profiles = profiles
+
     @staticmethod
     def _postgres_profile_id(profile: dict[str, str]) -> str:
         # JSON preserves boundaries in arbitrary database/user/schema identifiers.
@@ -584,8 +699,13 @@ class Session:
         # Connected source IDs are slugs; this namespace cannot collide with one.
         return f"saved-d1:{profile['account_id']}:{profile['database'].lower()}"
 
-    def saved_source_profile(self, source_id: str) -> dict[str, str] | None:
+    def saved_source_profile(self, source_id: str) -> dict | None:
         """Resolve a saved picker entry without connecting or changing schemas."""
+        source_id = self.source_key(source_id)
+        backend = next((profile for profile in self.backend_profiles
+                        if profile_id(profile) == source_id), None)
+        if backend is not None:
+            return {**deepcopy(backend), "kind": "ibis"}
         postgres = next((profile for profile in self.postgres_profiles
                          if self._postgres_profile_id(profile) == source_id), None)
         if postgres is not None:
@@ -608,6 +728,10 @@ class Session:
             for profile in self.postgres_profiles
             if self._postgres_profile_id(profile) not in registered
         ] + [
+            (f"{profile['display']} · disconnected", profile_id(profile))
+            for profile in self.backend_profiles
+            if profile_id(profile) not in registered
+        ] + [
             (f"{source['display']} · disconnected", key)
             for key, source in self.workspace["sources"].items()
             if source["kind"] == "d1" and key not in registered
@@ -618,7 +742,7 @@ class Session:
         if source_id not in self.sources:
             raise KeyError(source_id)
         self.active_id = source_id
-        self.dialect = default_dialect(self.source)
+        self.dialect = self.remembered_dialect(self.source)
         self.refresh_schema()
 
     @contextmanager
@@ -640,7 +764,7 @@ class Session:
 
     def register(self, source: DataSource, activate: bool = True) -> None:
         """Register an explicitly built source, replacing its disconnected target."""
-        key = (f"saved-d1:{source.d1.account_id}:{source.d1.database_uuid.lower()}" if source.d1 is not None else
+        key = source.connection_key or (f"saved-d1:{source.d1.account_id}:{source.d1.database_uuid.lower()}" if source.d1 is not None else
                f"snapshot:{source.dir.expanduser().resolve()}" if source.kind == "d1" else
                self._postgres_profile_id(source.postgres) if source.kind == "postgres-live" else source.id)
         placeholders = [name for name, item in self.sources.items() if item.con is None and self.source_key(name) == key]
@@ -669,7 +793,7 @@ class Session:
             tables=tables_of(source), capabilities=capabilities_object(source),
             fns=tuple(self.fns.values()),
             # Newly created relations may still be resolved on demand.
-            default_schema=source.postgres.get("schema"),
+            default_schema=source.default_schema or source.postgres.get("schema"),
             tables_complete=source.schema_indexed and source.kind != "postgres-live",
         )
 
@@ -711,23 +835,36 @@ class Session:
     ) -> list[tuple[str, str, str]]:
         """(column, dtype, detail) rows for the palette, open tables first.
 
-        With a `\\from` set the rows are exactly the document's open tables, in
-        open order; without one they are the registry's cross-dataset pool.
-        This is the data — which rows match what is typed is the palette's rule.
+        With a source set, rows are exactly its input relations, in open order.
+        Derived schemas come from unbound Ibis expressions over the captured
+        snapshot. Only a document without sources or CTEs uses the global pool.
         """
         schema = self.schema if schema is None else schema
-        open_tables = self.open_tables(doc, schema=schema)
+        # Offline inference cannot resolve unindexed tables. Strict metadata
+        # validation also keeps saved functions from capturing caller CTEs on
+        # a partial remote snapshot; outer typing errors do not block sources.
+        parsing_schema = schema if schema.tables_complete else replace(schema, tables_complete=True)
+        ast = parse_query(doc, schema=parsing_schema)
+        open_tables = open_tables_of(ast.from_, ast.joins) if ast.from_ is not None else []
         rows: list[tuple[str, str, str]] = []
         if open_tables:
-            for opened in open_tables:
-                table = schema.table_by_name(opened.dataset)
-                if table is None:
-                    continue
-                for column in table.columns:
-                    name = (f"{opened.identifier}.{column.name}"
-                            if qualified or opened.identifier != opened.dataset else column.name)
-                    rows.append((name, column.type, f"{column.type} · {opened.dataset}"))
-        else:
+            cte_names = {cte.name for cte in ast.with_}
+            derived = [clause.body is not None or opened.dataset in cte_names
+                       for clause, opened in zip((ast.from_, *ast.joins), open_tables)]
+            inferred = source_schemas(ast, schema) if any(derived) else []
+            for index, opened in enumerate(open_tables):
+                if derived[index]:
+                    output = inferred[index]
+                    columns = (() if output is None else
+                               ((name, type_name(dtype)) for name, dtype in output.items()))
+                else:
+                    table = schema.table_by_name(opened.dataset)
+                    columns = ((column.name, column.type) for column in table.columns) if table else ()
+                for column, dtype in columns:
+                    name = (f"{opened.identifier}.{column}"
+                            if qualified or opened.identifier != opened.dataset else column)
+                    rows.append((name, dtype, f"{dtype} · {opened.dataset or opened.identifier}"))
+        elif not ast.with_:
             rows = [
                 (col.name, col.type, f"{col.type} · {', '.join(col.tables)}") for col in schema.pool
             ]
@@ -1070,6 +1207,11 @@ class Session:
             schema=schema, sslmode=sslmode, display=display,
         )
 
+    def build_backend_source(self, profile: dict) -> DataSource:
+        """Build without registration or persistence; the connection owner disposes it."""
+        profile = validate_profile(profile)
+        return add_backend_source(self.next_source_id(profile["display"] or profile["backend"]), profile)
+
     # -- statements the query cannot carry ----------------------------------
 
     def _supports(self, name: str) -> bool:
@@ -1093,6 +1235,8 @@ class Session:
         keeps its savepoint while `RELEASE` (and everything after it) is gone.
         """
         if not self._supports("transactions"):
+            if self.source.kind == "ibis":
+                raise PayloadError(f"{self.source.dialect} does not support session transactions in this build.")
             raise PayloadError(
                 "a live D1 source has no transactions — it is reached over HTTP, "
                 "so every query stands alone"
@@ -1196,7 +1340,7 @@ class Session:
         tables = {name: entry["table"] for name, entry in source.datasets.items()}
         # Bare documents retain the selected schema even when other schemas
         # expose the same basename. Exact temp names continue to win.
-        selected = source.postgres.get("schema")
+        selected = source.default_schema or source.postgres.get("schema")
         if selected is not None:
             for name, entry in source.datasets.items():
                 parts = relation_parts(name)
@@ -1225,6 +1369,8 @@ class Session:
         it made last time, which is what an IDE's run key should do.
         """
         if not self._supports("temp"):
+            if self.source.kind == "ibis":
+                raise PayloadError(f"{self.source.dialect} does not support session temp tables in this build.")
             raise PayloadError(
                 "a live D1 source cannot hold a temp table — it is reached over HTTP"
             )
@@ -1261,24 +1407,66 @@ class Session:
 
     # -- running ------------------------------------------------------------
 
+    def execution_error(
+        self, exc: Exception, *, source: DataSource | None = None, operation: str = "Query",
+    ) -> str:
+        """Keep driver-owned exception text out of status, history and AI context."""
+        source = self.source if source is None else source
+        if source.kind == "ibis" and (not isinstance(exc, PayloadError) or exc.__cause__ is not None):
+            return f"{operation} failed. Check the query, connection and access permissions; driver details are withheld to protect credentials."
+        message = str(exc) if isinstance(exc, (PayloadError, D1Error)) else f"{type(exc).__name__}: {exc}"
+        if source.kind == "ibis":
+            profile = self.saved_source_profile(source.connection_key)
+            if profile is not None:
+                for secret in profile_secrets(profile):
+                    message = message.replace(secret, "[redacted]")
+        return message
+
     def run(self, doc: str, record: bool = True) -> RunOutcome:
         """Parse, run the document's statements, then its query; never raises.
 
-        A document is a statement: its transaction commands run first, in the
-        order they were written, then `\\drop`, and then the query — which is
-        the one thing `\\temp` wraps (`CREATE TEMP TABLE … AS`). A document of
-        statements alone runs them and answers with their status; the rows a
-        query produced are the rows it asked for, capped for the pane.
+        A document without `;` is one statement: its transaction commands run
+        first, in the order they were written, then `\\drop`, and then the
+        query — which is the one thing `\\temp` wraps (`CREATE TEMP TABLE …
+        AS`). `run` answers with the document's FIRST outcome; callers that
+        render every result of a multi-query document use `run_all`.
+        """
+        return self.run_all(doc, record=record)[0]
+
+    def run_all(self, doc: str, record: bool = True) -> list[RunOutcome]:
+        """Every `;`-separated statement's outcome, in document order.
+
+        The whole document parses before anything runs: one error names its
+        absolute line and executes nothing, so a half-written second query
+        never silently skips the good query above it. Each later statement
+        then sees what the earlier ones made (a `\\temp` table included) and
+        answers with its own outcome; the list stops at the first error.
         """
         try:
             if not self.source_connected():
                 raise PayloadError("The saved target is disconnected. Reconnect it or explicitly select another source before running.")
-            schema = self.schema
-            ast = parse_query(doc, schema=schema, settled=True)
-            if ast.errors:
-                first = ast.errors[0]
-                message = f"line {first.line}: {first.message}"
-                return RunOutcome(status=f"not executed · {message}", error=message)
+            segments = parse_statements(doc, schema=self.schema, settled=True)
+            for _start, _text, ast in segments:
+                if ast.errors:
+                    first = ast.errors[0]
+                    message = f"line {first.line}: {first.message}"
+                    return [RunOutcome(status=f"not executed · {message}", error=message)]
+        except Exception as exc:  # last-resort guard: a UI may not crash or exit
+            message = self.execution_error(exc)
+            return [RunOutcome(status=message, error=message)]
+        outcomes: list[RunOutcome] = []
+        for _start, text, ast in segments:
+            outcome = self._run_segment(ast, text, record=record)
+            outcomes.append(outcome)
+            if outcome.error:
+                break
+        return outcomes
+
+    def _run_segment(self, ast: QueryAST, doc: str, record: bool = True) -> RunOutcome:
+        """Run one parsed statement; the never-raises half of `run`."""
+        try:
+            if not self.source_connected():
+                raise PayloadError("The saved target is disconnected. Reconnect it or explicitly select another source before running.")
             payload = self._query_payload(ast)
             queried = has_query(ast)
             steps: list[str] = []
@@ -1307,11 +1495,9 @@ class Session:
                 )
             else:
                 result = execute(self.source.con, payload, dialect, tables=tables)
-        except (PayloadError, D1Error) as exc:
-            return RunOutcome(status=str(exc), error=str(exc))
         except Exception as exc:  # last-resort guard: a UI may not crash or exit
-            message = f"{type(exc).__name__}: {exc}"
-            return RunOutcome(status=message, error=message)
+            message = self.execution_error(exc)
+            return RunOutcome(status=message, error=message, doc=doc)
 
         returned = result["rows"]
         shown = returned[:PREVIEW_ROW_CAP]
@@ -1333,6 +1519,7 @@ class Session:
             ms=result["ms"],
             sql=result["sql"],
             schema_changed=bool(ast.temp or ast.drop),
+            doc=doc,
         )
         outcome.status = " · ".join([*steps, self._status_for(outcome)])
         if record:
@@ -1361,6 +1548,7 @@ class Session:
             dialect=dialect,
             status=" · ".join(steps) or "nothing to run",
             schema_changed=dropped,
+            doc=doc,
         )
         if record:
             self._record_history(
@@ -1381,31 +1569,37 @@ class Session:
         """(sql, message): the document rendered for the active dialect.
 
         Compiling never executes; `sql` is None when the document or the dialect
-        is refused, and `message` is then the user-facing reason. The statements
-        a document may carry — transactions, `\\temp`, `\\drop` — are not SQL to
-        render, so they are named in the message instead.
+        is refused, and `message` is then the user-facing reason. Every
+        `;`-separated query statement renders, joined for the pane; the
+        statements a document may carry — transactions, `\\temp`, `\\drop` —
+        are not SQL to render, so they are named in the message instead.
         """
         try:
             if not self.source_connected():
                 raise PayloadError("The saved target is disconnected. Reconnect it or explicitly select another source before compiling.")
             schema = self.schema
-            ast = parse_query(doc, schema=schema, settled=True)
-            if ast.errors:
-                first = ast.errors[0]
-                return None, f"line {first.line}: {first.message}"
-            payload = self._query_payload(ast)
-            if not has_query(ast):
-                return None, "nothing to compile — this document carries statements only"
+            segments = parse_statements(doc, schema=schema, settled=True)
+            for _start, _text, ast in segments:
+                if ast.errors:
+                    first = ast.errors[0]
+                    return None, f"line {first.line}: {first.message}"
             dialect = dialect_for(self.source, self.dialect)
             # Compile stays offline even while a remote source is indexing.
             con = schema_connection({}) if self.source.d1 is not None else self.source.con
-            sql = compile_sql(build(con, payload, tables=self.tables()), dialect)
-        except (PayloadError, D1Error) as exc:
-            return None, str(exc)
+            tables = self.tables()
+            renders = [
+                compile_sql(build(con, self._query_payload(ast), tables=tables), dialect)
+                for _start, _text, ast in segments if has_query(ast)
+            ]
+            if not renders:
+                return None, "nothing to compile — this document carries statements only"
+            temp = any(ast.temp for _start, _text, ast in segments)
         except Exception as exc:  # last-resort guard: a UI may not crash or exit
-            return None, f"{type(exc).__name__}: {exc}"
-        note = " · \\temp materializes on run" if ast.temp else ""
-        return sql, f"compiled for {dialect} · {len(sql.splitlines())} lines{note}"
+            return None, self.execution_error(exc, operation="Compilation")
+        sql = ";\n\n".join(render.strip().rstrip(";") for render in renders) + ";"
+        note = " · \\temp materializes on run" if temp else ""
+        plural = "" if len(segments) == 1 else f" · {len(renders)} queries"
+        return sql, f"compiled for {dialect} · {len(sql.splitlines())} lines{plural}{note}"
 
     def count_rows(self, expr) -> int | None:
         """The document's full row count, for the preview-cap note.

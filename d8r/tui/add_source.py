@@ -1,4 +1,4 @@
-"""Connect to live Cloudflare D1 or PostgreSQL, or open a SQLite snapshot.
+"""Connect to supported Ibis databases, Cloudflare D1, or local SQLite.
 
 Only Add remembers live credentials and transfers the source to the app.
 Test owns its connection until Add, a field change, or cancellation.
@@ -7,6 +7,7 @@ Test owns its connection until Add, a field change, or cancellation.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from textual import on
 from textual.app import ComposeResult
@@ -16,6 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, Static
 
 from d8r.engine import D1Error, DataSource, PayloadError
+from d8r.engine.connectors import BACKENDS, profile_secrets, validate_profile
 from d8r.tui.connection import CONNECTION_TIMEOUT, ConnectionStatus, build_connection, release_source
 
 
@@ -25,7 +27,7 @@ class AddSourceModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CONNECTION_TIMEOUT = CONNECTION_TIMEOUT
 
-    def __init__(self, session, *, profile: dict[str, str] | None = None, snapshot_path: str | None = None,
+    def __init__(self, session, *, profile: dict | None = None, snapshot_path: str | None = None,
                  auto_connect: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
@@ -37,11 +39,13 @@ class AddSourceModal(ModalScreen):
         self._observed_fields: tuple[str, ...] = ()
         self._profiles = list(session.d1_profiles)
         self._postgres_profiles = list(session.postgres_profiles)
+        self._backend_profiles = list(session.backend_profiles)
         self._initial_profile = dict(profile) if profile is not None else None
         self._snapshot_path = snapshot_path
         self._auto_connect = auto_connect
         self._reconnect_fields: tuple[str, ...] | None = None
         self._shown_backend: str | None = None
+        self._advanced_drafts: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="add-source"):
@@ -49,7 +53,7 @@ class AddSourceModal(ModalScreen):
                         "Connect saved data source" if self._initial_profile is not None else
                         "Add a data source", id="add-source-title")
             yield Static(
-                "Connect to Cloudflare D1 or PostgreSQL, or open an offline SQLite snapshot. "
+                "Connect through Ibis, Cloudflare D1, or an offline SQLite snapshot. "
                 "Add saves connection credentials locally in plaintext; keep connection backups private. "
                 "Test and Cancel save nothing.",
                 id="add-source-note",
@@ -57,8 +61,10 @@ class AddSourceModal(ModalScreen):
             )
             yield Label("Backend", classes="field-label")
             yield Select(
-                [("Cloudflare D1 / local SQLite snapshot", "d1"), ("PostgreSQL", "postgres")],
-                value="postgres" if self._initial_profile and self._initial_profile.get("kind") == "postgres-live" else "d1",
+                [("Cloudflare D1 / local SQLite snapshot", "d1"), ("PostgreSQL", "postgres"),
+                 *((spec.label, name) for name, spec in BACKENDS.items())],
+                value=(self._initial_profile["backend"] if self._initial_profile and self._initial_profile.get("kind") == "ibis"
+                       else "postgres" if self._initial_profile and self._initial_profile.get("kind") == "postgres-live" else "d1"),
                 allow_blank=False,
                 id="source-backend",
             )
@@ -122,6 +128,25 @@ class AddSourceModal(ModalScreen):
                     allow_blank=False,
                     id="postgres-sslmode",
                 )
+            with Vertical(id="backend-fields"):
+                yield Label("Saved database connection", classes="field-label")
+                yield Select(
+                    [(f"{profile['display']} · {BACKENDS[profile['backend']].label}", index)
+                     for index, profile in enumerate(self._backend_profiles)],
+                    prompt="New connection", id="backend-profile",
+                )
+                for name, spec in BACKENDS.items():
+                    with Vertical(id=f"backend-{name}-fields", classes="backend-fields"):
+                        yield Static(spec.help, markup=False)
+                        if spec.extra:
+                            yield Static(f"Driver: uv sync --extra {spec.extra}. Additional vendor runtimes may be required.", markup=False)
+                        for field in spec.fields:
+                            yield Label(field.label + (" · required" if field.required else ""), classes="field-label")
+                            yield Input(field.default, password=field.secret, id=f"backend-{name}-{field.name}")
+                yield Label("Advanced Ibis connection options · JSON object (masked)", classes="field-label")
+                yield Input("{}", password=True, id="backend-options")
+                yield Static("Use additional driver keyword arguments only; do not repeat filled fields above. "
+                             "Secrets in this JSON are saved with the connection on Add.", markup=False)
             yield Label("Display name", classes="field-label")
             yield Input(placeholder="optional label for the datasource list", id="display-name")
             yield Static("", id="add-source-message", markup=False)
@@ -137,6 +162,12 @@ class AddSourceModal(ModalScreen):
         self._show_backend()
         self._observed_fields = self._fields()
         if self._initial_profile is not None:
+            if self._initial_profile.get("kind") == "ibis":
+                with self.prevent(Select.Changed, Input.Changed):
+                    self._fill_backend_profile(self._initial_profile)
+                self._reconnect_fields = self._fields()
+                self.call_after_refresh(self.action_add)
+                return
             postgres = self._initial_profile.get("kind") == "postgres-live"
             profile = {key: value for key, value in self._initial_profile.items() if key != "kind"}
             profiles = self._postgres_profiles if postgres else self._profiles
@@ -162,11 +193,24 @@ class AddSourceModal(ModalScreen):
         backend = str(self.query_one("#source-backend", Select).value)
         if backend == self._shown_backend:
             return
+        advanced = self.query_one("#backend-options", Input)
+        if self._shown_backend in BACKENDS:
+            self._advanced_drafts[self._shown_backend] = advanced.value
+        with self.prevent(Input.Changed):
+            advanced.value = self._advanced_drafts.get(backend, "{}")
         self._shown_backend = backend
         postgres = backend == "postgres"
-        self.query_one("#d1-fields").display = not postgres
+        self.query_one("#d1-fields").display = backend == "d1"
         self.query_one("#postgres-fields").display = postgres
-        self.query_one("#postgres-host" if postgres else "#account-id", Input).focus()
+        self.query_one("#backend-fields").display = backend in BACKENDS
+        for name in BACKENDS:
+            self.query_one(f"#backend-{name}-fields").display = backend == name
+        if backend in BACKENDS:
+            fields = BACKENDS[backend].fields
+            selector = f"#backend-{backend}-{fields[0].name}" if fields else "#backend-options"
+        else:
+            selector = "#postgres-host" if postgres else "#account-id"
+        self.query_one(selector, Input).focus()
 
     def _fields(self) -> tuple[str, ...]:
         # Keep the D1 field positions stable. Passwords are deliberately not stripped.
@@ -176,16 +220,25 @@ class AddSourceModal(ModalScreen):
         postgres = tuple(self.query_one(f"#postgres-{name}", Input).value.strip() for name in (
             "host", "port", "database", "user",
         ))
+        backend = str(self.query_one("#source-backend", Select).value)
+        options = {
+            field.name: self.query_one(f"#backend-{backend}-{field.name}", Input).value
+            for field in BACKENDS[backend].fields
+        } if backend in BACKENDS else {}
         return (*d1, str(self.query_one("#source-backend", Select).value), *postgres,
                 self.query_one("#postgres-password", Input).value,
                 self.query_one("#postgres-schema", Input).value.strip(),
-                str(self.query_one("#postgres-sslmode", Select).value))
+                str(self.query_one("#postgres-sslmode", Select).value),
+                json.dumps(options), self.query_one("#backend-options", Input).value)
 
     def _message(self, text: str, error: bool = False) -> None:
-        for secret in (self.query_one("#api-token", Input).value.strip(),
-                       self.query_one("#postgres-password", Input).value):
-            if secret:
-                text = text.replace(secret, "[redacted]")
+        secrets = [widget.value for widget in self.query(Input) if widget.password and widget.value]
+        try:
+            secrets.extend(profile_secrets(self._backend_profile(self._fields())))
+        except (ValueError, KeyError):
+            pass
+        for secret in secrets:
+            text = text.replace(secret, "[redacted]")
         widget = self.query_one("#add-source-message", Static)
         widget.update(text)
         widget.set_class(error, "error")
@@ -199,7 +252,8 @@ class AddSourceModal(ModalScreen):
         progress.display = busy
         if busy:
             fields = self._fields()
-            target = fields[8] if fields[5] == "postgres" else fields[3] or fields[1]
+            target = (BACKENDS[fields[5]].label if fields[5] in BACKENDS else
+                      fields[8] if fields[5] == "postgres" else fields[3] or fields[1])
             for secret in (fields[2], fields[10]):
                 if secret:
                     target = target.replace(secret, "[redacted]")
@@ -261,7 +315,63 @@ class AddSourceModal(ModalScreen):
 
     @staticmethod
     def _postgres_profile(fields: tuple[str, ...]) -> dict[str, str]:
-        return dict(zip(("host", "port", "database", "user", "password", "schema", "sslmode"), fields[6:]))
+        return dict(zip(("host", "port", "database", "user", "password", "schema", "sslmode"), fields[6:13]))
+
+    @on(Select.Changed, "#backend-profile")
+    def _backend_profile_selected(self, event: Select.Changed) -> None:
+        if self._connection_form_closed:
+            return
+        self._invalidate()
+        if isinstance(event.value, int):
+            with self.prevent(Select.Changed, Input.Changed):
+                self._fill_backend_profile(self._backend_profiles[event.value])
+        else:
+            backend = str(self.query_one("#source-backend", Select).value)
+            if backend in BACKENDS:
+                with self.prevent(Select.Changed, Input.Changed):
+                    self._fill_backend_profile({"backend": backend, "options": {}, "display": ""})
+                self._message("")
+
+    def _fill_backend_profile(self, profile: dict) -> None:
+        backend = profile["backend"]
+        self.query_one("#source-backend", Select).value = backend
+        self._show_backend()
+        options = dict(profile["options"])
+        for field in BACKENDS[backend].fields:
+            value = options.pop(field.name, field.default)
+            self.query_one(f"#backend-{backend}-{field.name}", Input).value = str(value)
+        self.query_one("#backend-options", Input).value = json.dumps(options)
+        self.query_one("#display-name", Input).value = profile["display"]
+        self._observed_fields = self._fields()
+        self._message("Saved credentials loaded. Test or Add to connect.")
+
+    @staticmethod
+    def _backend_profile(fields: tuple[str, ...]) -> dict:
+        backend = fields[5]
+        if backend not in BACKENDS:
+            raise ValueError("Select a supported database backend.")
+        raw = json.loads(fields[13])
+        options = {}
+        for field in BACKENDS[backend].fields:
+            value = raw[field.name] if field.secret else raw[field.name].strip()
+            if value:
+                options[field.name] = value
+        try:
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate option")
+                    result[key] = value
+                return result
+            advanced = json.loads(fields[14], object_pairs_hook=unique_object)
+        except (ValueError, RecursionError):
+            raise ValueError("Advanced connection options must be a JSON object with unique keys.") from None
+        if not isinstance(advanced, dict):
+            raise ValueError("Advanced connection options must be a JSON object.")
+        if options.keys() & advanced.keys():
+            raise ValueError("Advanced options repeat a filled connection field; clear that field first.")
+        return validate_profile({"backend": backend, "options": options | advanced, "display": fields[4]})
 
     @on(Select.Changed, "#d1-profile")
     def _profile_selected(self, event: Select.Changed) -> None:
@@ -284,6 +394,8 @@ class AddSourceModal(ModalScreen):
 
     def _build(self, fields: tuple[str, ...]) -> DataSource:
         account_id, database, api_token, path, display = fields[:5]
+        if fields[5] in BACKENDS:
+            return self.session.build_backend_source(self._backend_profile(fields))
         if fields[5] == "postgres":
             profile = self._postgres_profile(fields)
             if not all(profile[key] for key in ("host", "port", "database", "user", "schema")):
@@ -334,6 +446,10 @@ class AddSourceModal(ModalScreen):
                     profile = self._postgres_profile(fields)
                     profile["display"] = source.display
                     self.session.remember_postgres(profile)
+                elif source.kind == "ibis" and fields != self._reconnect_fields:
+                    profile = self._backend_profile(fields)
+                    profile["display"] = source.display
+                    self.session.remember_backend(profile)
                 self._built = None  # ownership passes to the app's dismissal callback
                 self._connection_form_closed = True
                 self.dismiss(source)
@@ -365,6 +481,9 @@ class AddSourceModal(ModalScreen):
         if fields[5] == "postgres":
             return ("Could not connect to PostgreSQL or save the connection. Check the host, port (1–65535), "
                     "database, user, password, schema, TLS mode and access permissions, then try again.")
+        if fields[5] in BACKENDS:
+            return (f"Could not connect to {BACKENDS[fields[5]].label} or save the connection. "
+                    "Check the driver/runtime requirements, connection options and access permissions.")
         return "Could not connect. Check the account, database and token permissions, then try again."
 
     def action_cancel(self) -> None:
@@ -372,6 +491,9 @@ class AddSourceModal(ModalScreen):
         self._invalidate()
         self.query_one("#api-token", Input).value = ""
         self.query_one("#postgres-password", Input).value = ""
+        for widget in self.query(Input):
+            if widget.password:
+                widget.value = ""
         self.dismiss(None)
 
     def on_unmount(self) -> None:

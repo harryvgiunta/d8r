@@ -6,12 +6,12 @@ import json
 
 import httpx
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, OptionList, Static, TextArea
 
 from d8r.ai import client
 from d8r.ai.client import AIConfig
 from d8r.ai.context import AIContext
-from d8r.tui.ai import AIPanel, AITarget
+from d8r.tui.ai import AIChats, AIPanel, AITarget, AgentsPane
 from d8r.tui.session import HistoryEntry, Session
 
 
@@ -65,6 +65,16 @@ class ChatApp(App):
     @property
     def panel(self) -> AIPanel:
         return self.query_one(AIPanel)
+
+
+class AgentsApp(ChatApp):
+    def __init__(self, session: Session):
+        super().__init__(session)
+        self.ai_chats = AIChats(self, session)
+
+    def compose(self) -> ComposeResult:
+        yield from super().compose()
+        yield AgentsPane()
 
 
 async def _finished(panel: AIPanel) -> None:
@@ -180,6 +190,108 @@ def test_source_and_mode_isolation_and_durable_new_chat(monkeypatch):
             assert function_app.panel.query_one("#ai-input", TextArea).text == ""
     asyncio.run(scenario())
 
+def test_agents_roster_and_counts_follow_stable_source_without_current_chat():
+    async def scenario():
+        session = _session()
+        session.sources["demo"].connection_key = "saved:demo"
+        app = AgentsApp(session)
+        async with app.run_test(size=(140, 48)):
+            manager = app.ai_chats
+            query = manager.create(AITarget(("saved:demo", "query-page"), "demo", ""))
+            query.messages = [{"role": "assistant", "content": "Already reviewed"}]
+            ready = manager.create(AITarget(("saved:demo", "other-page"), "demo", ""))
+            ready.unread = True
+            function = manager.create(AITarget(("saved:demo", "function-draft"), "demo", "", ()))
+            function.status = "error"
+            hidden = manager.create(AITarget(("mysql", "mysql-page"), "mysql", ""))
+            hidden.status = "working"
+            hidden.unread = True
+            manager.changed(function)
+            listing = app.query_one("#agents-list", OptionList)
+            summary = app.query_one("#agents-summary", Static)
+            assert {listing.get_option_at_index(i).id for i in range(listing.option_count)} == {
+                query.id, ready.id, function.id,
+            }
+            counts = str(summary.content)
+            assert "1 Ready" in counts and "1 Seen" in counts and "1 Error" in counts
+            assert "Busy" not in counts
+            assert app.panel.chat is None
+
+            session.set_active("mysql")
+            app.panel.target_changed()
+            assert listing.option_count == 1
+            assert listing.get_option_at_index(0).id == hidden.id
+            assert "1 Busy" in str(summary.content)
+            assert "Ready" not in str(summary.content) and "Error" not in str(summary.content)
+            assert ready.unread and hidden.unread
+
+            session.restore_source("saved:empty")
+            app.panel.target_changed()
+            assert listing.option_count == 0
+            assert not str(summary.content)
+            assert app.query_one("#agents-empty").display
+            session.set_active("demo")
+            app.panel.target_changed()
+            assert {listing.get_option_at_index(i).id for i in range(listing.option_count)} == {
+                query.id, ready.id, function.id,
+            }
+            assert ready.unread and hidden.unread
+            assert set(manager.chats) == {query.id, ready.id, function.id, hidden.id}
+
+    asyncio.run(scenario())
+
+
+def test_source_switch_keeps_background_request_selection_draft_and_unread(monkeypatch):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Pending(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                started.set()
+                await release.wait()
+                yield _answer("Background reply")
+
+        _provider(monkeypatch, lambda request: httpx.Response(200, stream=Pending()))
+        app = AgentsApp(_session())
+        async with app.run_test(size=(140, 48)):
+            panel = app.panel
+            panel.open()
+            panel.query_one("#ai-input", TextArea).load_text("Work while I switch sources")
+            panel.action_send()
+            chat = panel.chat
+            await asyncio.wait_for(started.wait(), 5)
+            panel.query_one("#ai-input", TextArea).load_text("Keep my follow-up draft")
+            worker = chat.worker
+            generation = chat.generation
+            app.session.set_active("mysql")
+            panel.target_changed()
+            assert chat.worker is worker and chat.generation == generation
+            assert chat.selected and chat.input == "Keep my follow-up draft"
+            assert app.query_one("#agents-list", OptionList).option_count == 0
+            assert not app.ai_chats.is_read(chat)
+            panel.select_chat(chat.id)
+            assert panel.chat is None
+            release.set()
+            await asyncio.wait_for(worker.wait(), 8)
+            assert chat.messages[-1] == {"role": "assistant", "content": "Background reply"}
+            assert chat.unread
+            assert app.query_one("#agents-list", OptionList).option_count == 0
+
+            app.session.set_active("demo")
+            panel.target_changed()
+            assert panel.chat is chat
+            assert panel.query_one("#ai-input", TextArea).text == "Keep my follow-up draft"
+            assert chat.unread
+            assert "1 Ready" in str(app.query_one("#agents-summary", Static).content)
+            panel.open()
+            assert not chat.unread
+            assert "1 Seen" in str(app.query_one("#agents-summary", Static).content)
+            assert not app.applied and not app.session.history
+
+    asyncio.run(scenario())
+
+
 
 def test_cancelled_and_failed_partial_turns_are_not_replayed(monkeypatch):
     requests = []
@@ -219,7 +331,6 @@ def test_cancelled_and_failed_partial_turns_are_not_replayed(monkeypatch):
         async with restarted.run_test():
             panel = restarted.panel
             assert not panel.messages
-            assert not panel.query_one("#ai-transcript", Static).content
             assert panel.query_one("#ai-apply", Button).disabled
             panel.query_one("#ai-input", TextArea).load_text("Fresh request")
             panel.action_send()

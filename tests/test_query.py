@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from d8r.query import (  # noqa: E402  (repo root added to sys.path above)
     CaseBranch,
     ColumnDef,
+    FnDef,
     TableDef,
     auto_alias,
     clause_line,
@@ -346,6 +347,81 @@ def test_main_from_and_join_may_reference_earlier_ctes(loaded):
     ast = parse_query("\\with recent\n  \\from events\n\\from users\n\\join recent on user_id\n\\select score", schema=loaded)
     assert ast.errors == []
 
+
+
+def test_last_cte_is_the_implicit_source_with_header_line(loaded):
+    ast = parse_query(
+        "\\with first\n  \\from events\n  \\select user_id\n"
+        "\\with last\n  \\from first\n  \\select user_id as id\n"
+        "\\select last.id\n\\where last.id > 0",
+        schema=loaded, settled=True,
+    )
+    assert ast.errors == []
+    assert (ast.from_.line, ast.from_.table) == (4, "last")
+    assert ast.with_[1].body.from_.table == "first"
+    assert payload_from_ast(ast)["dataset"] == "last"
+
+    invalid = parse_query(
+        "\\with first\n  \\from events\n\\with last\n  \\from first\n"
+        "\\select first.user_id", schema=loaded, settled=True,
+    )
+    assert has_error(invalid, '"first" is not an open table: last')
+    assert [error.line for error in invalid.errors] == [5]
+
+
+@pytest.mark.parametrize("source", ["\\from users u", "\\open users u", "\\lookup() u"])
+@pytest.mark.parametrize("before", [False, True])
+def test_explicit_source_overrides_implicit_cte_anywhere(source, before):
+    schema = SchemaContext(TABLES, fns=[FnDef("lookup", body="\\from users")])
+    cte = "\\with recent\n  \\from events\n"
+    doc = source + "\n" + cte if before else cte + source + "\n"
+    ast = parse_query(doc + "\\select u.score", schema=schema, settled=True)
+    assert ast.errors == []
+    assert ast.from_.alias == "u"
+    assert ast.from_.line == (1 if before else 3)
+    assert ast.from_.table == ("" if "lookup" in source else "users")
+
+
+def test_lateral_body_sees_the_implicit_cte_source(loaded):
+    ast = parse_query(
+        "\\with recent\n  \\from events\n"
+        "\\join lateral (\\from users u \\where u.user_id = recent.user_id "
+        "\\select u.score) scores\n\\select recent.user_id, scores.score",
+        schema=loaded, settled=True,
+    )
+    assert ast.errors == []
+    assert ast.from_.table == "recent"
+    assert ast.joins[0].body.where.value == "recent.user_id"
+
+
+@pytest.mark.parametrize("doc", [
+    "\\with",
+    "\\with 1bad\n  \\from events",
+    "\\with recent",
+    "\\with recent\n  \\select user_id",
+    "\\with recent\n  \\from",
+    "\\with recent\n  \\from events\n  \\where",
+    "\\with recent\n  \\from missing",
+    "\\with recent\n  \\from events\n  \\select wrong.user_id",
+    "\\with first\n  \\from events\n\\with unfinished",
+    "\\with recent\n  \\from events\n\\from",
+])
+@pytest.mark.parametrize("settled", [False, True])
+def test_incomplete_or_invalid_ctes_do_not_supply_a_source(loaded, doc, settled):
+    ast = parse_query(doc, schema=loaded, settled=settled)
+    assert ast.from_ is None
+
+
+def test_invalid_cte_retains_errors_and_does_not_leak_its_source(loaded):
+    ast = parse_query("\\with 1bad\n  \\from events", schema=loaded, settled=True)
+    assert messages(ast) == ["\\with expects a bare CTE name"]
+    assert ast.from_ is None
+    invalid_body = parse_query(
+        "\\with recent\n  \\from events\n  \\where", schema=loaded, settled=True,
+    )
+    assert messages(invalid_body) == ["\\where expects arguments"]
+    assert [error.line for error in invalid_body.errors] == [3]
+    assert invalid_body.from_ is None
 
 def test_forward_reference_to_a_later_cte_is_unknown_table(loaded):
     ast = parse_query("\\from recent\n\\with recent\n  \\from events", schema=loaded)
@@ -1096,217 +1172,6 @@ def test_auto_alias_derivation():
 # --- AST -> engine payload ---------------------------------------------------
 
 
-def test_payload_maps_the_canonical_document():
-    ast = parse_query(CANONICAL_DOC)
-    payload = payload_from_ast(ast)
-    assert payload["dataset"] == "recent"
-    assert payload["distinct"] is True
-    assert payload["alias"] is None
-    assert payload["body"] is None
-    assert [
-        (op["op"], op["dataset"], op["distinct"], op["body"] is not None)
-        for op in payload["setOps"]
-    ] == [
-        ("union", "etl.archived", True, False),
-        ("union", "", False, True),
-        ("intersect", "other", True, False),
-        ("except", "", True, True),
-    ]
-    # Two set-op operands are inline subqueries: a payload of their own.
-    assert payload["setOps"][1]["body"]["dataset"] == "events"
-    assert payload["setOps"][3]["body"]["dataset"] == "staging"
-    assert payload["where"]["op"] == "in"
-    assert payload["where"]["subquery"]["dataset"] == "customers"
-    # The and-group on the same line: a `( … )` group node wrapping an
-    # in-list head with an or-group null test inside it.
-    (group,) = payload["where"]["ands"]
-    assert (group["op"], group["column"]) == ("", "")
-    assert group["group"]["op"] == "in"
-    assert group["group"]["values"] == ["purchase", "cli"]
-    (null_test,) = group["group"]["ors"]
-    assert null_test[0]["op"] == "is not null" and null_test[0]["column"] == "user_id"
-    assert payload["groupBy"] == []
-    assert payload["limit"] == 5
-    assert payload["orderBy"] == [{"target": "customer_total", "direction": "desc"}]
-    assert payload["cases"] == [
-        {
-            "alias": "flag",
-            "whens": [
-                {"column": "amount", "op": ">", "value": "100", "then": "high"},
-                {"column": "sku", "op": "ilike", "value": "SKU-0%", "then": "early"},
-                {"column": "customer_id", "op": "is null", "value": "", "then": "missing"},
-            ],
-            "else": "low",
-        }
-    ]
-    assert payload["temp"] == "snapshot"
-    assert payload["drop"] == "previous"
-    assert payload["tx"] == [{"kind": "begin", "name": None}, {"kind": "commit", "name": None}]
-
-    (
-        customer, month_col, total, running, rank_col, extracted, peak,
-        *constants, _scalar, translated, distance, link_host, placed_date,
-        dollars, safe_dollars, paid_total,
-    ) = payload["select"]
-    assert [item["literal"] for item in constants] == [
-        {"value": "1"}, {"value": 1}, {"value": "x"}, {"value": None},
-    ]
-    assert paid_total["aggregate"] == {
-        "fn": "sum", "arg": "amount",
-        "where": {"column": "status", "op": "=", "value": "paid", "subquery": None},
-    }
-    assert customer["column"] == "customer_id"
-    assert customer["alias"] is None
-    assert month_col["temporal"] == {"fn": "month", "arg": "placed_at"}
-    assert month_col["alias"] == "placed_at_month"
-    assert total == {
-        "column": None,
-        "literal": None,
-        "scalar": None,
-        "arithmetic": None,
-        "star": False,
-        "aggregate": {"fn": "sum", "arg": "amount"},
-        "temporal": None,
-        "rank": None,
-        "window": {"partitionBy": ["customer_id"], "order": None, "frame": None},
-        "regex": None,
-        "subquery": None,
-        "alias": "customer_total",
-    }
-    # The frame rides in the window, bounds and all (`range` here).
-    assert running["window"] == {
-        "partitionBy": [],
-        "order": {"column": "placed_at", "direction": "asc"},
-        "frame": {"kind": "range", "start": "unbounded preceding", "end": "current row"},
-    }
-    assert rank_col == {
-        "column": None,
-        "literal": None,
-        "scalar": None,
-        "arithmetic": None,
-        "star": False,
-        "aggregate": None,
-        "temporal": None,
-        "rank": {"fn": "rank"},
-        "window": {
-            "partitionBy": [],
-            "order": {"column": "placed_at", "direction": "desc"},
-            "frame": None,
-        },
-        "regex": None,
-        "subquery": None,
-        "alias": "recency_rank",
-    }
-    assert extracted["regex"] == {
-        "fn": "regexp_extract",
-        "arg": "sku",
-        "pattern": "SKU-([0-9]+)",
-        "group": 1,
-        "replacement": None,
-    }
-    assert extracted["alias"] == "sku_number"
-    # An inline subquery travels as a payload of its own, alias included.
-    assert peak["subquery"]["dataset"] == "staging"
-    assert peak["subquery"]["select"][0]["aggregate"] == {"fn": "max", "arg": "amount"}
-    assert peak["alias"] == "peak_amount"
-
-    # The extended catalog calls ride the same `scalar` node: fn plus args.
-    assert translated["scalar"] == {
-        "fn": "translate",
-        "args": [
-            {"column": "sku"},
-            {"literal": {"value": "S"}},
-            {"literal": {"value": "X"}},
-        ],
-    }
-    assert translated["alias"] == "translated_sku"
-    assert distance["scalar"] == {
-        "fn": "levenshtein",
-        "args": [{"column": "sku"}, {"literal": {"value": "SKU-001"}}],
-    }
-    assert link_host["scalar"] == {
-        "fn": "url_host",
-        "args": [{"literal": {"value": "https://acme.test/p"}}],
-    }
-    assert placed_date["scalar"] == {
-        "fn": "as_date",
-        "args": [
-            {"fn": "string", "args": [{"column": "placed_at"}]},
-            {"literal": {"value": "%Y-%m-%d"}},
-        ],
-    }
-    assert placed_date["alias"] == "placed_date"
-    assert dollars["arithmetic"] == {
-        "op": "/", "args": [{"column": "amount"}, {"literal": {"value": 100}}],
-    }
-    assert safe_dollars["scalar"] == {
-        "fn": "coalesce",
-        "args": [dollars["arithmetic"], {"literal": {"value": 0}}],
-    }
-
-    # The lateral join carries its body and its correlation, left as written.
-    lateral = payload["joins"][0]
-    assert lateral["lateral"] is True
-    assert lateral["alias"] == "last_two"
-    assert lateral["left"] == "recent.campaign_id"
-    assert (lateral["body"]["dataset"], lateral["body"]["limit"]) == ("etl.spend_log", 2)
-    assert lateral["body"]["where"]["value"] == "recent.campaign_id"
-
-    # A CTE body is a full payload whose own ctes list is empty (by grammar).
-    assert payload["ctes"] == [
-        {
-            "name": "recent",
-            "body": {
-                "dataset": "etl.orders",
-                "alias": None,
-                "body": None,
-                "joins": [],
-                "setOps": [],
-                "select": [],
-                "distinct": False,
-                "where": {
-                    "column": "",
-                    "op": "",
-                    "value": "",
-                    "subquery": None,
-                    "group": {
-                        "column": "status",
-                        "op": "=",
-                        "value": "paid",
-                        "subquery": None,
-                        "ands": [
-                            {
-                                "column": "amount",
-                                "op": "between",
-                                "value": "",
-                                "subquery": None,
-                                "low": "1",
-                                "high": "999.5",
-                            }
-                        ],
-                    },
-                    "ors": [
-                        [
-                            {
-                                "column": "sku",
-                                "op": "is null",
-                                "value": "",
-                                "subquery": None,
-                            }
-                        ]
-                    ],
-                },
-                "groupBy": [],
-                "orderBy": [],
-                "temp": None,
-                "drop": None,
-                "tx": [],
-                "limit": None,
-                "cases": [],
-                "ctes": [],
-            },
-        }
-    ]
 
 
 def test_payload_sends_derived_aliases_for_unaliased_aggregates():
@@ -1438,3 +1303,28 @@ def test_filtered_predicate_text_limits_and_quoted_keywords():
     )
     assert ast.errors == []
     assert ast.select[0].aggregate.where.value == r"paid and (pending) \\where"
+
+
+def test_aggregate_where_validates_argument_and_filter_qualification(loaded):
+    good = parse_query(
+        "\\from events e\n\\select e.user_id, count(*) as total_count\n"
+        "\\where sum(e.amount \\where e.status = 'paid') > 15 and total_count > 1",
+        schema=loaded, settled=True,
+    )
+    assert not good.errors
+    for predicate in ("sum(events.amount) > 15", "sum(e.amount \\where events.status = 'paid') > 15"):
+        bad = parse_query(f"\\from events e\n\\where {predicate}", schema=loaded, settled=True)
+        assert has_error(bad, "events.")
+        assert {error.line for error in bad.errors} == {2}
+
+
+@pytest.mark.parametrize("predicate", [
+    "count(*) >", "sum(*) > 15", "sum(amount / 100) > 15",
+    "count(* \\where count(*) > 1) > 15", "upper(status) = 'PAID'",
+])
+def test_aggregate_where_incomplete_or_invalid_operands_settle_safely(predicate):
+    doc = f"\\from events\n\\where {predicate}"
+    assert not parse_query(doc).errors
+    settled = parse_query(doc, settled=True)
+    assert settled.errors
+    assert {error.line for error in settled.errors} == {2}

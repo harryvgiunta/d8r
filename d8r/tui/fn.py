@@ -33,6 +33,7 @@ from d8r.query import is_identifier
 from .ai import AIPanel, AITarget
 
 from .palette import CommandPalette, EditorPane, prompt
+from .query_editor import QueryTextArea
 
 if TYPE_CHECKING:
     from .app import D8RApp
@@ -86,10 +87,11 @@ class FnBodyPane(EditorPane):
 
 
 class FnExplorer(Vertical):
-    """The function-mode contents of the workspace explorer slot."""
+    """The Functions tab, available from either workspace editor."""
 
     def compose(self) -> ComposeResult:
-        yield Static("Functions", classes="pane-title")
+        yield Button("Use current query page as function", id="query-to-fn", compact=True,
+                     tooltip="Copy the current query into a new function draft; nothing is saved or run")
         yield OptionList(id="fn-list")
         with VerticalScroll(id="fn-param-guide"):
             yield Static("How parameters work", classes="guide-title")
@@ -123,10 +125,12 @@ class FnEditor(Vertical):
         return self.ide.session
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="fn-actions"):
+        with Horizontal(id="fn-actions", classes="pane-controls"):
             yield Static("Function", classes="pane-title")
             yield Button("Ask AI", id="fn-ai", compact=True)
             yield Button("Query", id="fn-back", compact=True)
+            yield Button(Text("[x]"), id="fn-close", classes="pane-close", compact=True,
+                         tooltip="Return to query · preserve function draft")
         with VerticalScroll(id="fn-editor"):
             yield Select(
                 self.session.source_options(),
@@ -146,7 +150,7 @@ class FnEditor(Vertical):
                 yield Static("Preview values")
                 yield Input(self._initial_fields["arguments"], placeholder='10 (quote text; values in parameter order)', id="fn-args")
             with FnBodyPane(id="fn-body-pane"):
-                yield TextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
+                yield QueryTextArea(self._initial_fields["body"], id="fn-body", show_line_numbers=True)
                 yield CommandPalette(
                     self.session, source_id=self.source_id, workspace_actions=False,
                     parameters=self._parameter_names, id="fn-palette", markup=False,
@@ -169,9 +173,9 @@ class FnEditor(Vertical):
             )
         }
         self._draft_body.move_cursor(tuple(self._initial_fields["cursor"]))
-        keys = list(self.session.fns)
+        keys = list(self.session.functions_for(self.source_id))
         self._draw_list(keys.index(self.selected) if self.selected in keys else len(keys))
-        self.query_one("#fn-delete", Button).disabled = self.selected not in self.session.fns
+        self.query_one("#fn-delete", Button).disabled = self.selected not in self.session.functions_for(self.source_id)
         self._status("restored draft" if (self.session.workspace.get("function_draft") or {}).get("identity") == self._draft_identity
                      else f"{self.selected} · saved locally" if self.selected else "new function")
         self._draft_ready = True
@@ -179,7 +183,7 @@ class FnEditor(Vertical):
         self._queue_draft_save()
 
     def start_draft(self, *, focus: str = "", new_name: str = "", new_body: str = "") -> None:
-        """Explicit New/To function starts a fresh draft on the workspace source."""
+        """Explicit New/query conversion starts a fresh draft on the workspace source."""
         self.flush_draft()
         self.source_id = self.session.active_id
         with self.prevent(Select.Changed):
@@ -193,6 +197,33 @@ class FnEditor(Vertical):
                 self.query_one("#fn-body", TextArea).load_text(new_body)
         self._select_target(self.source_id)
         self._queue_draft_save()
+
+    def restore_workspace(self, draft: dict | None) -> None:
+        """Load this source's draft after the outgoing form has been flushed."""
+        if self._draft_timer is not None:
+            self._draft_timer.stop()
+            self._draft_timer = None
+        self.source_id = self.session.active_id
+        self.selected = draft["selected"] if draft else ""
+        self._draft_identity = draft["identity"] if draft else str(uuid4())
+        self._draft_snapshot = {}
+        with self.prevent(Select.Changed, Input.Changed, TextArea.Changed, TextArea.SelectionChanged):
+            select = self.query_one("#fn-source", Select)
+            select.set_options(self.session.source_options())
+            select.value = self.source_id
+            for key, widget in self._draft_inputs.items():
+                widget.value = draft[key] if draft else ""
+            self._draft_body.load_text(draft["body"] if draft else "")
+            self._draft_body.move_cursor(tuple(draft["cursor"]) if draft else (0, 0))
+        palette = self.query_one(CommandPalette)
+        palette.source_id = self.source_id
+        palette.close()
+        self.query_one("#fn-reconnect", Button).disabled = self.session.source_connected()
+        self.query_one("#fn-reconnect").display = not self.session.source_connected()
+        self.query_one("#fn-delete", Button).disabled = self.selected not in self.session.functions_for(self.source_id)
+        self.preview_grid.clear(columns=True)
+        self._draw_list()
+        self._status("restored draft" if draft else "new function")
 
     def on_unmount(self) -> None:
         self._leaving = True
@@ -245,8 +276,11 @@ class FnEditor(Vertical):
             with self.prevent(Select.Changed):
                 event.select.value = self.source_id
             self.ide.reconnect_source(event.value, self._source_connected)
-            return
-        self._select_target(event.value)
+        elif self.ide.select_source(event.value):
+            self.ide._open_fn()
+        else:
+            with self.prevent(Select.Changed):
+                event.select.value = self.source_id
 
     def _select_target(self, source_id: str) -> None:
         self.ide._cancel_connection()
@@ -283,12 +317,8 @@ class FnEditor(Vertical):
     def _source_connected(self, source) -> None:
         if source is None:
             return
-        self.ide._source_added(source, activate=False)
-        select = self.query_one("#fn-source", Select)
-        with self.prevent(Select.Changed):
-            select.set_options(self.session.source_options())
-            select.value = source.id
-        self._select_target(source.id)
+        self.ide._source_added(source)
+        self.ide._open_fn()
 
     @on(Button.Pressed, "#fn-reconnect")
     def _reconnect_target(self) -> None:
@@ -348,6 +378,7 @@ class FnEditor(Vertical):
         self.ide.action_ai()
 
     @on(Button.Pressed, "#fn-back")
+    @on(Button.Pressed, "#fn-close")
     def _back_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         self.action_back()
@@ -361,7 +392,7 @@ class FnEditor(Vertical):
     def _draw_list(self, highlight: int | None = None) -> None:
         """Redraw the library list from live state, with one row highlighted."""
         rows: list[tuple[str, str]] = []
-        for fn in self.session.fns.values():
+        for fn in self.session.functions_for(self.source_id).values():
             signature = ", ".join(fn.params) if fn.params else "no arguments"
             detail = f"{signature} · {fn.doc}" if fn.doc else f"{signature} · {len(fn.body.splitlines())} lines"
             rows.append((fn.name, detail))
@@ -375,7 +406,7 @@ class FnEditor(Vertical):
 
     def _select(self, name: str) -> None:
         """Highlight `name` in the list and load it (or a blank form) into the fields."""
-        keys = [*self.session.fns]
+        keys = [*self.session.functions_for(self.source_id)]
         index = keys.index(name) if name in keys else len(keys)
         self.selected = keys[index] if index < len(keys) else ""
         self._draw_list(highlight=index)
@@ -385,7 +416,7 @@ class FnEditor(Vertical):
         """Put one function's text in the fields; a new function shows blanks."""
         self._draft_identity = str(uuid4())
         self.query_one(CommandPalette).close()
-        fn = self.session.fns.get(name)
+        fn = self.session.functions_for(self.source_id).get(name)
         self.query_one("#fn-delete", Button).disabled = fn is None
         with self.prevent(Input.Changed, TextArea.Changed, TextArea.SelectionChanged):
             self.query_one("#fn-name", Input).value = fn.name if fn else ""
@@ -406,11 +437,7 @@ class FnEditor(Vertical):
     # -- acting --------------------------------------------------------------
 
     def select_function(self, name: str) -> None:
-        if name == NEW:
-            self._select("")
-            self.query_one("#fn-name", Input).focus()
-            return
-        self._select(name)
+        self.ide._open_fn(focus="" if name == NEW else name, restore_draft=False)
 
     def _fields(self) -> tuple[str, str, str, str]:
         return (
@@ -432,11 +459,11 @@ class FnEditor(Vertical):
             self._status(str(exc), error=True)
             return str(exc)
         self.selected = fn.name
-        self._draw_list(list(self.session.fns).index(fn.name))
+        self._draw_list(list(self.session.functions_for(self.source_id)).index(fn.name))
         self.query_one("#fn-delete", Button).disabled = False
         self._target_changed()
         self._queue_draft_save()
-        self._status(f'function "{fn.name}" saved locally · {len(self.session.fns)} in library')
+        self._status(f'function "{fn.name}" saved locally · {len(self.session.functions_for(self.source_id))} in library')
         return None
 
     @on(Button.Pressed, "#fn-save")
@@ -483,11 +510,12 @@ class FnEditor(Vertical):
         if self.ide.refuse_busy("Delete function"):
             return
         name = self.query_one("#fn-name", Input).value.strip()
-        if name not in self.session.fns:
+        if name not in self.session.functions_for(self.source_id):
             self._status("nothing to delete — this function is not saved", error=True)
             return
         try:
-            self.session.delete_fn(name)
+            with self.session.target_source(self.source_id):
+                self.session.delete_fn(name)
         except ValueError as exc:
             self._status(str(exc), error=True)
             return

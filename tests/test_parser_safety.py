@@ -107,10 +107,10 @@ def test_branching_expansion_budget_is_shared_and_save_matches_call():
 
 
 def install_legacy_cycle():
-    MemoryStore().save([
+    MemoryStore().save({"demo": [
         {"name": "a", "params": ["x"], "body": "\\from b(@x)", "description": ""},
         {"name": "b", "params": ["x"], "body": "\\from a(@x)", "description": ""},
-    ], [])
+    ]}, [])
 
 
 def test_legacy_cycles_are_recoverable_without_erasing_saved_work():

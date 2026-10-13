@@ -221,23 +221,21 @@ Verified: `percent_rank() over (…)` → `cannot parse expression "percent_rank
 
 ## Joins
 
-`_join_frames` (`d8r/engine/expression.py:267`) is the whole story: `\join
-<ds> [as a] on <col>[ = <col>]` → `expr.join(right, left_column ==
-right_column)` (line 305/326) — always **inner**, exactly **one equality**
-(a multi-predicate `on a = b and c = d` refuses at parse, verified), plus the
-lateral rewrite (`_apply_lateral_rows`, which numbers rows and re-projects).
-Verified `\left join …` → `unknown command "\left"`. `in`/`not in` subqueries
-reach semi/anti semantics through `_apply_subquery_filter` — that is the only
-non-inner reachability.
+`_join_frames` in `d8r/engine/expression.py` builds ordinary source joins,
+typed alias-graph joins, explicit Cartesian products, and the lateral rewrite.
+`\join <source> on ...` is inner; alias operators select inner/left/right/full,
+semi/anti, or backward as-of joins. `\join cross <source> [alias]` uses Ibis
+`cross_join`, without a predicate or parentheses around table/CTE names.
+Composite equalities are supported; arbitrary ON expressions remain a gap.
 
 | capability | ibis surface | D8R status | where it would hook in | effort | recommendation |
 | --- | --- | --- | --- | --- | --- |
-| join flavors | `Table.join(right, preds, how=JoinKind)` with `how` in `inner left right outer semi anti asof cross any_inner any_left positional`; shorthands `left_join/right_join/outer_join/semi_join/anti_join/cross_join` | **missing** (inner only) | payload `joins[].how`; `\join left <ds> …` / `\left join` grammar (the palette offers dataset names after `\join` today — the modifier slot is free); `expression._join_frames` gains `how=` | S–M | add `left`/`right`/`full` first (SQL parity users expect them); sqlite/duckdb/postgres all render them |
-| multi-key ON | join predicates are a sequence: `.join(r, [a==x, b==y])` | **missing** (single equality by grammar) | `on` tail becomes a comma-separated list; payload `left/right` → list of pairs | M | common; pairs-list shape keeps the "both sides named" rule |
+| join flavors | `Table.join(right, preds, how=JoinKind)` and typed join methods | **partial**: inner/left/right/outer/semi/anti/asof/cross present | existing `joins[].kind` and `_join_frames` | — | `any_inner`, `any_left`, and positional remain unexposed |
+| multi-key ON | `.join(r, [a==x, b==y])` | **present**: equality conjunctions in source and alias joins | existing `left`/`right` plus `keys` pairs | — | not a gap |
 | arbitrary ON predicate | predicates accept any boolean expression (`a > b`, functions) | **missing** (`on a = b` literally) | `on` tail carries a predicate like `\where`'s | M | after arithmetic lands |
-| ASOF join | `Table.asof_join(right, on=, predicates=, tolerance=)` — compiles on duckdb and postgres; **not** sqlite (`UnsupportedOperationError: ASOF joins are not supported by SQLite`, verified) or databricks | **missing** | new `how=asof` with a `>=` time condition + optional `tolerance` | M | flag via `CAPABILITIES["supports"]` per backend, exactly how `savepoints` is gated today |
-| CROSS join | `Table.cross_join(right)` | **missing** (`on` is mandatory) | `how=cross` with the `on` clause optional | S | cheap |
-| semi / anti as first-class | `semi_join`, `anti_join`, `any_left_join` | **partial**: reachable only as `in`/`not in` subquery filters | `how=semi/anti` for the join-shaped case | S | document the `in`/`not in` path; add kinds if `\join left` ships |
+| ASOF join | `Table.asof_join(right, on=, predicates=, tolerance=)` | **partial**: backward nearest-prior `@=` with equality partitions; no tolerance | existing alias join and backend capabilities | — | backend support still governs availability |
+| CROSS join | `Table.cross_join(right)` | **present**: `\join cross <source> [alias]`, no ON | existing `joins[].kind = "cross"` | — | table/CTE sources need no parentheses |
+| semi / anti as first-class | `semi_join`, `anti_join`, `any_left_join` | **present** for ordinary semi/anti via `^=` / `!=` alias edges | existing typed join path | — | `any_left_join` remains separate and unexposed |
 | positional join | `positional` kind (column-position concatenation) | **missing** | payload pass-through | S | skip — no natural `\join` spelling |
 | lname/rname suffixes | `.join(..., lname="{name}_", rname="{name}_right")` | **equivalent present**: `_join_frames` keeps first occurrence and renames duplicates (the `_LATERAL_ROW`-clash guard shows it) | — | — | not a gap |
 

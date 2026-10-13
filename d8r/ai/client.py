@@ -380,11 +380,9 @@ async def run_turn(
                         f"You have {remaining} tool rounds remaining for this turn. "
                         f"Request at most {config.max_tool_calls} tool calls per round. "
                         "Reuse context already collected and batch independent lookups. "
-                        "Reserve a tool round for apply_queries for an actionable data/query request, "
-                        "or save_function for a requested function edit, when that tool is available. "
-                        "Those tools validate before changing anything; do not use the last round only "
-                        "to validate a draft. Returning code or asking for approval is not completing "
-                        "an authorized edit. Complete the requested action before the final answer."
+                        "Reserve a tool round for save_function when the user requests a function save. "
+                        "For query edits, return a complete proposal for the IDE's Apply or auto-accept "
+                        "flow; do not ask permission to update the page or claim it is already applied."
                     )
                 else:
                     payload["tool_choice"] = "none"

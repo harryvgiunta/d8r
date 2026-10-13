@@ -156,3 +156,63 @@ def test_raw_predicate_limits_reject_deep_wide_and_cyclic_trees(payments):
             build(payments, {"dataset": "payments", "select": [
                 {"aggregate": {"fn": "sum", "arg": "amount", "where": where}}
             ]})
+
+
+@pytest.mark.parametrize("predicate", ["count(*) > 2", "total_count > 2"])
+def test_where_filters_aggregate_results_by_call_or_alias(payments, predicate):
+    assert run(payments, "region, count(*) as total_count",
+               f"\\where {predicate}\n\\order region") == [["north", 3]]
+
+
+def test_where_only_reductions_do_not_leak_into_projection(payments):
+    assert run(payments, "region", "\\where count(*) > 1\n\\order region") == [
+        ["north"], ["south"],
+    ]
+
+
+def test_row_conjuncts_filter_before_all_reductions(payments):
+    assert run(payments, "region, count(*) as n, sum(amount) as total",
+               "\\where status = 'paid' and (n > 1 and sum(amount) >= 100)\n\\order region") == [
+        ["north", 2, 100],
+    ]
+    assert run(payments, "p.region, count(*) as n, sum(p.amount) as total",
+               "\\join regions r on p.region = r.region\n"
+               "\\where p.id != 2 and n > 1 and sum(p.amount) >= 100\n\\order region",
+               source="payments p") == [["north", 2, 100], ["south", 2, 250]]
+
+
+def test_aggregate_or_keeps_group_keys_and_boolean_precedence(payments):
+    assert run(payments, "region, count(*) as n",
+               "\\where n > 2 or region = 'west'\n\\order region") == [["north", 3], ["west", 1]]
+    assert run(payments, "region, count(*) as n",
+               "\\where (n > 2 or region = 'west') and status = 'paid'\n\\order region") == []
+    with pytest.raises(PayloadError, match="(?i)group|aggregate"):
+        run(payments, "region, count(*) as n", "\\where n > 2 or status = 'pending'")
+
+
+def test_aggregate_alias_precedence_keeps_qualified_source_escape(payments):
+    assert run(payments, "region, count(*) as amount",
+               "\\where amount > 2 and p.amount >= 0\n\\order region", source="payments p") == []
+
+
+def test_aggregate_math_and_filtered_call_predicates(payments):
+    assert run(payments, "region, sum(amount) / 100 as dollars",
+               "\\where dollars > 2\n\\order region") == [["south", 2.5]]
+    assert run(payments, "region, count(*) as n",
+               "\\where count(* \\where status = 'paid') > 1\n\\order region") == [["north", 3]]
+
+
+def test_empty_global_aggregate_filters_after_reduction(payments):
+    assert run(payments, "count(*) as n", "\\where id < 0 and n = 0") == [[0]]
+    assert run(payments, "count(*) as n", "\\where id < 0 and count(*) > 0") == []
+
+
+def test_aggregate_predicate_operand_shapes_and_subquery_scope(payments):
+    assert run(payments, "region, count(*) as n",
+               "\\where count(*) between 2 and 3 and n in (2, 3) and sum(amount) is not null\n\\order region") == [
+        ["north", 3], ["south", 2],
+    ]
+    assert run(payments, "region, count(*) as n",
+               "\\where count(*) > (\\from regions \\select count(*) \\where status = 'keep')\n\\order region") == [
+        ["north", 3],
+    ]

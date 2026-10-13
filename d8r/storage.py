@@ -16,6 +16,8 @@ from uuid import UUID
 
 from d8r.ai.client import AIConfig
 from d8r.engine.datasources import DIALECT_BY_NAME
+from d8r.engine.connectors import profile_id, validate_profile
+from d8r.themes import DEFAULT_THEME, THEMES
 
 # How long a lock or temp file may exist before it is assumed to belong to a
 # crashed save. A save is two writes plus one fsync (sub-second), so anything
@@ -58,28 +60,38 @@ def _text(value: object, label: str, *, nonempty: bool = False) -> None:
 def _validate(value: object) -> dict:
     """Validate structure, never parse/execute bodies against the active schema."""
     if isinstance(value, dict):
-        value = {"postgres_profiles": [], **value}
-    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles"}, "memory")
+        value = {"postgres_profiles": [], "backend_profiles": [], **value}
+    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles", "backend_profiles"}, "memory")
     if type(document["version"]) is not int or document["version"] != 1:
         raise ValueError("unsupported memory version (expected 1)")
     functions = document["functions"]
-    if not isinstance(functions, list):
-        raise ValueError("functions must be a list")
-    names = set()
-    for function in functions:
-        fn = _record(function, {"name", "params", "body", "description"}, "function")
-        _text(fn["name"], "function name", nonempty=True)
-        _text(fn["body"], "function body")
-        _text(fn["description"], "function description")
-        if fn["name"] in names:
-            raise ValueError("duplicate function name")
-        names.add(fn["name"])
-        if not isinstance(fn["params"], list):
-            raise ValueError("function params must be an ordered list")
-        for param in fn["params"]:
-            _text(param, "function parameter", nonempty=True)
-        if len(set(fn["params"])) != len(fn["params"]):
-            raise ValueError("duplicate function parameter")
+    if isinstance(functions, dict):
+        for key in functions:
+            _text(key, "function source key", nonempty=True)
+        groups = functions.values()
+    elif isinstance(functions, list):
+        # Session binds legacy definitions after restoring the selected target.
+        groups = (functions,)
+    else:
+        raise ValueError("functions must map source keys to definition lists")
+    for group in groups:
+        if not isinstance(group, list):
+            raise ValueError("source functions must be a list")
+        names = set()
+        for function in group:
+            fn = _record(function, {"name", "params", "body", "description"}, "function")
+            _text(fn["name"], "function name", nonempty=True)
+            _text(fn["body"], "function body")
+            _text(fn["description"], "function description")
+            if fn["name"] in names:
+                raise ValueError("duplicate function name")
+            names.add(fn["name"])
+            if not isinstance(fn["params"], list):
+                raise ValueError("function params must be an ordered list")
+            for param in fn["params"]:
+                _text(param, "function parameter", nonempty=True)
+            if len(set(fn["params"])) != len(fn["params"]):
+                raise ValueError("duplicate function parameter")
     profiles = document["d1_profiles"]
     if not isinstance(profiles, list):
         raise ValueError("d1_profiles must be a list")
@@ -118,9 +130,22 @@ def _validate(value: object) -> dict:
         if identity in identities:
             raise ValueError("duplicate PostgreSQL profile")
         identities.add(identity)
+    backend_profiles = document["backend_profiles"]
+    if not isinstance(backend_profiles, list):
+        raise ValueError("backend_profiles must be a list")
+    normalized_profiles = []
+    identities = set()
+    for profile in backend_profiles:
+        _record(profile, {"backend", "options", "display"}, "backend profile")
+        normalized = validate_profile(profile)
+        identity = profile_id(normalized)
+        if identity in identities:
+            raise ValueError("duplicate backend profile")
+        identities.add(identity)
+        normalized_profiles.append(normalized)
     return {**document, "d1_profiles": [
         {**profile, "api_token": profile.get("api_token", "")} for profile in profiles
-    ]}
+    ], "backend_profiles": normalized_profiles}
 
 
 def _settings(value: object) -> dict:
@@ -128,10 +153,12 @@ def _settings(value: object) -> dict:
     defaults = {
         "version": 1, "intellisense": True,
         "entry_screen": False,
+        "theme": DEFAULT_THEME,
         "panes": {"results": True, "sql": True, "history": True, "schema": True,
                   "agents": True, "ai": False},
         "pane_sizes": {"explorer": 36, "ai": 44, "editor": 22},
         "source": "demo", "dialect": "duckdb",
+        "source_dialects": {},
         "default_rows": 50,
         "value_cache_enabled": True,
         "value_cache_limit": 1000,
@@ -149,6 +176,8 @@ def _settings(value: object) -> dict:
         raise ValueError("intellisense must be a boolean")
     if type(document["entry_screen"]) is not bool:
         raise ValueError("entry_screen must be a boolean")
+    if not isinstance(document["theme"], str) or document["theme"] not in THEMES:
+        raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
     for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes"):
@@ -171,6 +200,12 @@ def _settings(value: object) -> dict:
     _text(document["dialect"], "dialect", nonempty=True)
     if document["dialect"] not in DIALECT_BY_NAME:
         raise ValueError("unsupported dialect")
+    remembered = document["source_dialects"]
+    if not isinstance(remembered, dict) or any(
+        not isinstance(name, str) or not name or dialect not in DIALECT_BY_NAME
+        for name, dialect in remembered.items()
+    ):
+        raise ValueError("source_dialects must map source names to supported dialects")
     if type(document["default_rows"]) is not int or not 0 <= document["default_rows"] <= 1_000_000:
         raise ValueError("Default rows returned must be an integer between 0 and 1000000 (0 disables the default).")
     ai = document["ai"]
@@ -317,12 +352,16 @@ class MemoryStore(_JSONStore):
     """Durable function definitions and saved database credentials (schema v1)."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        super().__init__(data_dir, "memory", {"version": 1, "functions": [], "d1_profiles": [], "postgres_profiles": []}, _validate)
+        super().__init__(data_dir, "memory", {
+            "version": 1, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": [],
+        }, _validate)
 
-    def save(self, functions: list[dict], profiles: list[dict[str, str]],
-             postgres_profiles: list[dict[str, str]] | None = None) -> None:
+    def save(self, functions: dict[str, list[dict]], profiles: list[dict[str, str]],
+             postgres_profiles: list[dict[str, str]] | None = None,
+             backend_profiles: list[dict] | None = None) -> None:
         self._save({"version": 1, "functions": functions, "d1_profiles": profiles,
-                    "postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles})
+                    "postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles,
+                    "backend_profiles": self.document["backend_profiles"] if backend_profiles is None else backend_profiles})
 
 
 class SettingsStore(_JSONStore):
@@ -391,12 +430,23 @@ def _chat_messages(messages: object) -> None:
         raise ValueError("incomplete saved conversation")
 
 
+def _function_draft(draft: object) -> None:
+    if draft is None:
+        return
+    _record(draft, {"identity", "source", "selected", "name", "description", "parameters",
+                    "body", "arguments", "cursor"}, "function draft")
+    for name, text in draft.items():
+        if name != "cursor":
+            _text(text, f"function draft {name}")
+    _cursor(draft["cursor"])
+
+
 def _workspace_document(value: object) -> dict:
     if isinstance(value, dict):
-        value = {"pages": [], "explorer_tab": "schema", **value}
+        value = {"pages": [], "explorer_tab": "schema", "source_workspaces": {}, **value}
     document = _record(value, {
         "version", "document", "document_id", "cursor", "source", "dialect", "sources",
-        "active_view", "function_draft", "chats", "history", "pages", "explorer_tab",
+        "active_view", "function_draft", "chats", "history", "pages", "explorer_tab", "source_workspaces",
     }, "workspace")
     if type(document["version"]) is not int or document["version"] != 1:
         raise ValueError("unsupported workspace version (expected 1)")
@@ -406,14 +456,16 @@ def _workspace_document(value: object) -> dict:
         _text(document[name], f"workspace {name}")
     if document["dialect"] and document["dialect"] not in DIALECT_BY_NAME:
         raise ValueError("unsupported workspace dialect")
-    if document["explorer_tab"] not in ("schema", "pages", "agents"):
+    if document["explorer_tab"] not in ("schema", "pages", "functions", "agents"):
         raise ValueError("invalid explorer tab")
     if not isinstance(document["pages"], list):
         raise ValueError("invalid query pages")
     page_ids: set[str] = set()
     for page in document["pages"]:
-        _record(page, {"id", "title", "document", "cursor", "source", "dialect"}, "query page")
-        for name in ("id", "title", "document", "source", "dialect"):
+        if isinstance(page, dict):
+            page.setdefault("description", "")
+        _record(page, {"id", "title", "description", "document", "cursor", "source", "dialect"}, "query page")
+        for name in ("id", "title", "description", "document", "source", "dialect"):
             _text(page[name], f"query page {name}", nonempty=name == "id")
         if page["id"] in page_ids:
             raise ValueError("duplicate query page identity")
@@ -431,14 +483,18 @@ def _workspace_document(value: object) -> dict:
         _record(source, {"id", "display", "kind", "path"}, "workspace source")
         for name, text in source.items():
             _text(text, f"workspace source {name}")
-    draft = document["function_draft"]
-    if draft is not None:
-        _record(draft, {"identity", "source", "selected", "name", "description", "parameters",
-                        "body", "arguments", "cursor"}, "function draft")
-        for name, text in draft.items():
-            if name != "cursor":
-                _text(text, f"function draft {name}")
-        _cursor(draft["cursor"])
+    _function_draft(document["function_draft"])
+    if not isinstance(document["source_workspaces"], dict):
+        raise ValueError("invalid source workspaces")
+    for key, workspace in document["source_workspaces"].items():
+        _text(key, "workspace source key", nonempty=True)
+        _record(workspace, {"document_id", "function_draft", "active_view"}, "source workspace")
+        _text(workspace["document_id"], "source workspace document_id")
+        if workspace["active_view"] not in ("workspace", "function"):
+            raise ValueError("invalid source workspace view")
+        _function_draft(workspace["function_draft"])
+        if workspace["function_draft"] is not None and workspace["function_draft"]["source"] != key:
+            raise ValueError("function draft belongs to a different source workspace")
     if not isinstance(document["chats"], dict):
         raise ValueError("invalid saved chats")
     for key, chat in document["chats"].items():
@@ -483,7 +539,7 @@ class WorkspaceStore(_JSONStore):
             "version": 1, "document": None, "document_id": "", "cursor": [0, 0],
             "source": "", "dialect": "", "sources": {}, "active_view": "workspace",
             "function_draft": None, "chats": {}, "history": [],
-            "pages": [], "explorer_tab": "schema",
+            "pages": [], "explorer_tab": "schema", "source_workspaces": {},
         }, _workspace_document)
 
     def save(self, document: dict) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
+import pytest
+
 from textual.widgets import Input, OptionList, Select, TextArea
 
 from d8r.engine import add_sqlite_source
@@ -80,6 +82,8 @@ def test_button_draft_neither_infers_parameters_nor_saves_invalid_body_on_cancel
         app = D8RApp(session)
         async with app.run_test(size=(150, 58)) as pilot:
             app.editor.load_text(document)
+            await pilot.pause()
+            await pilot.click("#--content-tab-tab-functions")
             await pilot.pause()
             await pilot.click("#query-to-fn")
             await pilot.pause()
@@ -164,5 +168,49 @@ def test_prefill_never_overwrites_saved_entries_or_later_new_drafts():
             assert session.fns["saved_events"].body == saved_body
             assert session.storage_path.read_bytes() == persisted
             assert session.history == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("open_current", [True, False])
+def test_explorer_pages_return_from_function_editor_without_losing_draft(tmp_path, open_current):
+    async def scenario():
+        session = Session(data_dir=tmp_path)
+        body = "\\from events\n\\limit 2"
+        session.save_fn("saved_events", "", body, "")
+        app = D8RApp(session)
+        async with app.run_test(size=(150, 58)) as pilot:
+            first_document = "\\from users\n\\limit 3"
+            app.editor.load_text(first_document)
+            await pilot.pause()
+            first_page = app._document_identity
+            app._new_page()
+            second_document = "\\from events\n\\limit 4"
+            app.editor.load_text(second_document)
+            await pilot.pause()
+            page_id = app._document_identity if open_current else first_page
+            await pilot.click("#--content-tab-tab-functions")
+            await pilot.pause()
+            assert not app.function_mode
+            await pilot.click("#fn-list", offset=(3, 0))
+            await pilot.pause()
+            assert app.function_mode
+            assert app.query_one("#fn-body", TextArea).text == body
+            draft = body + "\n\\select user_id"
+            app.query_one("#fn-body", TextArea).load_text(draft)
+            await pilot.click("#--content-tab-tab-pages")
+            await pilot.pause()
+            pages = app.query_one("#pages-list", OptionList)
+            pages.highlighted = pages.get_option_index(page_id)
+            pages.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not app.function_mode
+            assert app.editor.text == (second_document if open_current else first_document)
+            app.action_fn()
+            await pilot.pause()
+            assert app.query_one("#fn-body", TextArea).text == draft
+            assert session.fns["saved_events"].body == body
+            assert not session.history
 
     asyncio.run(scenario())

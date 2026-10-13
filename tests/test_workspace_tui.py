@@ -63,7 +63,6 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
             assert reopened.session.source_key() == target
             assert reopened.query_one("#source-select", Select).value == reopened.session.active_id
             assert "disconnected" in reopened.session.source.display
-            assert str(reopened.query_one("#backend-pill", Static).content) == "disconnected"
             assert not reopened.query_one("#schema-tree").root.children
             assert reopened.query_one("#dialect-select", Select).value == "sqlite"
             assert reopened.query_one("#history-table", DataTable).row_count == 1
@@ -217,7 +216,6 @@ def test_history_restores_snapshot_offline_and_run_reconnects_automatically(tmp_
             assert reopened.session.source_key() == target
             assert reopened._ai_target().identity == identity
             assert reopened.query_one("#source-select", Select).value == reopened.session.active_id
-            assert "disconnected" not in str(reopened.query_one("#backend-pill", Static).content)
             assert str(reopened.query_one("#results-table", DataTable).get_cell_at((0, 0))) == "123"
             assert len(reopened.session.history) == 2
             assert reopened.query_one("#schema-tree").root.children
@@ -279,8 +277,9 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
             assert screen._ai_target().identity == identity
             assert not reopened.session.source_connected(screen.source_id)
             assert "disconnected" in reopened.session.sources[screen.source_id].display
-            assert reopened.session.active_id == "demo"
-            assert reopened.session.fns["saved_events"].body == original
+            assert reopened.session.active_id == screen.source_id
+            assert reopened.session.functions_for("demo")["saved_events"].body == original
+            assert "saved_events" not in reopened.session.fns
             assert "draft_events" not in reopened.session.fns
             assert not reopened.session.history
             assert screen.preview_grid.row_count == 0
@@ -303,12 +302,12 @@ def test_function_restart_restores_unsaved_draft_without_saving_definition(tmp_p
             assert screen.query_one("#fn-name", Input).value == ""
             assert screen.query_one("#fn-body", TextArea).text == ""
             assert screen._ai_target().identity != identity
-            assert screen.source_id == "demo"
+            assert screen.source_id == third.session.active_id
 
     asyncio.run(workspace_then_new_draft())
 
 
-def test_function_preview_follows_a_reconnect_from_the_workspace(tmp_path):
+def test_function_preview_follows_a_reconnect_from_the_workspace(tmp_path, monkeypatch):
     """A reconnect retitles the draft's dead target key; preview must follow.
 
     The draft names its disconnected target by identity key. Registering the
@@ -336,10 +335,15 @@ def test_function_preview_follows_a_reconnect_from_the_workspace(tmp_path):
             app.exit()
 
     asyncio.run(edit_draft())
+    # This is now the selected workspace, so startup attempts to reconnect it.
+    # Leave that attempt offline to exercise the later explicit reconnect path.
+    monkeypatch.setattr("d8r.tui.app.build_saved_source", _forbidden)
     reopened = D8RApp(Session(data_dir=data_dir))
 
     async def reconnect_and_preview():
         async with reopened.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            await reopened.workers.wait_for_complete()
             await pilot.pause()
             screen = reopened.function_editor
             key = screen.source_id
@@ -549,3 +553,47 @@ def test_page_deletion_preserves_other_drafts_and_retries_failed_last_page_save(
     assert [page["id"] for page in restored.workspace["pages"]] == [blank_id]
     assert set(restored.load_chats()) == {survivor_id}
     assert restored.history == history
+
+
+def test_pages_search_all_sources_and_metadata_without_changing_query(tmp_path):
+    session = Session(data_dir=tmp_path)
+    session.workspace["pages"] = [
+        {"id": "p1", "title": "Monthly revenue", "description": "Paid orders",
+         "document": "\\from events\\limit 1", "cursor": [0, 0],
+         "source": "demo", "dialect": "duckdb"},
+        {"id": "p2", "title": "Customers", "description": "Annual retention",
+         "document": "\\from customers\\select email", "cursor": [0, 0],
+         "source": "postgres", "dialect": "postgres"},
+    ]
+    session.save_workspace(document_id="p1", document="\\from events\\limit 1",
+                           source="demo", dialect="duckdb")
+    app = D8RApp(session)
+
+    async def scenario():
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            app.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
+            listing = app.query_one("#pages-list", OptionList)
+            search = app.query_one("#page-search", Input)
+            for text, expected in (("REVENUE", {"p1"}), ("retention", {"p2"}),
+                                   ("email", {"p2"}), ("no matches", set()),
+                                   ("", {"p1", "p2"})):
+                search.value = text
+                await pilot.pause()
+                assert {option.id for option in listing.options} == expected
+                assert app._document_identity == "p1"
+                assert app.editor.text == "\\from events\\limit 1"
+                assert not session.history
+            search.value = "email"
+            await pilot.pause()
+            listing.focus()
+            listing.highlighted = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._document_identity == "p2"
+            assert app.session.source_key() == "postgres"
+            assert app.editor.text == "\\from customers\\select email"
+            assert search.value == "email"
+            assert not session.history
+
+    asyncio.run(scenario())

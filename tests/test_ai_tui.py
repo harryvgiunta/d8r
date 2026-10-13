@@ -500,7 +500,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
                 await click(pilot, panel.query_one("#ai-send", Button))
                 assert await asyncio.to_thread(started.wait, 2)
                 await click(pilot, panel.query_one("#ai-cancel", Button))
-                await click(pilot, panel.query_one("#ai-close", Button))
+                await click(pilot, app.query_one("#assistant-close", Button))
                 await pilot.press("ctrl+enter")
                 assert not app.run_busy
                 assert "unavailable" in str(app.query_one("#status", Static).content)
@@ -582,7 +582,8 @@ def test_function_make_ai_uses_draft_and_requires_apply_then_save(monkeypatch):
             assert not app.session.storage_path.exists()
             await click(pilot, screen.query_one("#fn-save", Button))
             assert app.session.fns["categories"].body == body
-            assert app.session.active_id == "demo"
+            assert app.session.active_id == "mysql"
+            assert "categories" not in app.session.functions_for("demo")
     asyncio.run(scenario())
 
 
@@ -612,6 +613,24 @@ def test_context_pins_source_bounds_samples_and_never_runs_suggested_text():
         assert len(session.history) == 2
         assert "events" in session.sources["demo"].datasets
     asyncio.run(scenario())
+
+
+def test_function_ai_baseline_tracks_its_source_not_the_visible_library():
+    session = Session()
+    session.save_fn("local", "", "\\from events", "Demo")
+    with session.target_source("mysql"):
+        session.save_fn("local", "", "\\from products", "MySQL")
+    context = AIContext(session, "mysql", "")
+    metadata = {"kind": "function", "original_name": "local", "name": "local",
+                "description": "Updated MySQL", "parameters": [], "arguments": ""}
+    proposal = context.read_proposal("```json\n" + json.dumps(metadata)
+                                     + "\n```\n```d8r\n\\from products\n\\limit 2\n```")
+    assert context.validate_replacement(proposal) is None
+    session.save_fn("local", "", "\\from users", "Changed demo")
+    assert context.validate_replacement(proposal) is None
+    with session.target_source("mysql"):
+        session.save_fn("local", "", "\\from products\n\\limit 1", "Changed MySQL")
+    assert context.validate_replacement(proposal) is not None
 
 
 def test_complete_function_proposals_reject_invalid_or_conflicting_definitions():
@@ -671,16 +690,12 @@ QUERY_UPDATES = (
 )
 
 
-def query_tool_frame(arguments):
-    call = {"index": 0, "id": "queries-1", "type": "function", "function": {
-        "name": "apply_queries", "arguments": json.dumps(arguments),
-    }}
-    return frame({"tool_calls": [call]}) + frame({}, "tool_calls") + b"data: [DONE]\n\n"
+def query_answer(updates=QUERY_UPDATES):
+    metadata = {"kind": "queries", "titles": [query["title"] for query in updates]}
+    return "```json\n" + json.dumps(metadata) + "\n```\n" + "\n".join(
+        "```d8r\n" + query["body"] + "\n```" for query in updates)
 
 
-def query_tool_result(request):
-    return next(json.loads(message["content"]) for message in request["messages"]
-                if message.get("tool_call_id") == "queries-1")
 
 
 def query_workspace():
@@ -727,23 +742,21 @@ def assert_query_receipt(panel):
     assert "applied" in transcript.casefold() or "updated" in transcript.casefold()
 
 
-def test_direct_query_batch_updates_all_pages_preserves_results_and_survives_restart(monkeypatch):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_query_batch_proposal_applies_all_pages_preserves_results_and_survives_restart(monkeypatch, automatic):
     requests = []
 
     def provider(request):
         body = json.loads(request.content)
         requests.append(body)
-        if len(requests) == 1:
-            data = query_tool_frame({"queries": QUERY_UPDATES})
-        else:
-            # A post-commit answer must not become a second, unrequested replacement.
-            data = completion(ANSWER)
-        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                              content=completion(query_answer()))
 
     install_provider(monkeypatch, provider)
 
     async def scenario():
         session = query_workspace()
+        session.update_settings(ai_auto_accept=automatic)
         unrelated = deepcopy(session.workspace["pages"][0])
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
@@ -755,13 +768,17 @@ def test_direct_query_batch_updates_all_pages_preserves_results_and_survives_res
             assert result[1]  # The preserved result is from a real engine run.
             history = list(session.history)
             source = (session.active_id, session.dialect)
-            assert not session.ai_auto_accept
+            original = deepcopy(session.workspace["pages"])
             app.action_ai()
             panel = app.ai_panel
             panel.query_one("#ai-input", TextArea).load_text("Replace this query with Recent events and create Users and Event users pages")
             panel.action_send()
             await query_chat_finished(panel.chat)
             await pilot.pause()
+            if not automatic:
+                assert session.workspace["pages"] == original
+                assert not panel.query_one("#ai-apply", Button).disabled
+                await click(pilot, panel.query_one("#ai-apply", Button))
             assert app.editor.text == QUERY_UPDATES[0]["body"]
             assert_query_pages(session.workspace)
             assert next(page for page in session.workspace["pages"] if page["id"] == "unrelated-page") == unrelated
@@ -771,9 +788,6 @@ def test_direct_query_batch_updates_all_pages_preserves_results_and_survives_res
             assert app.pane_visible("schema")
             assert app.query_one("#explorer-tabs", TabbedContent).active == "tab-pages"
             assert panel.query_one("#ai-apply", Button).disabled
-            assert query_tool_result(requests[-1]) == {
-                "applied": True, "titles": [query["title"] for query in QUERY_UPDATES], "executed": False,
-            }
             assert_query_receipt(panel)
         restored = Session()
         assert_query_pages(restored.workspace)
@@ -793,22 +807,24 @@ def test_direct_query_batch_updates_all_pages_preserves_results_and_survives_res
 
 @pytest.mark.parametrize("later", [
     {"title": "Invalid later query", "body": "\\from events\n\\bogus"},
-    {"title": "Unexpected field", "body": PROPOSAL, "overwrite": True},
+    {"title": "Invalid CTE field", "body": "\\with selected\n  \\from events\n  \\select event_type as kind\n\\select event_type"},
     {"title": ["Not a label"], "body": PROPOSAL},
-], ids=["invalid-later-document", "extra-nested-field", "non-string-label"])
-def test_invalid_query_batch_rejects_every_page_before_mutating(later, monkeypatch):
+], ids=["invalid-later-document", "missing-cte-field", "non-string-label"])
+@pytest.mark.parametrize("automatic", [False, True])
+def test_invalid_query_batch_rejects_every_page_before_mutating(later, automatic, monkeypatch):
     requests = []
 
     def provider(request):
         body = json.loads(request.content)
         requests.append(body)
-        data = query_tool_frame({"queries": [QUERY_UPDATES[0], later]}) if len(requests) == 1 else completion("No changes.")
+        data = completion(query_answer([QUERY_UPDATES[0], later]))
         return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data)
 
     install_provider(monkeypatch, provider)
 
     async def scenario():
         session = query_workspace()
+        session.update_settings(ai_auto_accept=automatic)
         original = deepcopy(session.workspace)
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
@@ -818,13 +834,42 @@ def test_invalid_query_batch_rejects_every_page_before_mutating(later, monkeypat
             panel.action_send()
             await query_chat_finished(panel.chat)
             await pilot.pause()
-            result = query_tool_result(requests[-1])
-            assert result["applied"] is False and result["error"]
+            assert panel.chat.validation_error or panel.chat.status == "error"
+            if panel.chat.proposal is not None:
+                assert not panel.manager.apply(panel.chat, panel, automatic=automatic)
             assert app.editor.text == original["document"]
             assert session.workspace["pages"] == original["pages"]
             assert Session().workspace["pages"] == original["pages"]
             assert not session.history
             assert panel.query_one("#ai-apply", Button).disabled
+    asyncio.run(scenario())
+
+
+def test_completed_proposal_checks_cached_fields_while_source_is_busy(monkeypatch):
+    async def scenario():
+        session = configured()
+        invalid = "\\with selected\n  \\from events\n  \\select event_type as kind\n\\select event_type"
+
+        def provider(request):
+            session.busy = "Query running"
+            answer = "```d8r\n" + invalid + "\n```"
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=completion(answer))
+
+        install_provider(monkeypatch, provider)
+        app = D8RApp(session)
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.action_ai()
+            panel = app.ai_panel
+            panel.query_one("#ai-input", TextArea).load_text("Show event types")
+            panel.action_send()
+            try:
+                await finished(panel)
+                await pilot.pause()
+                assert panel.chat.validation_error is not None
+                assert panel.chat.status == "error"
+                assert panel.query_one("#ai-apply", Button).disabled
+            finally:
+                session.busy = ""
     asyncio.run(scenario())
 
 
@@ -840,7 +885,7 @@ def test_delayed_query_batch_cannot_write_after_target_changes_or_cancellation(c
                 yield frame({"content": "Preparing the requested documents."})
                 started.set()
                 await release.wait()
-                yield query_tool_frame({"queries": QUERY_UPDATES})
+                yield completion(query_answer())
 
             async def aclose(self):
                 closed.set()
@@ -855,6 +900,7 @@ def test_delayed_query_batch_cannot_write_after_target_changes_or_cancellation(c
 
         install_provider(monkeypatch, provider)
         session = query_workspace()
+        session.update_settings(ai_auto_accept=True)
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
             app.action_ai()
@@ -875,6 +921,9 @@ def test_delayed_query_batch_cannot_write_after_target_changes_or_cancellation(c
                     await click(pilot, panel.query_one("#ai-cancel", Button))
                     await asyncio.wait_for(closed.wait(), 5)
                 await pilot.pause(0.3)
+                # Baseline the user's edit, not a still-pending autosave. This
+                # scenario tests stale AI writes, not debounce timing.
+                app._flush_workspace()
                 editor = app.editor.text
                 pages = deepcopy(session.workspace["pages"])
                 target = (session.workspace["document_id"], session.active_id, session.dialect)
@@ -892,91 +941,55 @@ def test_delayed_query_batch_cannot_write_after_target_changes_or_cancellation(c
 
 
 @pytest.mark.parametrize("ending", ["provider-failure", "cancel"])
-def test_committed_query_batch_survives_failed_or_cancelled_answer_with_ide_receipt(ending, monkeypatch):
+def test_incomplete_query_proposal_never_applies_even_with_auto_accept(ending, monkeypatch):
     async def scenario():
-        committed = asyncio.Event()
-        requests = []
+        partial = asyncio.Event()
 
         class PendingAnswer(httpx.AsyncByteStream):
             async def __aiter__(self):
-                yield frame({"content": "Additional commentary is pending."})
+                yield frame({"content": query_answer()})
+                partial.set()
+                if ending == "provider-failure":
+                    raise httpx.ReadError("Interrupted stream")
                 await asyncio.Event().wait()
 
-        def provider(request):
-            body = json.loads(request.content)
-            requests.append(body)
-            if len(requests) == 1:
-                return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
-                                     content=query_tool_frame({"queries": QUERY_UPDATES}))
-            committed.set()
-            if ending == "provider-failure":
-                return httpx.Response(503, text="Unavailable")
-            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=PendingAnswer())
-
-        install_provider(monkeypatch, provider)
+        install_provider(monkeypatch, lambda request: httpx.Response(
+            200, headers={"Content-Type": "text/event-stream"}, stream=PendingAnswer()))
         session = query_workspace()
+        session.update_settings(ai_auto_accept=True)
+        original = deepcopy(session.workspace["pages"])
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
             app.action_ai()
             panel = app.ai_panel
-            panel.query_one("#ai-input", TextArea).load_text("Update the editor and create the three named query pages")
+            panel.query_one("#ai-input", TextArea).load_text("Update these query pages")
             panel.action_send()
             chat = panel.chat
-            await asyncio.wait_for(committed.wait(), 5)
-            assert app.editor.text == QUERY_UPDATES[0]["body"]
+            await asyncio.wait_for(partial.wait(), 5)
             if ending == "cancel":
                 await click(pilot, panel.query_one("#ai-cancel", Button))
             await query_chat_finished(chat)
             await pilot.pause()
-            assert_query_pages(session.workspace)
-            assert_query_pages(Session().workspace)
-            assert not session.history
-            assert panel.query_one("#ai-apply", Button).disabled
-            assert query_tool_result(requests[-1])["applied"] is True
-            assert_query_receipt(panel)
-            if ending == "provider-failure":
-                assert "503" in str(panel.query_one("#ai-status", Static).content)
-    asyncio.run(scenario())
-
-
-def test_preview_query_batch_waits_for_manual_apply_then_creates_all_pages(monkeypatch):
-    metadata = {"kind": "queries", "titles": [query["title"] for query in QUERY_UPDATES]}
-    answer = "```json\n" + json.dumps(metadata) + "\n```\n" + "\n".join(
-        "```d8r\n" + query["body"] + "\n```" for query in QUERY_UPDATES)
-    install_provider(monkeypatch, lambda request: httpx.Response(
-        200, headers={"Content-Type": "text/event-stream"}, content=completion(answer)))
-
-    async def scenario():
-        session = query_workspace()
-        original = deepcopy(session.workspace["pages"])
-        app = D8RApp(session)
-        async with app.run_test(size=(160, 62)) as pilot:
-            assert not session.ai_auto_accept
-            app.action_ai()
-            panel = app.ai_panel
-            panel.query_one("#ai-input", TextArea).load_text("Only preview three labeled queries; do not change my editor yet")
-            panel.action_send()
-            await query_chat_finished(panel.chat)
-            await pilot.pause()
-            assert app.editor.text == original[-1]["document"]
             assert session.workspace["pages"] == original
-            assert Session().workspace["pages"] == original
-            assert not panel.query_one("#ai-apply", Button).disabled
-            await click(pilot, panel.query_one("#ai-apply", Button))
-            assert app.editor.text == QUERY_UPDATES[0]["body"]
-            assert_query_pages(session.workspace)
+            assert app.editor.text == original[-1]["document"]
             assert not session.history
             assert panel.query_one("#ai-apply", Button).disabled
     asyncio.run(scenario())
 
 
-def test_function_form_cannot_use_query_batch_tool_to_mutate_workspace(monkeypatch):
+
+
+@pytest.mark.parametrize("function_mode", [False, True])
+def test_provider_cannot_use_removed_query_mutation_tool(monkeypatch, function_mode):
     requests = []
 
     def provider(request):
         body = json.loads(request.content)
         requests.append(body)
-        data = query_tool_frame({"queries": QUERY_UPDATES}) if len(requests) == 1 else completion("No changes.")
+        call = {"index": 0, "id": "forbidden", "type": "function", "function": {
+            "name": "apply_queries", "arguments": json.dumps({"queries": QUERY_UPDATES})}}
+        data = (frame({"tool_calls": [call]}) + frame({}, "tool_calls") + b"data: [DONE]\n\n"
+                if len(requests) == 1 else completion("No changes."))
         return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=data)
 
     install_provider(monkeypatch, provider)
@@ -986,21 +999,29 @@ def test_function_form_cannot_use_query_batch_tool_to_mutate_workspace(monkeypat
         pages = deepcopy(session.workspace["pages"])
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
-            app.action_fn()
-            await pilot.pause()
-            screen = app.function_editor
-            screen.query_one("#fn-name", Input).value = "Draft function"
-            screen.query_one("#fn-body", TextArea).load_text(PROPOSAL)
-            await click(pilot, screen.query_one("#fn-ai", Button))
-            panel = screen.ai_panel
+            original = app.editor.text
+            if function_mode:
+                app.action_fn()
+                await pilot.pause()
+                screen = app.function_editor
+                screen.query_one("#fn-name", Input).value = "Draft function"
+                screen.query_one("#fn-body", TextArea).load_text(PROPOSAL)
+                await click(pilot, screen.query_one("#fn-ai", Button))
+            else:
+                app.action_ai()
+            panel = app.ai_panel
             panel.query_one("#ai-input", TextArea).load_text("Create these query pages")
             panel.action_send()
             await query_chat_finished(panel.chat)
             await pilot.pause()
             assert "apply_queries" not in {tool["function"]["name"] for tool in requests[0]["tools"]}
-            assert query_tool_result(requests[-1])["error"]
+            result = next(json.loads(message["content"]) for message in requests[-1]["messages"]
+                          if message.get("tool_call_id") == "forbidden")
+            assert result["error"]
             assert session.workspace["pages"] == pages
-            assert screen.query_one("#fn-body", TextArea).text == PROPOSAL
-            assert screen.query_one("#fn-name", Input).value == "Draft function"
+            assert app.editor.text == original
+            if function_mode:
+                assert screen.query_one("#fn-body", TextArea).text == PROPOSAL
+                assert screen.query_one("#fn-name", Input).value == "Draft function"
             assert not session.fns and not session.history
     asyncio.run(scenario())

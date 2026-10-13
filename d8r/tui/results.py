@@ -8,13 +8,15 @@ import io
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from rich.style import Style
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Text
+from textual.coordinate import Coordinate
 from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Select, Static
@@ -33,7 +35,7 @@ class ResultSnapshot:
 
 
 class ResultsTable(DataTable):
-    """A cell-cursor grid with independent row selection and column resizing."""
+    """Buffered cell ranges, whole-row selection, and column resizing."""
 
     COMPONENT_CLASSES = DataTable.COMPONENT_CLASSES | {"results--selected-row"}
     DEFAULT_CSS = """
@@ -48,14 +50,18 @@ class ResultsTable(DataTable):
     }
     """
     BINDINGS = [
-        Binding("shift+left", "narrow_column", "Narrow column", show=False),
-        Binding("shift+right", "widen_column", "Widen column", show=False),
-        Binding("shift+up", "extend_rows(-1)", "Extend rows up", show=False),
-        Binding("shift+down", "extend_rows(1)", "Extend rows down", show=False),
+        Binding("alt+left", "narrow_column", "Narrow column", show=False),
+        Binding("alt+right", "widen_column", "Widen column", show=False),
+        Binding("shift+left", "extend_selection(0,-1)", "Extend selection left", show=False),
+        Binding("shift+right", "extend_selection(0,1)", "Extend selection right", show=False),
+        Binding("shift+up", "extend_selection(-1,0)", "Extend selection up", show=False),
+        Binding("shift+down", "extend_selection(1,0)", "Extend selection down", show=False),
+        Binding("shift+space", "select_row", "Select row", show=False),
+        Binding("ctrl+space", "select_column", "Select column", show=False),
         Binding("space", "toggle_row", "Toggle row", show=False),
         Binding("ctrl+a", "select_all_rows", "Select buffered rows", show=False),
-        Binding("escape", "clear_rows", "Clear row selection", show=False),
-        Binding("ctrl+c,super+c", "copy_rows", "Copy rows", show=False),
+        Binding("escape", "clear_selection", "Clear selection", show=False),
+        Binding("ctrl+c,super+c", "copy_selection", "Copy selection", show=False),
     ]
 
     def __init__(self, *args, **kwargs) -> None:
@@ -63,10 +69,13 @@ class ResultsTable(DataTable):
         self.raw_rows: tuple[tuple[object, ...], ...] = ()
         self.result_total = 0
         self.selected_rows: set[int] = set()
-        self._range_anchor: int | None = None
-        self._range_end: int | None = None
+        self._cell_bounds: tuple[int, int, int, int] | None = None
+        self._range_anchor: Coordinate | None = None
+        self._selection_mode: Literal["cell", "row", "column"] = "cell"
+        self._extending = False
+        self._dragging = False
         super().__init__(*args, **kwargs)
-        self.border_title = "Shift+↑/↓ range · Space toggle · Ctrl+C copy"
+        self.border_title = "Drag / Shift+arrows select · Ctrl+C copy · Alt+←/→ resize"
         self._selection_caption()
 
     def show_result(self, outcome: RunOutcome) -> None:
@@ -75,8 +84,8 @@ class ResultsTable(DataTable):
         self.raw_columns = tuple(outcome.columns) if not outcome.error else ()
         self.raw_rows = tuple(tuple(row) for row in outcome.rows) if self.raw_columns else ()
         self.result_total = outcome.total if self.raw_columns else 0
-        self._range_anchor = self._range_end = None
-        self._set_selection(set())
+        self._end_drag()
+        self.action_clear_selection()
         if not self.raw_columns:
             return
         self.add_columns(*[
@@ -84,20 +93,24 @@ class ResultsTable(DataTable):
             if index < len(outcome.dtypes) and outcome.dtypes[index] else Text(name)
             for index, name in enumerate(self.raw_columns)
         ])
-        self.add_rows([
-            [Text("NULL", style="dim") if value is None else Text(str(value)) for value in row]
-            for row in self.raw_rows
-        ])
+        for index, row in enumerate(self.raw_rows):
+            self.add_row(*[
+                Text("NULL", style="dim") if value is None else Text(str(value)) for value in row
+            ], label=str(index + 1))
         self.move_cursor(row=0, column=0)
 
     def _selection_caption(self) -> None:
+        if self._cell_bounds is not None:
+            top, left, bottom, right = self._cell_bounds
+            selected = f"{(bottom - top + 1) * (right - left + 1):,} cells"
+        else:
+            selected = f"{len(self.selected_rows):,} rows"
         self.border_subtitle = (
-            f"{len(self.selected_rows):,} selected · {len(self.raw_rows):,} buffered / "
+            f"{selected} selected · {len(self.raw_rows):,} buffered / "
             f"{self.result_total:,} total · preview cap {PREVIEW_ROW_CAP:,}"
         )
 
-    def _set_selection(self, rows: set[int]) -> None:
-        self.selected_rows = rows
+    def _selection_changed(self) -> None:
         # Textual 8's row and line caches do not include owner selection state.
         self._clear_caches()
         self._selection_caption()
@@ -110,51 +123,166 @@ class ResultsTable(DataTable):
             style += self.get_component_rich_style("results--selected-row")
         return style
 
-    def action_cursor_up(self) -> None:
-        self._range_anchor = self._range_end = None
-        super().action_cursor_up()
+    def _render_cell(self, row_index: int, column_index: int, base_style: Style,
+                     width: int, cursor: bool = False, hover: bool = False):
+        selected = row_index in self.selected_rows
+        if self._cell_bounds is not None:
+            top, left, bottom, right = self._cell_bounds
+            selected = (left <= column_index <= right and
+                        (top <= row_index <= bottom or
+                         row_index == -1 and self._selection_mode == "column"))
+        if selected:
+            base_style += self.get_component_rich_style("results--selected-row")
+            hover = False
+        return super()._render_cell(row_index, column_index, base_style, width, cursor, hover)
 
-    def action_cursor_down(self) -> None:
-        self._range_anchor = self._range_end = None
-        super().action_cursor_down()
+    def watch_cursor_coordinate(self, old_coordinate: Coordinate, new_coordinate: Coordinate) -> None:
+        super().watch_cursor_coordinate(old_coordinate, new_coordinate)
+        if not self._extending:
+            self._range_anchor = None
+            self._selection_mode = "cell"
+            if self._cell_bounds is not None:
+                self._cell_bounds = None
+                self._selection_changed()
 
-    def action_extend_rows(self, delta: int) -> None:
+    def _select_to(self, target: Coordinate) -> None:
         if not self.raw_rows:
             return
-        current = self.cursor_row
-        if self._range_anchor is None or current != self._range_end:
-            self._range_anchor = current
-        target = max(0, min(len(self.raw_rows) - 1, current + delta))
-        self.move_cursor(row=target)
-        self._range_end = target
-        first, last = sorted((self._range_anchor, target))
-        self._set_selection(set(range(first, last + 1)))
+        anchor = self._range_anchor or self.cursor_coordinate
+        target = Coordinate(max(0, min(len(self.raw_rows) - 1, target.row)),
+                            max(0, min(len(self.raw_columns) - 1, target.column)))
+        self._extending = True
+        try:
+            self.move_cursor(row=target.row, column=target.column, animate=False)
+        finally:
+            self._extending = False
+        self._range_anchor = anchor
+        top, bottom = sorted((anchor.row, target.row))
+        left, right = sorted((anchor.column, target.column))
+        self.selected_rows = set()
+        self._cell_bounds = None
+        if self._selection_mode == "row":
+            self.selected_rows = set(range(top, bottom + 1))
+        else:
+            if self._selection_mode == "column":
+                top, bottom = 0, len(self.raw_rows) - 1
+            self._cell_bounds = top, left, bottom, right
+        self._selection_changed()
+
+    def action_extend_selection(self, rows: int, columns: int) -> None:
+        self._set_hover_cursor(False)
+        self._select_to(Coordinate(self.cursor_row + rows, self.cursor_column + columns))
+
+    def action_select_row(self) -> None:
+        self._range_anchor = self.cursor_coordinate
+        self._selection_mode = "row"
+        self._select_to(self.cursor_coordinate)
+
+    def action_select_column(self) -> None:
+        self._range_anchor = self.cursor_coordinate
+        self._selection_mode = "column"
+        self._select_to(self.cursor_coordinate)
 
     def action_toggle_row(self) -> None:
         if not self.raw_rows:
             return
-        self._range_anchor = self._range_end = None
-        self._set_selection(self.selected_rows ^ {self.cursor_row})
+        self._range_anchor = self.cursor_coordinate
+        self._selection_mode = "row"
+        self._cell_bounds = None
+        self.selected_rows ^= {self.cursor_row}
+        self._selection_changed()
 
     def action_select_all_rows(self) -> None:
-        self._range_anchor = self._range_end = None
-        self._set_selection(set(range(len(self.raw_rows))))
+        self._range_anchor = None
+        self._cell_bounds = None
+        self._selection_mode = "row"
+        self.selected_rows = set(range(len(self.raw_rows)))
+        self._selection_changed()
 
-    def action_clear_rows(self) -> None:
-        self._range_anchor = self._range_end = None
-        self._set_selection(set())
+    def action_clear_selection(self) -> None:
+        self._range_anchor = None
+        self._cell_bounds = None
+        self._selection_mode = "cell"
+        self.selected_rows = set()
+        self._selection_changed()
 
-    def action_copy_rows(self) -> None:
+    def _mouse_cell(self, event: events.MouseEvent) -> Coordinate | None:
+        meta = event.style.meta
+        row, column = meta.get("row"), meta.get("column")
+        if not isinstance(row, int) or not isinstance(column, int) or meta.get("out_of_bounds"):
+            return None
+        return Coordinate(row, column)
+
+    def _on_mouse_down(self, event: events.MouseDown) -> None:
+        event.prevent_default()
+        if event.button != 1 or not self.raw_rows:
+            return
+        cell = self._mouse_cell(event)
+        if cell is None:
+            return
+        event.stop()
+        self.focus()
+        if cell.row == -1 and cell.column == -1:
+            self.action_select_all_rows()
+            return
+        mode = "column" if cell.row == -1 else "row" if cell.column == -1 else "cell"
+        target = Coordinate(max(0, cell.row), max(0, cell.column))
+        if not event.shift or self._selection_mode != mode:
+            self._range_anchor = target
+        self._selection_mode = mode
+        if mode == "row" and (event.ctrl or event.meta):
+            self.move_cursor(row=target.row, column=target.column)
+            self.action_toggle_row()
+            return
+        self._select_to(target)
+        self._dragging = True
+        self.capture_mouse()
+
+    def _on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._dragging:
+            return
+        event.prevent_default()
+        event.stop()
+        cell = self._mouse_cell(event)
+        if cell is not None:
+            self._select_to(cell)
+
+    def _end_drag(self) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.release_mouse()
+
+    def _on_mouse_up(self, event: events.MouseUp) -> None:
+        event.prevent_default()
+        if self._dragging:
+            event.stop()
+            self._end_drag()
+
+    async def _on_click(self, event: events.Click) -> None:
+        # Selection happens on press/move. A release-generated click must not
+        # collapse a dragged range or move the cursor a second time.
+        event.prevent_default()
+        event.stop()
+
+    def _selected_indices(self) -> tuple[list[int] | range, range]:
+        if self._cell_bounds is not None:
+            top, left, bottom, right = self._cell_bounds
+            return range(top, bottom + 1), range(left, right + 1)
+        if self.selected_rows:
+            return sorted(self.selected_rows), range(len(self.raw_columns))
+        return [self.cursor_row], range(self.cursor_column, self.cursor_column + 1)
+
+    def action_copy_selection(self) -> None:
         if not self.raw_columns or not self.raw_rows:
             self.app.notify("No buffered result rows to copy.", severity="warning")
             return
-        indices = sorted(self.selected_rows) if self.selected_rows else [self.cursor_row]
+        rows, columns = self._selected_indices()
         output = io.StringIO(newline="")
         writer = csv.writer(output, delimiter="\t")
-        writer.writerow(self.raw_columns)
-        writer.writerows(self.raw_rows[index] for index in indices)
+        writer.writerow(self.raw_columns[column] for column in columns)
+        writer.writerows([self.raw_rows[row][column] for column in columns] for row in rows)
         self.app.copy_to_clipboard(output.getvalue())
-        self.app.notify(f"Copied {len(indices):,} buffered row(s) with headers as TSV. NULL is an empty cell.")
+        self.app.notify(f"Copied {len(rows):,} row(s) × {len(columns):,} field(s) with headers as TSV. NULL is an empty cell.")
 
     def action_export(self) -> None:
         if not self.raw_columns:
@@ -163,7 +291,7 @@ class ResultsTable(DataTable):
         # Isolate even nested engine values from future result mutations.
         snapshot = ResultSnapshot(
             self.raw_columns, deepcopy(self.raw_rows), self.result_total,
-            tuple(sorted(self.selected_rows)),
+            tuple(self._selected_indices()[0]) if self.selected_rows or self._cell_bounds else (),
         )
         self.app.push_screen(ExportModal(snapshot))
 

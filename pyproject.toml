@@ -4,13 +4,35 @@ version = "0.1.0"
 description = "A keyboard-first IDE for querying data through Ibis, in the terminal"
 requires-python = ">=3.13"
 dependencies = [
-    "ibis-framework[duckdb,postgres]==12.0.0",
+    "ibis-framework[duckdb,postgres,sqlite,trino]==12.0.0",
     "psycopg[binary]==3.3.6",
     "pyarrow==24.0.0",
     "pyarrow-hotfix==0.7",
     "httpx==0.28.1",
     "textual==8.2.7",
 ]
+
+[project.optional-dependencies]
+athena = ["ibis-framework[athena]==12.0.0"]
+bigquery = ["ibis-framework[bigquery]==12.0.0"]
+clickhouse = ["ibis-framework[clickhouse]==12.0.0"]
+databricks = ["ibis-framework[databricks]==12.0.0"]
+datafusion = ["ibis-framework[datafusion]==12.0.0"]
+druid = ["ibis-framework[druid]==12.0.0"]
+duckdb = ["ibis-framework[duckdb]==12.0.0"]
+exasol = ["ibis-framework[exasol]==12.0.0"]
+# PyFlink's Java/native runtime is installed separately on supported platforms.
+flink = ["ibis-framework[flink]==12.0.0"]
+impala = ["ibis-framework[impala]==12.0.0"]
+materialize = ["ibis-framework[materialize]==12.0.0"]
+mssql = ["ibis-framework[mssql]==12.0.0"]
+mysql = ["ibis-framework[mysql]==12.0.0"]
+oracle = ["ibis-framework[oracle]==12.0.0"]
+pyspark = ["ibis-framework[pyspark]==12.0.0"]
+risingwave = ["ibis-framework[risingwave]==12.0.0"]
+snowflake = ["ibis-framework[snowflake]==12.0.0"]
+sqlite = ["ibis-framework[sqlite]==12.0.0"]
+trino = ["ibis-framework[trino]==12.0.0"]
 
 [project.scripts]
 d8r = "d8r.tui.app:main"

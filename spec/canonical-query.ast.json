@@ -8,22 +8,33 @@
         "from": {
           "line": 2,
           "table": "etl.orders",
-          "alias": null,
+          "alias": "o",
           "body": null
         },
-        "joins": [],
+        "joins": [
+          {
+            "line": 5,
+            "dataset": "customers",
+            "alias": "c",
+            "left": "o.customer_id",
+            "right": "c.customer_id",
+            "lateral": false,
+            "body": null,
+            "kind": "left"
+          }
+        ],
         "setOps": [],
         "select": [],
         "distinct": false,
         "where": {
-          "line": 3,
+          "line": 6,
           "raw": "(status = \"paid\" and amount between 1 and 999.5) or sku is null",
           "column": "",
           "op": "",
           "value": "",
           "subquery": null,
           "group": {
-            "line": 3,
+            "line": 6,
             "raw": "status = \"paid\" and amount between 1 and 999.5",
             "column": "status",
             "op": "=",
@@ -63,14 +74,14 @@
     }
   ],
   "from": {
-    "line": 5,
+    "line": 1,
     "table": "recent",
     "alias": null,
     "body": null
   },
   "joins": [
     {
-      "line": 6,
+      "line": 8,
       "dataset": "",
       "alias": "last_two",
       "left": "recent.campaign_id",
@@ -79,7 +90,7 @@
       "body": {
         "with": [],
         "from": {
-          "line": 6,
+          "line": 8,
           "table": "etl.spend_log",
           "alias": null,
           "body": null
@@ -89,7 +100,7 @@
         "select": [],
         "distinct": false,
         "where": {
-          "line": 6,
+          "line": 8,
           "raw": "etl.spend_log.campaign_id = recent.campaign_id",
           "column": "etl.spend_log.campaign_id",
           "op": "=",
@@ -99,7 +110,7 @@
         "groupBy": [],
         "orderBy": [
           {
-            "line": 6,
+            "line": 8,
             "target": "day",
             "direction": "desc",
             "resolvesTo": null
@@ -112,78 +123,36 @@
         "limit": 2,
         "errors": []
       }
+    },
+    {
+      "line": 33,
+      "dataset": "etl.labels",
+      "alias": "labels",
+      "left": "",
+      "right": "",
+      "lateral": false,
+      "body": null,
+      "kind": "cross"
     }
   ],
   "setOps": [
     {
-      "line": 16,
+      "line": 18,
       "op": "union",
       "dataset": "etl.archived",
       "distinct": true,
       "body": null
     },
     {
-      "line": 17,
+      "line": 19,
       "op": "union",
       "dataset": "",
       "distinct": false,
       "body": {
         "with": [],
         "from": {
-          "line": 17,
-          "table": "events",
-          "alias": null,
-          "body": null
-        },
-        "joins": [],
-        "setOps": [],
-        "select": [
-          {
-            "line": 17,
-            "raw": "customer_id",
-            "column": "customer_id",
-            "literal": null,
-            "scalar": null,
-            "arithmetic": null,
-            "star": false,
-            "aggregate": null,
-            "temporal": null,
-            "rank": null,
-            "window": null,
-            "regex": null,
-            "subquery": null,
-            "alias": null
-          }
-        ],
-        "distinct": false,
-        "where": null,
-        "groupBy": [],
-        "orderBy": [],
-        "cases": [],
-        "temp": null,
-        "drop": null,
-        "tx": [],
-        "limit": null,
-        "errors": []
-      }
-    },
-    {
-      "line": 18,
-      "op": "intersect",
-      "dataset": "other",
-      "distinct": true,
-      "body": null
-    },
-    {
-      "line": 19,
-      "op": "except",
-      "dataset": "",
-      "distinct": true,
-      "body": {
-        "with": [],
-        "from": {
           "line": 19,
-          "table": "staging",
+          "table": "events",
           "alias": null,
           "body": null
         },
@@ -218,11 +187,63 @@
         "limit": null,
         "errors": []
       }
+    },
+    {
+      "line": 20,
+      "op": "intersect",
+      "dataset": "other",
+      "distinct": true,
+      "body": null
+    },
+    {
+      "line": 21,
+      "op": "except",
+      "dataset": "",
+      "distinct": true,
+      "body": {
+        "with": [],
+        "from": {
+          "line": 21,
+          "table": "staging",
+          "alias": null,
+          "body": null
+        },
+        "joins": [],
+        "setOps": [],
+        "select": [
+          {
+            "line": 21,
+            "raw": "customer_id",
+            "column": "customer_id",
+            "literal": null,
+            "scalar": null,
+            "arithmetic": null,
+            "star": false,
+            "aggregate": null,
+            "temporal": null,
+            "rank": null,
+            "window": null,
+            "regex": null,
+            "subquery": null,
+            "alias": null
+          }
+        ],
+        "distinct": false,
+        "where": null,
+        "groupBy": [],
+        "orderBy": [],
+        "cases": [],
+        "temp": null,
+        "drop": null,
+        "tx": [],
+        "limit": null,
+        "errors": []
+      }
     }
   ],
   "select": [
     {
-      "line": 7,
+      "line": 9,
       "raw": "customer_id",
       "column": "customer_id",
       "literal": null,
@@ -238,7 +259,7 @@
       "alias": null
     },
     {
-      "line": 8,
+      "line": 10,
       "raw": "month(placed_at)",
       "column": null,
       "literal": null,
@@ -257,7 +278,7 @@
       "alias": null
     },
     {
-      "line": 9,
+      "line": 11,
       "raw": "sum(amount) over (partition by customer_id) as customer_total",
       "column": null,
       "literal": null,
@@ -282,7 +303,7 @@
       "alias": "customer_total"
     },
     {
-      "line": 10,
+      "line": 12,
       "raw": "sum(amount) over (order by placed_at range between unbounded preceding and current row) as running_total",
       "column": null,
       "literal": null,
@@ -312,7 +333,7 @@
       "alias": "running_total"
     },
     {
-      "line": 11,
+      "line": 13,
       "raw": "rank() over (order by placed_at desc) as recency_rank",
       "column": null,
       "literal": null,
@@ -337,7 +358,7 @@
       "alias": "recency_rank"
     },
     {
-      "line": 12,
+      "line": 14,
       "raw": "regexp_extract(sku, \"SKU-([0-9]+)\", 1) as sku_number",
       "column": null,
       "literal": null,
@@ -359,7 +380,7 @@
       "alias": "sku_number"
     },
     {
-      "line": 13,
+      "line": 15,
       "raw": "(\\from staging \\select max(amount)) as peak_amount",
       "column": null,
       "literal": null,
@@ -374,7 +395,7 @@
       "subquery": {
         "with": [],
         "from": {
-          "line": 13,
+          "line": 15,
           "table": "staging",
           "alias": null,
           "body": null
@@ -383,7 +404,7 @@
         "setOps": [],
         "select": [
           {
-            "line": 13,
+            "line": 15,
             "raw": "max(amount)",
             "column": null,
             "literal": null,
@@ -416,7 +437,7 @@
       "alias": "peak_amount"
     },
     {
-      "line": 25,
+      "line": 27,
       "raw": "'1' as text_one",
       "column": null,
       "literal": {
@@ -434,7 +455,7 @@
       "alias": "text_one"
     },
     {
-      "line": 25,
+      "line": 27,
       "raw": "1 as number_one",
       "column": null,
       "literal": {
@@ -452,7 +473,7 @@
       "alias": "number_one"
     },
     {
-      "line": 25,
+      "line": 27,
       "raw": "'x' as marker",
       "column": null,
       "literal": {
@@ -470,7 +491,7 @@
       "alias": "marker"
     },
     {
-      "line": 25,
+      "line": 27,
       "raw": "null as missing",
       "column": null,
       "literal": {
@@ -488,7 +509,7 @@
       "alias": "missing"
     },
     {
-      "line": 26,
+      "line": 28,
       "raw": "concat(upper(sku), '-', string(customer_id)) as customer_sku",
       "column": null,
       "literal": null,
@@ -529,7 +550,7 @@
       "alias": "customer_sku"
     },
     {
-      "line": 27,
+      "line": 29,
       "raw": "translate(sku, \"S\", \"X\") as translated_sku",
       "column": null,
       "literal": null,
@@ -562,7 +583,7 @@
       "alias": "translated_sku"
     },
     {
-      "line": 27,
+      "line": 29,
       "raw": "levenshtein(sku, \"SKU-001\") as sku_distance",
       "column": null,
       "literal": null,
@@ -590,7 +611,7 @@
       "alias": "sku_distance"
     },
     {
-      "line": 27,
+      "line": 29,
       "raw": "url_host(\"https://acme.test/p\") as link_host",
       "column": null,
       "literal": null,
@@ -615,7 +636,7 @@
       "alias": "link_host"
     },
     {
-      "line": 27,
+      "line": 29,
       "raw": "as_date(string(placed_at), \"%Y-%m-%d\") as placed_date",
       "column": null,
       "literal": null,
@@ -648,7 +669,7 @@
       "alias": "placed_date"
     },
     {
-      "line": 29,
+      "line": 31,
       "raw": "amount / 100 as amount_dollars",
       "column": null,
       "literal": null,
@@ -676,7 +697,7 @@
       "alias": "amount_dollars"
     },
     {
-      "line": 29,
+      "line": 31,
       "raw": "coalesce(amount / 100, 0) as safe_amount_dollars",
       "column": null,
       "literal": null,
@@ -714,7 +735,7 @@
       "alias": "safe_amount_dollars"
     },
     {
-      "line": 30,
+      "line": 32,
       "raw": "sum(amount \\where status = 'paid') as paid_total",
       "column": null,
       "literal": null,
@@ -725,7 +746,7 @@
         "fn": "sum",
         "arg": "amount",
         "where": {
-          "line": 30,
+          "line": 32,
           "raw": "status = 'paid'",
           "column": "status",
           "op": "=",
@@ -743,15 +764,15 @@
   ],
   "distinct": true,
   "where": {
-    "line": 15,
-    "raw": "customer_id in (\\from customers \\select customer_id \\where region = \"us\") and (event_type in (\"purchase\", \"cli\") or user_id is not null)",
+    "line": 17,
+    "raw": "customer_id in (\\from customers \\select customer_id \\where region = \"us\" and count(*) > 15) and (event_type in (\"purchase\", \"cli\") or user_id is not null)",
     "column": "customer_id",
     "op": "in",
     "value": "",
     "subquery": {
       "with": [],
       "from": {
-        "line": 15,
+        "line": 17,
         "table": "customers",
         "alias": null,
         "body": null
@@ -760,7 +781,7 @@
       "setOps": [],
       "select": [
         {
-          "line": 15,
+          "line": 17,
           "raw": "customer_id",
           "column": "customer_id",
           "literal": null,
@@ -778,12 +799,24 @@
       ],
       "distinct": false,
       "where": {
-        "line": 15,
-        "raw": "region = \"us\"",
+        "line": 17,
+        "raw": "region = \"us\" and count(*) > 15",
         "column": "region",
         "op": "=",
         "value": "us",
-        "subquery": null
+        "subquery": null,
+        "ands": [
+          {
+            "column": "",
+            "op": ">",
+            "value": "15",
+            "subquery": null,
+            "aggregate": {
+              "fn": "count",
+              "arg": "*"
+            }
+          }
+        ]
       },
       "groupBy": [],
       "orderBy": [],
@@ -801,7 +834,7 @@
         "value": "",
         "subquery": null,
         "group": {
-          "line": 15,
+          "line": 17,
           "raw": "event_type in (\"purchase\", \"cli\") or user_id is not null",
           "column": "event_type",
           "op": "in",
@@ -828,7 +861,7 @@
   "groupBy": [],
   "orderBy": [
     {
-      "line": 23,
+      "line": 25,
       "target": "customer_total",
       "direction": "desc",
       "resolvesTo": 3
@@ -836,7 +869,7 @@
   ],
   "cases": [
     {
-      "line": 14,
+      "line": 16,
       "raw": "flag = when amount > 100 then \"high\" when sku ilike \"SKU-0%\" then \"early\" when customer_id is null then \"missing\" else \"low\"",
       "alias": "flag",
       "whens": [
@@ -863,21 +896,21 @@
     }
   ],
   "temp": {
-    "line": 20,
+    "line": 22,
     "name": "snapshot"
   },
   "drop": {
-    "line": 21,
+    "line": 23,
     "name": "previous"
   },
   "tx": [
     {
-      "line": 4,
+      "line": 7,
       "kind": "begin",
       "name": null
     },
     {
-      "line": 22,
+      "line": 24,
       "kind": "commit",
       "name": null
     }

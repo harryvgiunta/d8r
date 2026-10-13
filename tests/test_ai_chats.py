@@ -96,7 +96,7 @@ def test_parallel_same_target_switching_preserves_drafts_and_marks_unread(tmp_pa
             await pilot.press("ctrl+j")
             await pilot.pause()
             assert app.screen is screen
-            assert app.query_one("#explorer-tabs", TabbedContent).active == "tab-agents"
+            assert app.query_one("#assistant-tabs", TabbedContent).active == "tab-agents"
             options = app.query_one("#agents-list", OptionList)
             options.highlighted = options.get_option_index(second.id)
             options.focus()
@@ -292,6 +292,7 @@ def test_auto_accept_rejects_unsafe_response_without_losing_completed_history(tm
                 original = app.editor.text
             elif unsafe == "source":
                 app.select_source("mysql")
+                original = app.editor.text
             await pilot.pause()
             release.set()
             await _finished(chat)
@@ -301,9 +302,14 @@ def test_auto_accept_rejects_unsafe_response_without_losing_completed_history(tm
                 assert not chat.messages
                 assert chat.proposal is None
             else:
-                panel.select_chat(chat.id)
                 assert chat.messages[-1]["content"] == answer
-                assert answer in str(panel.query_one("#ai-transcript", Static).content)
+                if unsafe == "source":
+                    panel.select_chat(chat.id)
+                    assert panel.chat_id != chat.id
+                    assert chat.unread
+                else:
+                    panel.select_chat(chat.id)
+                    assert answer in str(panel.query_one("#ai-transcript", Static).content)
                 assert panel.query_one("#ai-apply", Button).disabled
                 panel.action_apply()
                 assert app.editor.text == original
@@ -456,7 +462,7 @@ def test_deleting_waiting_chat_revokes_late_updates_and_does_not_restore_it(tmp_
             result = json.loads(await context.call_tool("apply_queries", {
                 "queries": [{"title": "Too late", "body": BODY}],
             }))
-            assert result["applied"] is False
+            assert result["error"]
             assert app.editor.text == original
             assert not app.ai_chats.chats
             assert not app.session.load_chats()

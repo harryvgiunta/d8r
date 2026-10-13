@@ -24,6 +24,7 @@ from textual.timer import Timer
 from d8r.ai import client
 from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
+from d8r.engine.connectors import profile_secrets
 
 
 class ComposerArea(TextArea):
@@ -61,8 +62,8 @@ class AIDiagnosticsScreen(ModalScreen):
         with Vertical(id="ai-log-screen"):
             yield Static("AI diagnostics · current chat", classes="pane-title")
             yield Static("In memory only. May contain query text and data values; review before sharing.\n"
-                         "Known AI/D1 keys are redacted. Each chat keeps its own logs.\n"
-                         "Validation is parser-only: a rejected operation may still be supported by Ibis.",
+                         "Known AI and database credentials are redacted. Each chat keeps its own logs.\n"
+                         "Validation checks syntax and cached schemas offline; no query is executed or results verified.",
                          id="ai-log-notice", markup=False)
             yield TextArea("", read_only=True, soft_wrap=True, id="ai-log-text")
             with Horizontal(id="ai-log-buttons"):
@@ -158,6 +159,14 @@ class AIChat:
         return "Ready" if self.unread or not self.messages else "Seen"
 
     @property
+    def source_key(self) -> str | None:
+        try:
+            _, source, _ = json.loads(self.target_key)
+        except (ValueError, TypeError):
+            return None
+        return source if isinstance(source, str) else None
+
+    @property
     def target_label(self) -> str:
         try:
             mode, source, identity = json.loads(self.target_key)
@@ -204,8 +213,10 @@ class AIChats:
                     yield panel
 
     def is_read(self, chat: AIChat) -> bool:
-        return any(panel.chat_id == chat.id and panel.display and panel.screen is self.app.screen
-                   for panel in self.panels())
+        return (chat.source_key == self.session.source_key()
+                and any(panel.chat_id == chat.id and panel.display and panel.is_on_screen
+                        and panel.screen is self.app.screen
+                        for panel in self.panels()))
 
     def changed(self, chat: AIChat, *, agents: bool = True) -> None:
         if self.closing or self.chats.get(chat.id) is not chat:
@@ -214,10 +225,13 @@ class AIChats:
             if panel.chat_id == chat.id:
                 panel._draw_chat()
         if agents:
-            for screen in self.app.screen_stack:
-                for pane in screen.query(AgentsPane):
-                    if pane.is_mounted:
-                        pane.refresh_chats()
+            self.refresh_agents()
+
+    def refresh_agents(self) -> None:
+        for screen in self.app.screen_stack:
+            for pane in screen.query(AgentsPane):
+                if pane.is_mounted:
+                    pane.refresh_chats()
 
     def persist(self, chat: AIChat) -> None:
         if self.chats.get(chat.id) is not chat:
@@ -267,10 +281,7 @@ class AIChats:
         for panel in self.panels():
             if panel.chat_id in removed:
                 panel.detach_chat()
-        for screen in self.app.screen_stack:
-            for pane in screen.query(AgentsPane):
-                if pane.is_mounted:
-                    pane.refresh_chats()
+        self.refresh_agents()
 
     def delete(self, chat_id: str) -> None:
         if chat_id not in self.chats:
@@ -298,6 +309,7 @@ class AIChats:
             config.api_key,
             *(profile.get("api_token", "") for profile in self.session.d1_profiles),
             *(profile.get("password", "") for profile in self.session.postgres_profiles),
+            *(secret for profile in self.session.backend_profiles for secret in profile_secrets(profile)),
             *(source.d1.api_token for source in self.session.sources.values() if source.d1 is not None),
         ])
         try:
@@ -315,7 +327,6 @@ class AIChats:
             context = AIContext(
                 self.session, target.source_id, target.document, target.parameters, target.function_name,
                 save_guard=lambda: self._mutation_guard(chat, generation),
-                query_apply=lambda proposal: self._apply_queries(chat, proposal),
                 ask_user=lambda question: self._ask_user(chat, generation, question),
             )
             system = context.system_prompt()
@@ -340,6 +351,7 @@ class AIChats:
         if chat.title == "New chat":
             chat.title = " ".join(prompt.split())[:80]
         chat.pending_prompt = prompt
+        chat.transcript += f"You: {prompt}\n\n"
         chat.input = ""
         chat.partial = ""
         chat.status = "working"
@@ -373,8 +385,7 @@ class AIChats:
         if saved := self._mutation_status(chat):
             interruption += "\nD8R confirmed: " + saved
         chat.messages.append({"role": "assistant", "content": interruption})
-        chat.transcript += (f"You: {chat.pending_prompt}\n\n"
-                            "D8R: Response interrupted by a follow-up. Completed exchanges and saves retained.\n\n")
+        chat.transcript += "D8R: Response interrupted by a follow-up. Completed exchanges and saves retained.\n\n"
         chat.diagnostics.record("Turn steered", "Restarting with the original request, completed exchanges and new instruction.")
         self._clear_question(chat)
         chat.worker.cancel()
@@ -386,6 +397,26 @@ class AIChats:
         if not any(panel.snapshot() == chat.target for panel in self.panels()):
             return "The editor target changed; send a fresh request before changing it."
         return None
+
+    def _retain_clarifications(self, chat: AIChat, messages: list[dict]) -> None:
+        """Close interrupted turns only when a completed batch contains an answer."""
+        if not messages or messages[-1].get("role") != "tool":
+            return
+        turn_start = next(index for index in range(len(messages) - 1, -1, -1)
+                          if messages[index].get("role") == "user")
+        questions = set()
+        for message in messages[turn_start + 1:]:
+            questions.update(call["id"] for call in message.get("tool_calls", [])
+                             if call["function"]["name"] == "ask_user")
+            if (message.get("role") == "tool" and message.get("tool_call_id") in questions
+                    and json.loads(message["content"]).get("answer")):
+                # run_turn commits whole tool batches atomically. Its completed
+                # results need a terminal assistant receipt for durable replay.
+                receipt = "D8R stopped this response before completion. Completed clarification answers were retained."
+                if saved := self._mutation_status(chat):
+                    receipt += "\nD8R confirmed: " + saved
+                chat.messages = [*messages[1:], {"role": "assistant", "content": receipt}]
+                return
 
     def _clear_question(self, chat: AIChat) -> None:
         answer = chat.question_answer
@@ -415,7 +446,8 @@ class AIChats:
             # An abandoned generation must not dismiss its successor's question.
             if chat.question_answer is answer:
                 self._clear_question(chat)
-                if generation == chat.generation and chat.status == "working":
+                if (generation == chat.generation and chat.status == "working"
+                        and answer.done() and not answer.cancelled()):
                     chat.status_text = "Continuing with your answer…"
                 self.changed(chat)
 
@@ -433,7 +465,15 @@ class AIChats:
             chat.status_text = "Choose an option or enter an answer of at most 2,000 characters."
             self.changed(chat)
             return False
-        chat.transcript += f"You (clarification): {text}\n\n"
+        question = chat.question
+        lines = [f"Assistant (clarification): {question.question}"]
+        for index, choice in enumerate(question.options):
+            recommended = " (Recommended)" if index == question.recommended else ""
+            lines.append(f"- {choice.label}{recommended}")
+            if choice.description:
+                lines.append(f"  {choice.description}")
+        lines.extend(["- Other: type your own answer", "", f"You (clarification): {text}", "", ""])
+        chat.transcript += "\n".join(lines)
         chat.diagnostics.record("Clarification answered", text)
         chat.status_text = "Continuing with your answer…"
         answer.set_result(text)
@@ -441,25 +481,12 @@ class AIChats:
         self.changed(chat)
         return True
 
-    def _apply_queries(self, chat: AIChat, proposal: AIProposal) -> None:
-        panel = next(panel for panel in self.panels() if panel.snapshot() == chat.target)
-        panel.apply_document(proposal)
-        # This request owns the change; later tools still reject user edits,
-        # page/source switches, cancellation and superseding generations.
-        chat.target = panel.snapshot()
 
     def _mutation_status(self, chat: AIChat) -> str:
-        if chat.context is None:
+        if chat.context is None or not chat.context.saved_functions:
             return ""
-        receipts = []
-        if chat.context.saved_functions:
-            receipts.append("Saved functions: " + ", ".join(chat.context.saved_functions) + ". "
-                            + ("Nothing executed." if chat.context.applied_queries else
-                               "Query unchanged; nothing executed."))
-        if chat.context.applied_queries:
-            receipts.append("Applied queries: " + ", ".join(query.title for query in chat.context.applied_queries)
-                            + ". Drafts updated; nothing executed.")
-        return "\n".join(receipts)
+        return ("Saved functions: " + ", ".join(chat.context.saved_functions)
+                + ". Query unchanged; nothing executed.")
 
     async def _call_tool(self, chat: AIChat, context: AIContext, name: str, args: dict, generation: int) -> str:
         """Serialize shared-connection access, not independent provider requests."""
@@ -469,34 +496,32 @@ class AIChats:
             return await context.call_tool(name, args)
         if self.session.busy:
             error: dict[str, str | bool] = {"error": f"{self.session.busy}; try again after it finishes."}
-            if name in ("save_function", "apply_queries"):
-                error["saved" if name == "save_function" else "applied"] = False
+            if name == "save_function":
+                error["saved"] = False
             return json.dumps(error)
-        if name in ("save_function", "apply_queries"):
+        if name == "save_function":
             # Mutations never queue behind a shield after cancellation. Guard,
             # commit and receipt run in one event-loop step, without an await
             # inside the synchronous mutation implementation.
-            self.session.busy = "AI function save running" if name == "save_function" else "AI query update running"
-            had_changes = bool(context.saved_functions or context.applied_queries)
+            self.session.busy = "AI function save running"
+            had_changes = bool(context.saved_functions)
             try:
                 result = await context.call_tool(name, args)
             finally:
                 self.session.busy = ""
             result_fields = json.loads(result)
-            if result_fields.get("saved") or result_fields.get("applied"):
-                receipt = (f'Saved function "{result_fields["name"]}". Query unchanged; nothing executed.'
-                           if name == "save_function" else
-                           "Applied queries: " + ", ".join(result_fields["titles"]) + ". Nothing executed.")
+            if result_fields.get("saved"):
+                receipt = f'Saved function "{result_fields["name"]}". Query unchanged; nothing executed.'
                 chat.transcript += f"D8R: {receipt}\n\n"
                 chat.status_text = receipt
-                chat.diagnostics.record("Saved function" if name == "save_function" else "Applied queries", receipt)
+                chat.diagnostics.record("Saved function", receipt)
                 confirmation = {"role": "assistant", "content": "D8R confirmed: " + self._mutation_status(chat)}
                 if had_changes:
                     chat.messages[-1] = confirmation
                 else:
                     chat.messages.extend([{"role": "user", "content": chat.pending_prompt}, confirmation])
                 self.persist(chat)
-                if name == "save_function" and hasattr(self.app, "refresh_functions"):
+                if hasattr(self.app, "refresh_functions"):
                     self.app.refresh_functions()
                 self.changed(chat)
             return result
@@ -548,14 +573,13 @@ class AIChats:
             # its view disappeared while the provider was working.
             answer = messages[-1].get("content") or ""
             chat.messages = messages[1:]
-            chat.transcript += f"You: {chat.pending_prompt}\n\nAssistant: {answer}\n\n"
+            chat.transcript += f"Assistant: {answer}\n\n"
             chat.pending_prompt = ""
             chat.partial = ""
             chat.status = "idle"
             chat.diagnostics.record("Turn completed", "Complete provider response received; no query executed.")
             try:
-                chat.proposal = (None if context.saved_functions or context.applied_queries else
-                                 context.read_proposal(answer))
+                chat.proposal = None if context.saved_functions else context.read_proposal(answer)
             except ValueError as exc:
                 chat.status = "error"
                 chat.status_text = str(exc)
@@ -563,11 +587,9 @@ class AIChats:
             else:
                 chat.status_text = "Response complete. Reply below to continue."
                 if chat.proposal is not None:
-                    chat.validation_error = (context.replacement_guard(chat.proposal) if self.session.busy
-                                             else context.validate_replacement(chat.proposal))
-                    chat.diagnostics.record("Proposal validation (parser only)",
-                                            "Deferred: connection busy." if self.session.busy else
-                                            chat.validation_error or "Valid syntax; execution not checked.")
+                    chat.validation_error = context.validate_replacement(chat.proposal)
+                    chat.diagnostics.record("Proposal validation (offline schema)",
+                                            chat.validation_error or "Valid against cached schemas; execution not checked.")
                     if chat.validation_error:
                         chat.status = "error"
                         chat.status_text = "Needs a fix: " + chat.validation_error
@@ -578,8 +600,7 @@ class AIChats:
         except asyncio.CancelledError:
             if generation == chat.generation:
                 chat.status = "cancelled"
-                chat.status_text = ("Cancelled. Incomplete response discarded." if context.applied_queries else
-                                    "Cancelled. Incomplete response discarded; document unchanged.")
+                chat.status_text = "Cancelled. Incomplete response discarded; document unchanged."
             raise
         except client.AIError as exc:
             if generation != chat.generation:
@@ -599,6 +620,7 @@ class AIChats:
         finally:
             if generation == chat.generation:
                 chat.worker = None
+                self._retain_clarifications(chat, messages)
                 self._clear_question(chat)
                 chat.request_messages = []
                 self._recover_prompt(chat)
@@ -648,7 +670,7 @@ class AIChats:
         if error is not None:
             chat.status = "error"
             chat.status_text = "Proposal cannot be applied: " + error
-            chat.diagnostics.record("Apply rejected (parser only)", error)
+            chat.diagnostics.record("Apply rejected (offline schema)", error)
             self.changed(chat)
             return False
         saves_function = chat.saves_function
@@ -672,6 +694,7 @@ class AIChats:
                                 "Drafts updated; nothing executed or saved as a function.")
         chat.status_text = ("Function saved. Query unchanged; nothing executed." if saves_function else
                             "Query drafts applied. Nothing executed.")
+        chat.transcript += f"D8R: {chat.status_text}\n\n"
         self.persist(chat)
         self.changed(chat)
         return True
@@ -685,12 +708,12 @@ class AIChats:
         chat.generation += 1
         self._clear_question(chat)
         chat.worker.cancel()
+        self._retain_clarifications(chat, chat.request_messages)
         chat.worker = None
         chat.request_messages = []
         chat.proposal = None
         chat.status = "cancelled"
-        chat.status_text = ("Cancelled. Incomplete response discarded." if chat.context and chat.context.applied_queries else
-                            "Cancelled. Incomplete response discarded; document unchanged.")
+        chat.status_text = "Cancelled. Incomplete response discarded; document unchanged."
         if saved := self._mutation_status(chat):
             chat.status_text += "\n" + saved
         self._recover_prompt(chat)
@@ -762,18 +785,25 @@ class AgentsPane(Vertical):
         self._rows = None
         self.refresh_chats()
 
+    def notify_style_update(self) -> None:
+        super().notify_style_update()
+        if self.is_mounted:
+            # Roster text embeds status colors; rebuild it after theme changes.
+            self._rows = None
+            self.call_after_refresh(self.refresh_chats)
+
     def on_resize(self) -> None:
         if self.is_mounted:
             self.refresh_chats()
 
     def _prompt(self, chat: AIChat, width: int) -> Text:
         state = chat.label
-        style = self.get_component_rich_style("agents--" + state.lower())
+        style = self.get_component_rich_style("agents--" + state.lower(), partial=True)
         lines = [
             Text.assemble((f"{self.STATES[state][1]} {state}  ", style),
                           (" ".join(chat.title.split()), "bold")),
             Text.assemble("  ", ("unread · " if chat.unread else "",
-                                 self.get_component_rich_style("agents--busy")),
+                                 self.get_component_rich_style("agents--busy", partial=True)),
                           (chat.target_label, "dim")),
             Text("  " + " ".join(chat.status_text.split()), style="dim"),
         ]
@@ -782,7 +812,10 @@ class AgentsPane(Vertical):
         return Text("\n").join(lines)
 
     def refresh_chats(self) -> None:
-        chats = sorted(reversed(list(self.app.ai_chats.chats.values())),
+        manager = self.app.ai_chats
+        source_key = manager.session.source_key()
+        chats = sorted((chat for chat in reversed(manager.chats.values())
+                        if chat.source_key == source_key),
                        key=lambda chat: self.STATES[chat.label][0])
         options = self.query_one(OptionList)
         width = max(1, self.content_size.width - options.styles.gutter.width - options.styles.scrollbar_size_vertical)
@@ -802,7 +835,7 @@ class AgentsPane(Vertical):
             if not count:
                 continue
             group = Text(f"{self.STATES[state][1]} {count} {state}",
-                         style=self.get_component_rich_style("agents--" + state.lower()))
+                         style=self.get_component_rich_style("agents--" + state.lower(), partial=True))
             group.truncate(summary_width, overflow="ellipsis")
             if line_width:
                 if line_width + 3 + group.cell_len > summary_width:
@@ -863,12 +896,14 @@ class AIPanel(Vertical):
     ]
 
     def __init__(self, session, snapshot: Callable[[], AITarget],
-                 apply: Callable[[AIProposal], None], return_focus: Callable[[], None], **kwargs) -> None:
+                 apply: Callable[[AIProposal], None], return_focus: Callable[[], None], *,
+                 reveal: Callable[[], None] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.session = session
         self.snapshot = snapshot
         self.apply_document = apply
         self.return_focus = return_focus
+        self.reveal = reveal
         self.chat_id: str | None = None
         self._target_key: str | None = None
         self._composer: TextArea | None = None
@@ -928,7 +963,6 @@ class AIPanel(Vertical):
         with Horizontal(classes="ai-buttons"):
             yield Button("New chat", id="ai-clear", compact=True)
             yield Button("Agents", id="ai-agents", compact=True)
-            yield Button("Close", id="ai-close", compact=True)
         with Horizontal(classes="ai-buttons"):
             yield Button("Settings", id="ai-settings", compact=True)
             yield Button("Logs", id="ai-logs", compact=True)
@@ -1012,12 +1046,13 @@ class AIPanel(Vertical):
             visible = chat.visible if chat is not None else self.display
             self._set_visible(visible and self.session.pane_visibility["ai"])
             self._set_input(chat.input if chat is not None else "")
+            self.manager.refresh_agents()
         self._draft_target = current
         self._draw_chat()
 
     def select_chat(self, chat_id: str) -> None:
         chat = self.manager.chats.get(chat_id)
-        if chat is None:
+        if chat is None or chat.source_key != self.session.source_key():
             return
         if not self._set_visible(True, persist=True):
             return
@@ -1030,6 +1065,8 @@ class AIPanel(Vertical):
         self._set_input(chat.input)
         self.manager.select(chat)
         self._draw_chat()
+        if self.reveal is not None:
+            self.reveal()
         self.query_one("#ai-input", TextArea).focus()
 
     def open(self) -> None:
@@ -1041,6 +1078,8 @@ class AIPanel(Vertical):
             self.chat.unread = False
             self.manager.persist(self.chat)
             self.manager.changed(self.chat)
+        if self.reveal is not None:
+            self.reveal()
         self.query_one("#ai-input", TextArea).focus()
 
     def _status(self, text: str) -> None:
@@ -1082,8 +1121,8 @@ class AIPanel(Vertical):
                        if chat.context is not None and chat.proposal is not None else None)
         self.query_one("#ai-title", Static).update(f"{chat.title} · {chat.label}")
         text = chat.transcript
-        if chat.worker is not None:
-            text += f"You: {chat.pending_prompt}\n\nAssistant: {chat.partial}"
+        if chat.worker is not None and chat.partial:
+            text += f"Assistant: {chat.partial}"
         transcript = self.query_one("#ai-transcript", Static)
         self.query_one("#ai-conversation").display = bool(text)
         if str(transcript.content) != text:
@@ -1208,7 +1247,7 @@ class AIPanel(Vertical):
 
     def _focus_control(self, direction: int) -> None:
         names = ("question-options", "question-other", "question-submit") if self.query_one("#ai-question").display else ()
-        names += ("proposal", "input", "send", "cancel", "apply", "clear", "agents", "close", "settings", "logs")
+        names += ("proposal", "input", "send", "cancel", "apply", "clear", "agents", "settings", "logs")
         controls = [self.query_one(f"#ai-{name}") for name in names]
         controls = [widget for widget in controls if widget.display and not widget.disabled]
         focused = self.screen.focused
@@ -1219,7 +1258,7 @@ class AIPanel(Vertical):
     def _pressed(self, event: Button.Pressed) -> None:
         actions = {"ai-send": self.action_send, "ai-cancel": self.action_cancel,
                    "ai-apply": self.action_apply, "ai-clear": self.action_clear,
-                   "ai-close": self.action_close, "ai-settings": self.action_settings,
+                   "ai-settings": self.action_settings,
                    "ai-logs": self.action_logs, "ai-agents": self.action_agents}
         actions["ai-question-submit"] = self.action_answer_question
         action = actions.get(event.button.id)

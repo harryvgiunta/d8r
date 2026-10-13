@@ -19,6 +19,8 @@ import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisError
 
+from d8r.query import QueryAST, SchemaContext, payload_from_ast
+
 from d8r.query.functions import (
     ARITHMETIC_PRECEDENCE,
     JSON_FUNCTIONS,
@@ -32,7 +34,7 @@ from d8r.query.identifiers import relation_parts
 
 from .d1api import D1Error
 
-__all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql"]
+__all__ = ["PayloadError", "AGGREGATE_FNS", "TEMPORAL_FNS", "OPERATORS", "col", "build", "compile_sql", "source_schemas", "validate_schema"]
 
 
 class PayloadError(Exception):
@@ -116,7 +118,7 @@ def get_table(
         if parts is not None and len(parts) == 2 and getattr(con, "name", None) == "postgres":
             return con.table(parts[1], database=(None, parts[0]))
         return con.table(dataset)
-    except D1Error:
+    except (D1Error, PayloadError):
         raise
     except Exception as exc:  # backend raises IbisError/KeyError for unknown names
         raise PayloadError(f"unknown dataset: {dataset}") from exc
@@ -356,6 +358,7 @@ def _lateral_parts(
             ctes,
             tables,
         )
+    right = right.view()
     parts: list[ir.Value] = []
     if left_ref is not None:
         parts.append(
@@ -422,19 +425,19 @@ def _join_frames(
     body: object = None,
     tables: dict[str, ir.Table] | None = None,
 ) -> tuple[list[tuple[str, ir.Table]], ir.Table]:
-    """Build the ordered open-table list and the chained inner-join expression.
+    """Build the surviving alias frames and the oriented join expression.
 
-    Frames are `[source, *joined]` in document order, keyed by identifier (alias if
-    present, else dataset name); duplicate identifiers are rejected. Join keys
-    validate against frames accumulated so far (left) and the right table;
-    predicates reference the pre-join parent frames, which ibis still resolves
-    inside the join graph. A source may be an inline subquery body, and a
+    Each join introduces one fresh identifier. Keys retain legacy qualified
+    lookup, while bare keys address the accumulated relation and the new source.
+    Explicit projections retain every surviving frame's identity, including
+    nullable keys which Ibis would otherwise deduplicate in inner joins. A
     `lateral` join's body may read the frames to its left (see `_lateral_parts`).
     """
     source = _build_source(con, dataset, body, ctes, tables)
     identifier = alias if isinstance(alias, str) and alias else dataset
     frames: list[tuple[str, ir.Table]] = [(identifier, source)]
     expr: ir.Table = source
+    identifiers = {identifier}
     if joins is None:
         joins = []
     if not isinstance(joins, list):
@@ -442,10 +445,18 @@ def _join_frames(
     for spec in joins:
         if not isinstance(spec, dict):
             raise PayloadError("join specs must be objects")
-        if set(spec) - {"dataset", "alias", "left", "right", "lateral", "body", "keys"}:
+        if set(spec) - {"dataset", "alias", "left", "right", "lateral", "body", "keys", "kind", "reverse"}:
             raise PayloadError("join specs contain unknown fields")
         if "lateral" in spec and not isinstance(spec["lateral"], bool):
             raise PayloadError("join lateral must be a boolean")
+        kind = spec.get("kind", "inner")
+        if not isinstance(kind, str) or kind not in {"inner", "left", "right", "outer", "anti", "semi", "asof", "cross"}:
+            raise PayloadError(f"unknown join kind: {kind!r}")
+        reverse = spec.get("reverse", False)
+        if not isinstance(reverse, bool):
+            raise PayloadError("join reverse must be a boolean")
+        if spec.get("lateral") and (kind != "inner" or reverse):
+            raise PayloadError("lateral joins support only forward inner joins")
         extra_keys = spec.get("keys", [])
         if not isinstance(extra_keys, list):
             raise PayloadError("join keys must be an array of column pairs")
@@ -458,7 +469,11 @@ def _join_frames(
                 raise PayloadError("each join key pair must contain two non-empty column strings")
         if spec.get("lateral") and extra_keys:
             raise PayloadError("compound ON keys are not supported for lateral joins")
-        if not spec.get("lateral") and any(
+        if kind == "cross" and (
+            reverse or extra_keys or any(spec.get(side, "") != "" for side in ("left", "right"))
+        ):
+            raise PayloadError("cross joins do not accept keys or reverse orientation")
+        if kind != "cross" and not spec.get("lateral") and any(
             not isinstance(spec.get(side), str) or not spec[side]
             for side in ("left", "right")
         ):
@@ -468,36 +483,64 @@ def _join_frames(
         right_ident = right_alias if isinstance(right_alias, str) and right_alias else right_name
         if not isinstance(right_ident, str) or not right_ident:
             raise PayloadError("a join source needs an identifier")
-        if any(name == right_ident for name, _ in frames):
+        if right_ident in identifiers:
             raise PayloadError(f'duplicate table identifier "{right_ident}"')
+        identifiers.add(right_ident)
+        cap = None
         if spec.get("lateral"):
             right, predicate, keys, orders, cap = _lateral_parts(con, spec, frames, ctes, tables)
-            expr = expr.join(right, predicate)
-            if cap is not None:
-                expr = _cap_lateral_rows(expr, keys, orders, cap)
+            expr = expr.inner_join(right, predicate)
             frames.append((right_ident, right))
-            continue
-        right = _build_source(con, right_name, spec.get("body"), ctes, tables)
-        # A *qualified* `on` side may name either relation — `a.k = b.k` and
-        # `b.k = a.k` are the same equality — so it resolves against the
-        # accumulated frames *and* this join's own table (its identifier is fresh,
-        # duplicates refused above, so a qualified name is never ambiguous). A
-        # *bare* name keeps left/right scoping: left resolves to the accumulated
-        # left, right to this table, so `on user_id` is `left.user_id = right.user_id`,
-        # never a self-comparison that would cross the two relations.
-        both = [*frames, (right_ident, right)]
+        elif kind == "cross":
+            right = _build_source(con, right_name, spec.get("body"), ctes, tables).view()
+            expr = expr.cross_join(right)
+            frames.append((right_ident, right))
+        else:
+            # Every occurrence needs its own identity, even when the registry
+            # returns the very same relation for two distinct aliases.
+            right = _build_source(con, right_name, spec.get("body"), ctes, tables).view()
+            fresh = [(right_ident, right)]
+            both = [*frames, *fresh]
 
-        def key(ref: object, own: list[tuple[str, ir.Table]]) -> ir.Column:
-            scoped = both if isinstance(ref, str) and "." in ref else own
-            return col(scoped, ref, "join key")
+            def key(ref: object, own: list[tuple[str, ir.Table]]) -> ir.Column:
+                scoped = both if isinstance(ref, str) and "." in ref else own
+                return col(scoped, ref, "join key")
 
-        left_column = key(spec.get("left"), frames)
-        right_column = key(spec.get("right"), [(right_ident, right)])
-        predicate = left_column == right_column
-        for left_ref, right_ref in extra_keys:
-            predicate &= key(left_ref, frames) == key(right_ref, [(right_ident, right)])
-        expr = expr.join(right, predicate)
-        frames.append((right_ident, right))
+            left_column = key(spec.get("left"), frames)
+            right_column = key(spec.get("right"), fresh)
+            equalities = [
+                key(left_ref, frames) == key(right_ref, fresh)
+                for left_ref, right_ref in extra_keys
+            ]
+            written_left, written_right = (right, expr) if reverse else (expr, right)
+            if kind == "asof":
+                on = right_column >= left_column if reverse else left_column >= right_column
+                expr = written_left.asof_join(written_right, on=on, predicates=equalities)
+            else:
+                expr = getattr(written_left, f"{kind}_join")(
+                    written_right, [left_column == right_column, *equalities]
+                )
+            if kind in {"semi", "anti"}:
+                if reverse:
+                    frames = fresh
+            else:
+                frames = both
+
+        # Finish each join with all surviving source fields, not Ibis' default
+        # deduplicated keys. A later reversed join nests this entire expression;
+        # omitted keys would then lose their original alias or NULL provenance.
+        projected = []
+        names: set[str] = set()
+        for _, frame in frames:
+            for name in frame.columns:
+                output = name
+                while output in names:
+                    output += "_right"
+                names.add(output)
+                projected.append(frame[name].name(output))
+        expr = expr.select(projected)
+        if cap is not None:
+            expr = _cap_lateral_rows(expr, keys, orders, cap)
     return frames, expr
 
 
@@ -531,26 +574,16 @@ def _aggregate(
     ctes: dict[str, ir.Table] | None, tables: dict[str, ir.Table] | None,
 ) -> ir.Scalar:
     """Apply an optional predicate to this reduction, never to the input relation."""
-    if not isinstance(spec, dict) or not {"fn", "arg"} <= set(spec) or set(spec) - {"fn", "arg", "where"}:
-        raise PayloadError("aggregate must contain fn, arg and optional where")
-    fn, arg = spec["fn"], spec["arg"]
-    if not isinstance(fn, str) or fn not in AGGREGATE_FNS:
-        raise PayloadError(f"unknown aggregate: {fn!r}")
-    if not isinstance(arg, str):
-        raise PayloadError("aggregate arguments must be a column or count(*)")
+    fn, arg = _validate_aggregate(spec)
     predicate = spec.get("where")
     if predicate is not None:
-        _validate_aggregate_where(predicate)
         predicate = _where_expr(con, frames, predicate, ctes, tables)
+        (predicate,) = expr.bind(predicate)
     if arg == "*":
         if fn != "count":
             raise PayloadError(f"{fn}(*) is not supported — only count accepts '*'")
-        if predicate is not None:
-            # Table.count's lightweight binding does not rewrite ancestor fields.
-            # Dereference onto the joined/filtered relation before CountStar owns it.
-            (predicate,) = expr.bind(predicate)
         return expr.count(where=predicate)
-    column = col(frames, arg)
+    (column,) = expr.bind(col(frames, arg))
     method = "mean" if fn == "avg" else fn
     try:
         return getattr(column, method)(where=predicate)
@@ -558,47 +591,68 @@ def _aggregate(
         raise PayloadError(f"invalid {fn} operand: {exc}") from exc
 
 
-def _validate_aggregate_where(predicate: object) -> None:
-    """Reject malformed/ambiguous raw predicate trees before Ibis sees them."""
+def _validate_aggregate(spec: object) -> tuple[str, str]:
+    if not isinstance(spec, dict) or not {"fn", "arg"} <= set(spec) or set(spec) - {"fn", "arg", "where"}:
+        raise PayloadError("aggregate must contain fn, arg and optional where")
+    fn, arg = spec["fn"], spec["arg"]
+    if not isinstance(fn, str) or fn not in AGGREGATE_FNS:
+        raise PayloadError(f"unknown aggregate: {fn!r}")
+    if not isinstance(arg, str) or not arg:
+        raise PayloadError("aggregate arguments must be a column or count(*)")
+    if spec.get("where") is not None:
+        _validate_where(spec["where"])
+    return fn, arg
+
+
+def _validate_where(predicate: object, *, allow_aggregate: bool = False) -> None:
+    """Bound predicate trees; a reduction's own filter always remains row-only."""
+    label = "where" if allow_aggregate else "aggregate where"
     pending = [(predicate, 0, True)]
     nodes = 0
     leaf_fields = {"column", "op", "value", "subquery", "low", "high", "values", "group"}
+    if allow_aggregate:
+        leaf_fields.add("aggregate")
     scalar_types = (str, int, float, bool)
     while pending:
         condition, depth, tree = pending.pop()
         nodes += 1
         if depth > MAX_WHERE_DEPTH or nodes > MAX_WHERE_NODES:
-            raise PayloadError("aggregate where exceeds maximum depth or nodes")
+            raise PayloadError(f"{label} exceeds maximum depth or nodes")
         allowed = leaf_fields | {"ands", "ors"} if tree else leaf_fields
         if not isinstance(condition, dict) or set(condition) - allowed:
-            raise PayloadError("aggregate where conditions must be predicate objects")
+            raise PayloadError(f"{label} conditions must be predicate objects")
         for key in ("ands", "ors"):
             if key not in condition:
                 continue
             children = condition[key]
-            if not isinstance(children, list) or not children:
-                raise PayloadError(f"aggregate where {key} must be a non-empty array")
+            if not isinstance(children, list) or (not children and (not allow_aggregate or key == "ors")):
+                raise PayloadError(f"{label} {key} must be a non-empty array")
             if key == "ands":
                 pending.extend((child, depth, False) for child in children)
             else:
                 for group in children:
                     if not isinstance(group, list) or not group:
-                        raise PayloadError("aggregate where or-groups must be non-empty arrays")
+                        raise PayloadError(f"{label} or-groups must be non-empty arrays")
                     pending.extend((child, depth, False) for child in group)
-        if "group" in condition:
-            if any(condition.get(key) not in (None, "") for key in ("column", "op", "value", "subquery")) or any(key in condition for key in ("low", "high", "values")):
-                raise PayloadError("aggregate where group cannot carry a predicate operand")
+        aggregate = condition.get("aggregate")
+        if condition.get("group") is not None:
+            if aggregate is not None or any(condition.get(key) not in (None, "") for key in ("column", "op", "value", "subquery")) or any(key in condition for key in ("low", "high", "values")):
+                raise PayloadError(f"{label} group cannot carry a predicate operand")
             pending.append((condition["group"], depth + 1, True))
             continue
         op = condition.get("op")
         if not isinstance(op, str) or op not in OPERATORS:
             raise PayloadError(f"unknown operator: {op!r}")
-        if not isinstance(condition.get("column"), str):
-            raise PayloadError("aggregate where needs a column")
+        if aggregate is not None:
+            if condition.get("column") not in (None, ""):
+                raise PayloadError("aggregate where predicate cannot also name a column")
+            _validate_aggregate(aggregate)
+        elif not isinstance(condition.get("column"), str):
+            raise PayloadError(f"{label} needs a column")
         subquery = condition.get("subquery")
         if subquery is not None:
             if not isinstance(subquery, dict) or op not in SUBQUERY_OPS | COMPARISONS.keys():
-                raise PayloadError("aggregate where has an invalid subquery operand")
+                raise PayloadError(f"{label} has an invalid subquery operand")
             operands = set()
         elif op in NULL_OPS:
             operands = set()
@@ -609,33 +663,186 @@ def _validate_aggregate_where(predicate: object) -> None:
         else:
             operands = {"value"}
         if (set(condition) & {"low", "high", "values"}) != operands - {"value"}:
-            raise PayloadError("aggregate where has invalid predicate operands")
+            raise PayloadError(f"{label} has invalid predicate operands")
         if "value" not in operands and condition.get("value") not in (None, ""):
-            raise PayloadError("aggregate where operator takes no value operand")
+            raise PayloadError(f"{label} operator takes no value operand")
         for key in operands:
             if key not in condition:
-                raise PayloadError(f"aggregate where needs {key}")
+                raise PayloadError(f"{label} needs {key}")
             value = condition[key]
             if key == "values":
                 if not isinstance(value, list) or not value:
-                    raise PayloadError("aggregate where values must be a non-empty array")
+                    raise PayloadError(f"{label} values must be a non-empty array")
                 values = value
             else:
                 values = [value]
             if any(value is not None and not isinstance(value, scalar_types) for value in values):
-                raise PayloadError("aggregate where operands must be scalar values")
+                raise PayloadError(f"{label} operands must be scalar values")
 
 
-def _predicate(frames: list[tuple[str, ir.Table]], condition: dict) -> ir.BooleanValue:
+def _where_aliases(select: list) -> tuple[set[str], set[str]]:
+    """Discover output scopes without building reductions on unfiltered input."""
+    aggregates: set[str] = set()
+    windows: set[str] = set()
+    for item in select:
+        if not isinstance(item, dict):
+            raise PayloadError("select items must be objects")
+        aggregate = item.get("aggregate")
+        rank = item.get("rank")
+        alias = item.get("alias")
+        name = alias if isinstance(alias, str) and alias else None
+        if isinstance(aggregate, dict):
+            name = name or _derived_alias(aggregate.get("fn"), aggregate.get("arg"))
+        elif isinstance(rank, dict):
+            name = name or str(rank.get("fn"))
+        if item.get("window") is not None:
+            if name:
+                windows.add(name)
+            continue
+        if aggregate is not None and name:
+            aggregates.add(name)
+        arithmetic = item.get("arithmetic")
+        if arithmetic is None:
+            continue
+        pending = [(arithmetic, 1)]
+        nodes = 0
+        while pending:
+            node, depth = pending.pop()
+            nodes += 1
+            if depth > MAX_EXPRESSION_DEPTH or nodes > MAX_EXPRESSION_NODES:
+                raise PayloadError("expression exceeds maximum depth or nodes")
+            if not isinstance(node, dict):
+                continue  # The ordinary expression builder reports invalid operands.
+            if node.get("aggregate") is not None:
+                aggregates.add(name or "arithmetic")
+            args = node.get("args")
+            if isinstance(args, list):
+                pending.extend((child, depth + 1) for child in args)
+    return aggregates, windows
+
+
+def _split_where(
+    condition: dict, aggregate_aliases: set[str], window_aliases: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate independent AND factors, never move part of an OR across stages."""
+    rows: list[dict] = []
+    groups: list[dict] = []
+    if condition.get("ors"):
+        leaves, _ = _tree_leaves(condition)
+        aggregate = False
+        for leaf in leaves:
+            ref = leaf.get("column")
+            if isinstance(ref, str) and "." not in ref:
+                if ref in window_aliases:
+                    raise PayloadError(f"where cannot reference window alias {ref!r}; use a CTE")
+                aggregate |= ref in aggregate_aliases
+            aggregate |= leaf.get("aggregate") is not None
+        return ([], [condition]) if aggregate else ([condition], [])
+    for leaf in [condition, *(condition.get("ands") or [])]:
+        if leaf.get("group") is not None:
+            before, after = _split_where(leaf["group"], aggregate_aliases, window_aliases)
+            rows.extend(before)
+            groups.extend(after)
+            continue
+        ref = leaf.get("column")
+        unqualified = isinstance(ref, str) and "." not in ref
+        if unqualified and ref in window_aliases:
+            raise PayloadError(f"where cannot reference window alias {ref!r}; use a CTE")
+        target = groups if leaf.get("aggregate") is not None or (unqualified and ref in aggregate_aliases) else rows
+        target.append({key: value for key, value in leaf.items() if key != "ands"} if "ands" in leaf else leaf)
+    return rows, groups
+
+
+def _aggregate_result(
+    con, source: ir.Table, frames: list[tuple[str, ir.Table]], keys: list[ir.Value],
+    aggregates: list[ir.Scalar], constants: list[ir.Scalar], conditions: list[dict],
+    ctes: dict[str, ir.Table] | None, tables: dict[str, ir.Table] | None,
+) -> ir.Table:
+    """Filter grouped outputs with private metrics, preserving the requested keys."""
+    if not conditions:
+        expr = source.group_by(keys).aggregate(aggregates) if keys else source.aggregate(aggregates)
+        return expr.mutate(constants) if constants else expr
+    if not keys and not aggregates and not constants:
+        raise PayloadError("aggregate where needs selected expressions or groupBy columns")
+
+    def operation(value: ir.Value):
+        node = value.op()
+        return node.arg if isinstance(node, ops.Alias) else node
+
+    names = {value.get_name() for value in [*keys, *aggregates, *constants]}
+    aliases = {value.get_name() for value in aggregates}
+    outputs = {value.get_name() for value in [*keys, *constants]}
+    metrics = list(aggregates)
+    metric_names = {operation(value): value.get_name() for value in aggregates}
+    references: dict[int, str] = {}
+    helpers: list[str] = []
+    for condition in conditions:
+        leaves, _ = _tree_leaves(condition)
+        for leaf in leaves:
+            spec = leaf.get("aggregate")
+            if spec is None:
+                continue
+            value = _aggregate(con, source, frames, spec, ctes, tables)
+            node = operation(value)
+            name = metric_names.get(node)
+            if name is None:
+                name = f"d8r_where_{len(helpers)}"
+                while name in names:
+                    name += "_"
+                names.add(name)
+                helpers.append(name)
+                metrics.append(value.name(name))
+                metric_names[node] = name
+            references[id(spec)] = name
+
+    expr = source.group_by(keys).aggregate(metrics) if keys else source.aggregate(metrics)
+    if constants:
+        expr = expr.mutate(constants)
+    grouped = {operation(value): value.get_name() for value in source.bind(keys)}
+
+    def resolve(condition: dict) -> ir.Value:
+        if condition.get("aggregate") is not None:
+            return expr[references[id(condition["aggregate"])]]
+        ref = condition.get("column")
+        unqualified = isinstance(ref, str) and "." not in ref
+        # Only aggregate aliases shadow source columns; qualification escapes it.
+        if unqualified and ref in aliases:
+            return expr[ref]
+        try:
+            column = col(frames, ref)
+        except PayloadError:
+            if unqualified and ref in outputs:
+                return expr[ref]
+            raise PayloadError(f"post-aggregation where needs a grouped column: {ref!r}") from None
+        (column,) = source.bind(column)
+        name = grouped.get(operation(column))
+        if name is None:
+            raise PayloadError(
+                f"post-aggregation where cannot reference ungrouped column {ref!r}; "
+                "an OR with aggregates must use grouped columns"
+            )
+        return expr[name]
+
+    expr = expr.filter([
+        _where_expr(con, frames, condition, ctes, tables, resolve)
+        for condition in conditions
+    ])
+    return expr.drop(*helpers) if helpers else expr
+
+
+def _predicate(
+    frames: list[tuple[str, ir.Table]], condition: dict, column: ir.Value | None = None,
+) -> ir.BooleanValue:
     """Boolean predicate from a condition object (shared by `where` and case
     `when` branches).
 
     The base shape is `{column, op, value}`; `between` carries `low`/`high`,
     an `in`/`not in` literal list carries `values`, and `is [not] null` carries
-    neither. A `{subquery}` operand is handled one level up (`_apply_filter`),
+    neither. A `{subquery}` operand is handled one level up (`_condition_tree`),
     never inside a `\\case` branch.
     """
-    column = col(frames, condition.get("column"))
+    if column is None:
+        column = col(frames, condition.get("column"))
     op = condition.get("op")
     value = condition.get("value")
     if op in NULL_OPS:
@@ -682,25 +889,6 @@ def _regex_match(column: ir.Column, op: str, pattern: object) -> ir.BooleanValue
     return match if op == "~" else ~match
 
 
-def _apply_filter(
-    con,
-    expr: ir.Table,
-    frames: list[tuple[str, ir.Table]],
-    condition: object,
-    ctes: dict[str, ir.Table] | None,
-    tables: dict[str, ir.Table] | None,
-) -> ir.Table:
-    """A `\\where` clause: a literal predicate, a predicate tree, or one over
-    an inline subquery.
-
-    A single plain condition filters exactly as it always did; composition
-    (`ands`/`ors`, and `( ... )` groups under `group`) reduces through
-    `_where_expr`."""
-    if not isinstance(condition, dict):
-        raise PayloadError("where must be an object")
-    return expr.filter(_where_expr(con, frames, condition, ctes, tables))
-
-
 def _head(group: object) -> dict:
     """An or-group's `[first, *ands]` list as one and-group dict."""
     if not isinstance(group, list) or not group or not isinstance(group[0], dict):
@@ -714,11 +902,12 @@ def _where_expr(
     condition: dict,
     ctes: dict[str, ir.Table] | None,
     tables: dict[str, ir.Table] | None,
+    resolve: Callable[[dict], ir.Value] | None = None,
 ) -> object:
     """A where-tree dict (a clause or a group) as a boolean expression.
 
-    Same shape `_apply_filter` reads at the top level: the head's and-group
-    ANDed, then `ors` ORed over it. A group node recurses through its own
+    The head's and-group is ANDed, then `ors` are ORed over it. A group node
+    recurses through its own
     `group` subtree — parens are just a where-tree in a box."""
     if not isinstance(condition, dict):
         raise PayloadError("where conditions must be objects")
@@ -729,9 +918,9 @@ def _where_expr(
         groups = [condition, *(_head(group) for group in ors)]
         return functools.reduce(
             operator.or_,
-            [_condition_tree(con, frames, group, ctes, tables) for group in groups],
+            [_condition_tree(con, frames, group, ctes, tables, resolve) for group in groups],
         )
-    return _condition_tree(con, frames, condition, ctes, tables)
+    return _condition_tree(con, frames, condition, ctes, tables, resolve)
 
 
 def _condition_tree(
@@ -740,6 +929,7 @@ def _condition_tree(
     condition: dict,
     ctes: dict[str, ir.Table] | None,
     tables: dict[str, ir.Table] | None,
+    resolve: Callable[[dict], ir.Value] | None = None,
 ) -> object:
     """One and-group as a boolean expression; its leaves AND together.
 
@@ -752,11 +942,13 @@ def _condition_tree(
             raise PayloadError("where conditions must be objects")
         group = cond.get("group")
         if group is not None:
-            leaves.append(_where_expr(con, frames, group, ctes, tables))
-        elif cond.get("subquery") is not None:
-            leaves.append(_subquery_predicate(con, frames, cond, cond["subquery"], ctes, tables))
+            leaves.append(_where_expr(con, frames, group, ctes, tables, resolve))
         else:
-            leaves.append(_predicate(frames, cond))
+            column = resolve(cond) if resolve is not None else None
+            if cond.get("subquery") is not None:
+                leaves.append(_subquery_predicate(con, frames, cond, cond["subquery"], ctes, tables, column))
+            else:
+                leaves.append(_predicate(frames, cond, column))
     return leaves[0] if len(leaves) == 1 else functools.reduce(operator.and_, leaves)
 
 
@@ -767,6 +959,7 @@ def _subquery_predicate(
     subquery: object,
     ctes: dict[str, ir.Table] | None,
     tables: dict[str, ir.Table] | None,
+    column: ir.Value | None = None,
 ) -> object:
     """A predicate over an inline `( … )` subquery operand.
 
@@ -777,7 +970,8 @@ def _subquery_predicate(
     if not isinstance(subquery, dict):
         raise PayloadError("where subquery must be an object")
     op = condition.get("op")
-    column = col(frames, condition.get("column"))
+    if column is None:
+        column = col(frames, condition.get("column"))
     sub = build(con, subquery, ctes, tables)
     projected = [str(name) for name in sub.columns]
     if len(projected) != 1:
@@ -1221,6 +1415,87 @@ def _star_columns(frames: list[tuple[str, ir.Table]]) -> list[ir.Column]:
     return columns
 
 
+class _SchemaConnection:
+    """Resolve unbound relations from one snapshot, never a backend connection."""
+
+    def __init__(self, schema: SchemaContext) -> None:
+        self.schema = schema
+        self.tables: dict[str, ir.Table] = {}
+
+    def table(self, name: str) -> ir.Table:
+        definition = self.schema.table_by_name(name)
+        if definition is None or not definition.columns:
+            raise PayloadError(f"schema metadata unavailable for dataset: {name}")
+        if definition.name not in self.tables:
+            self.tables[definition.name] = ibis.table(
+                {column.name: column.type for column in definition.columns},
+                name=definition.name,
+            )
+        return self.tables[definition.name]
+
+
+def validate_schema(ast: QueryAST, schema: SchemaContext) -> None:
+    """Validate a complete query against captured metadata without any backend I/O.
+
+    CTEs, subqueries and expanded functions use the same builder as execution,
+    so every reference is checked against its actual input relation's schema.
+    Missing metadata is an error, including for partial remote schema indexes.
+    """
+    if ast.errors:
+        raise PayloadError("; ".join(error.message for error in ast.errors))
+    if ast.from_ is None and (ast.tx or ast.drop):
+        return
+    try:
+        build(_SchemaConnection(schema), payload_from_ast(ast))
+    except (IbisError, TypeError, ValueError, OverflowError) as exc:
+        raise PayloadError(f"invalid query for loaded schema: {exc}") from exc
+
+
+def source_schemas(ast: QueryAST, schema: SchemaContext) -> list[ibis.Schema | None]:
+    """Infer input relations in source order using the ordinary expression builder.
+
+    Only completed source bodies are built: the outer projection/filter being
+    typed must not hide its input columns. An invalid or unindexed relation has
+    no known schema, not the global column pool. Each relation fails separately
+    so an unfinished neighbour cannot remove other available sources.
+    """
+    if ast.from_ is None:
+        return []
+    con = _SchemaConnection(schema)
+    ctes: dict[str, ir.Table] = {}
+    errors = {error.line for error in ast.errors}
+    for cte in ast.with_:
+        body = cte.body
+        clauses = (body.from_, body.where, *body.joins, *body.set_ops, *body.select,
+                   *body.group_by, *body.order_by, *body.cases)
+        if body.from_ is None or any(clause.line in errors for clause in clauses if clause is not None):
+            continue
+        try:
+            ctes[cte.name] = build(con, payload_from_ast(cte.body), ctes)
+        except (PayloadError, IbisError, TypeError, ValueError):
+            # Invalid/incomplete bodies have no trustworthy output schema.
+            continue
+
+    payload = payload_from_ast(ast)
+    frames: list[tuple[str, ir.Table]] = []
+    schemas: list[ibis.Schema | None] = []
+    for clause, spec in zip((ast.from_, *ast.joins), (payload, *payload["joins"])):
+        if clause.line in errors:
+            schemas.append(None)
+            continue
+        try:
+            if spec.get("lateral"):
+                relation, *_ = _lateral_parts(con, spec, frames, ctes, None)
+            else:
+                relation = _build_source(con, spec["dataset"], spec.get("body"), ctes, None)
+        except (PayloadError, IbisError, TypeError, ValueError):
+            schemas.append(None)
+            continue
+        frames.append((spec.get("alias") or spec["dataset"], relation))
+        schemas.append(relation.schema())
+    return schemas
+
+
 def build(
     con,
     payload: dict,
@@ -1259,6 +1534,7 @@ def build(
         tables,
     )
 
+    # Query filters have two scopes; reduction filters still resolve only rows.
     select = payload.get("select") or []
     group_by = payload.get("groupBy") or []
     where = payload.get("where")
@@ -1272,8 +1548,16 @@ def build(
     if not isinstance(order_by, list):
         raise PayloadError("orderBy must be an array")
 
+    post_where: list[dict] = []
     if where is not None:
-        expr = _apply_filter(con, expr, frames, where, cte_tables, tables)
+        _validate_where(where, allow_aggregate=True)
+        aggregate_aliases, window_aliases = _where_aliases(select)
+        row_where, post_where = _split_where(where, aggregate_aliases, window_aliases)
+        if row_where:
+            expr = expr.filter([
+                _where_expr(con, frames, condition, cte_tables, tables)
+                for condition in row_where
+            ])
 
     plain: list[ir.Value] = []
     constants: list[ir.Scalar] = []
@@ -1428,15 +1712,15 @@ def build(
     if not isinstance(cases, list):
         raise PayloadError("cases must be an array")
     computed = [_case_column(frames, spec) for spec in cases]
-    if windowed and (aggregates or group_by):
+    if windowed and (aggregates or post_where or group_by):
         raise PayloadError("windowed select items cannot mix with aggregates or group by")
-    if star_seen and (aggregates or group_by):
+    if star_seen and (aggregates or post_where or group_by):
         raise PayloadError("star select cannot mix with aggregates or group by")
-    if scalar_subqueries and (aggregates or group_by):
+    if scalar_subqueries and (aggregates or post_where or group_by):
         raise PayloadError("a scalar subquery cannot mix with aggregates or group by")
     computed += windowed + scalar_subqueries
     joined = len(frames) > 1
-    if aggregates:
+    if aggregates or post_where:
         if computed:
             raise PayloadError("case/window columns cannot mix with aggregates")
         for column in plain:
@@ -1445,9 +1729,9 @@ def build(
             if column.get_name() not in seen:
                 keys.append(column)
                 seen.add(column.get_name())
-        expr = expr.group_by(keys).aggregate(aggregates) if keys else expr.aggregate(aggregates)
-        if constants:
-            expr = expr.mutate(constants)
+        expr = _aggregate_result(
+            con, expr, frames, keys, aggregates, constants, post_where, cte_tables, tables,
+        )
     elif plain:
         expr = expr.select([*plain, *computed])
     elif joined:

@@ -3,7 +3,7 @@
 A datasource is a named connection carrying its own dataset schemas. `demo`
 is the bundled Parquet directory executed on a real in-process DuckDB; other
 bundled entries are vendor-shaped mock schemas mirrored into DuckDB. Explicitly
-added sources use a local SQLite snapshot, Cloudflare's live D1 API, or PostgreSQL.
+added sources use real Ibis backends or Cloudflare's live D1 HTTP API.
 
 Every bundled path resolves from this module's own file, never the process
 working directory, so the engine behaves the same however it is launched.
@@ -144,6 +144,10 @@ def _probe_compile(con, make) -> bool:
     operations at construction (SQLite rejects ASOF joins and seeded samples
     before any SQL is compiled), and a refusal is a refusal.
     """
+    # Spark's compiler consults the active session config, which can be a remote
+    # Spark Connect RPC. Never perform that lookup from an offline capability probe.
+    if getattr(con, "name", None) == "pyspark":
+        return False
     try:
         compile_sql(make(), dialect=getattr(con, "name", None))
     except Exception:
@@ -156,11 +160,10 @@ def _probe_flags(con) -> dict:
 
     `has_operation` answers for the backend's own compiler; the two flags
     with no operation class of their own (`asofJoin`, `samplingSeed`) are
-    compile probes. The probe tables are bound to `con` (a `con.sql` stub
-    with a declared schema — never executed) so per-backend construction
-    checks, like SQLite refusing an ASOF join or a seeded sample outright,
-    count as refusals too. On probe failure the flag is False — the
-    conservative direction.
+    compile probes. Probe tables are constructed directly as bound Ibis nodes,
+    never through con.sql (which performs metadata queries on some backends).
+    Per-backend construction checks count as refusals too. On probe failure
+    the flag is False — the conservative direction.
     """
     flags = {flag: False for flag in (*_PROBE_OPS, "asofJoin", "samplingSeed")}
     for flag, op_name in _PROBE_OPS.items():
@@ -169,9 +172,9 @@ def _probe_flags(con) -> dict:
         except Exception:
             flags[flag] = False
     try:
-        t = con.sql("SELECT 1", schema=_PROBE_TABLE)
-        left = con.sql("SELECT 1", schema=_PROBE_JOIN)
-        right = con.sql("SELECT 2", schema=_PROBE_JOIN)
+        t = ops.DatabaseTable("probe", ibis.schema(_PROBE_TABLE), source=con).to_expr()
+        left = ops.DatabaseTable("probe_left", ibis.schema(_PROBE_JOIN), source=con).to_expr()
+        right = ops.DatabaseTable("probe_right", ibis.schema(_PROBE_JOIN), source=con).to_expr()
     except Exception:
         return flags
     flags["samplingSeed"] = _probe_compile(con, lambda: t.sample(0.1, seed=7))
@@ -203,7 +206,7 @@ def _unrenderable_on(con) -> frozenset[str]:
         "url_fragment": lambda: t.s.fragment(),
     }
     try:
-        t = con.sql("SELECT 1", schema={"a": "int64", "s": "string"})
+        t = ops.DatabaseTable("probe", ibis.schema({"a": "int64", "s": "string"}), source=con).to_expr()
     except Exception:
         return frozenset((*calls, *JSON_FUNCTIONS))
     for fn in JSON_FUNCTIONS:
@@ -217,10 +220,9 @@ def _unrenderable_on(con) -> frozenset[str]:
     return frozenset(dead)
 
 # Functions ibis's PostgreSQL compiler renders but a server only answers
-# when an extension provides them (fuzzystrmatch owns levenshtein). A compile
-# probe cannot see server state; the catalog can, and it is queried once per
-# connection at first capability call — introspection like schema discovery,
-# never a row scan, never an extension install.
+# when an extension provides them (fuzzystrmatch owns levenshtein). Read those
+# catalog facts during explicit connection discovery, never inside a capability
+# probe or UI capability lookup. Unknown extension support stays conservative.
 _PG_EXTENSION_FUNCTIONS = frozenset({"levenshtein"})
 
 
@@ -248,7 +250,7 @@ def _probes_for(con) -> dict:
         return cached
     dead = _unrenderable_on(con)
     if getattr(con, "name", None) == "postgres":
-        dead = dead | _pg_extension_function_gaps(con)
+        dead = dead | getattr(con, "_d8r_missing_extension_functions", _PG_EXTENSION_FUNCTIONS)
     probed = {**_probe_flags(con), "dead": dead}
     try:
         _PROBE_CACHE[con] = probed
@@ -337,6 +339,21 @@ def capabilities_for(source: "DataSource") -> dict:
                 op for op in CAPABILITIES["operators"]
                 if regex or op not in {"~", "!~"}
             ],
+        }
+    elif source.kind in {"ibis", "disconnected"}:
+        connected = source.kind == "ibis" and source.con is not None
+        # tx.py only controls our DuckDB/sqlite3 handles and existing PostgreSQL
+        # path. A DB-API-looking driver is not evidence of transaction support.
+        local_tx = connected and source.dialect in {"duckdb", "sqlite"}
+        caps = {
+            **CAPABILITIES,
+            "backend": f"{source.dialect} ({'live' if connected else 'disconnected'})",
+            "supports": {
+                **CAPABILITIES["supports"],
+                "temp": local_tx,
+                "transactions": local_tx,
+                "savepoints": local_tx and source.dialect == "sqlite",
+            },
         }
     if source.con is None:
         return caps
@@ -579,7 +596,7 @@ class DataSource:
     id: str
     display: str
     doc: str
-    kind: str  # "demo" | "mock" | "d1" | "d1-live" | "postgres-live"
+    kind: str  # "demo" | "mock" | "d1" | "d1-live" | "postgres-live" | "ibis" | "disconnected"
     dialect: str  # suggested default compile dialect
     dir: Path
     con: object = field(default=None, repr=False)
@@ -591,6 +608,8 @@ class DataSource:
     # Connection identity only: the password stays with the driver/profile owner.
     postgres: dict[str, str] = field(default_factory=dict, repr=False)
     schema_indexed: bool = True
+    connection_key: str = ""
+    default_schema: str | None = None
 
 
 def type_name(dtype) -> str:
@@ -613,7 +632,7 @@ def dialect_for(source: DataSource, name: str | None = None) -> str:
     spec = DIALECT_BY_NAME.get(chosen)
     if spec is None:
         raise PayloadError(f"unknown dialect: {chosen}")
-    if not spec["compiles"]:
+    if not spec["compiles"] and not (source.kind == "ibis" and source.dialect == chosen and source.con is not None):
         raise PayloadError(f"dialect {chosen} does not compile in this build")
     return chosen
 
@@ -946,6 +965,7 @@ def add_postgres_source(
         )
         stage = "inspect"
         con = ibis.postgres.from_connection(raw)
+        con._d8r_missing_extension_functions = _pg_extension_function_gaps(con)
         # Connection state, not query SQL. Identifier quoting makes commas,
         # quotes and dots a single schema name, never a search_path expression.
         with raw.cursor() as cursor:

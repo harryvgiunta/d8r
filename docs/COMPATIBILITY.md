@@ -39,6 +39,7 @@ tokens ≤ 640 chars; ≤ 16 nested / 256 total function calls per parse.
 |Module|Functionality|
 |---|---|
 |`datasources.py`|The registry: `demo` (Parquet on DuckDB), four vendor mocks, runtime-added SQLite snapshots (`d1`), live Cloudflare D1 (`d1-live`), live PostgreSQL (`postgres-live`). `DIALECTS` (20 compile targets), `CAPABILITIES`, `capabilities_for` (per-source truth: function lists, operator lists, `supports` flags — live-probed per connection through `_probe_flags`/`_unrenderable_on`, plus a `pg_proc` check for extension-backed functions like `levenshtein`).|
+|`connectors.py`|Real `kind="ibis"` adapters for every advertised backend except the dedicated PostgreSQL path; backend form metadata, profile normalization/identity, safe credential handling, namespace-only discovery and owned-resource disposal. Optional drivers and native runtimes remain explicit prerequisites.|
 |`expression.py`|`build` — payload → `ir.Table`: select items (column / literal / aggregate / temporal / scalar call / regex / rank / window / case / subquery), the recursive `_condition_tree` for `\where` (ands, or-groups, `( … )` groups), joins incl. the lateral correlation hoisting + top-N rewrite, set ops, `compile_sql` (render-only, any dialect).|
 |`execute.py`|`execute` (build → compile → run), `execute_remote` (live D1: the compiled SQLite SQL POSTed to D1's HTTP API), `materialize` (`\temp`).|
 |`tx.py`|Transactions, savepoints, temp tables — the only DDL in the app, issued through the backend handle (`CREATE TEMPORARY TABLE … AS`, temp-namespace-qualified).|
@@ -111,11 +112,18 @@ Two independent questions, answered separately and measured live:
 
 * **Compile** — `ctrl+k` renders the document's SQL for *any* of the 19
   compilable dialects without executing anything (the 20th, PySpark, is
-  listed as known-but-uncompilable). A function "compiles" for a dialect
+  available only with its live Spark runtime). A function "compiles" for a dialect
   when ibis has a rendering rule there.
 * **Execute** — a source runs a function only when its own connection
   answers; `capabilities_for` hides what it cannot, and the palette stops
   offering it.
+
+The execution matrices below describe the measured DuckDB/SQLite/PostgreSQL/D1
+baseline, not live-server certification of every new connector. Generic sources
+probe their own compilers offline and label their backend honestly. They enable
+transactions/temp tables only for the existing DuckDB/SQLite implementations.
+Connection setup and native prerequisites are documented in the README's
+**Add Trino or another Ibis database** section.
 
 ### 4.1 Universal (compiles 19/19 and executes on every live backend)
 
@@ -153,7 +161,7 @@ below (measured against ibis 12.0.0; `·`-listed = cannot render):
 |`snowflake`|`url_host` · `convert_base`|
 |`sqlite`|`levenshtein` · `as_date` · `as_time` · `as_timestamp` · `convert_base`|
 |`trino`|`as_time` · `convert_base`|
-|`pyspark`|*known-but-uncompilable in this build* (labelled `· unavailable` in the picker)|
+|`pyspark`|Requires its real live Spark session; unavailable for offline compilation.|
 
 Notes:
 

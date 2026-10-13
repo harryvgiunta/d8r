@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 
 import pytest
-from textual.widgets import DataTable
+from textual.widgets import DataTable, TextArea, Tree
 
 from d8r.query import ForeignKey
 from d8r.tui.app import D8RApp
@@ -62,6 +62,21 @@ def test_filtered_aggregate_uses_where_completion_until_its_closing_paren(expres
     view = view_for(session, "\\from events\n" + line, line, len(line))
     assert view is not None
     assert view.labels == labels
+
+
+def test_aggregate_predicate_completion_never_samples_a_source_column(sources):
+    session = Session(sources)
+
+    def no_values(column):
+        pytest.fail(f"aggregate result requested source values for {column}")
+
+    for predicate in ("count ( * ) ", "sum(amount \\where event_type = 'purchase') "):
+        line = "\\where " + predicate
+        view = view_for(session, "\\from events\n" + line, line, len(line), value_lookup=no_values)
+        assert view is not None and ">" in view.labels
+    for predicate in ("count(*) > ", "count(*) between ", "count(*) between 1 and "):
+        line = "\\where " + predicate
+        assert view_for(session, "\\from events\n" + line, line, len(line), value_lookup=no_values) is None
 
 
 @pytest.mark.parametrize(("marked", "expected", "label"), [
@@ -388,5 +403,106 @@ def test_group_completion_stays_in_its_cte_and_preserves_existing_groups():
             app.editor.move_cursor((1, len("\\select event_type")))
             await pilot.press(*"\\gro", "tab")
             assert app.editor.text == "\\from events\n\\select event_type\n\\group event_type "
+
+    asyncio.run(scenario())
+
+
+def test_cross_mode_keeps_source_boundaries_aliases_and_foreign_keys(sources, tmp_path):
+    source = replace(sources["demo"], datasets={
+        "events": {
+            **sources["demo"].datasets["events"],
+            "foreign_keys": (ForeignKey(("user_id",), "etl.users", ("user_id",)),),
+        },
+        "etl.users": sources["demo"].datasets["users"],
+    })
+    session = Session({source.id: source}, data_dir=tmp_path)
+    prefix = "\\from events u\n"
+    mode = "\\join cr"
+    view = view_for(session, prefix + mode, mode, len(mode))
+    assert [(entry.label, entry.insert) for entry in view.entries] == [("cross", "cross ")]
+
+    line = '\\JOIN\tCrOsS\t"etl".us'
+    view = view_for(session, prefix + line, line, len(line))
+    assert view.labels == ["etl.users"]
+    assert line[:view.start] + view.entries[0].insert == "\\JOIN\tCrOsS\tetl.users u2 "
+    # Editing an existing source preserves its explicit alias and trailing text.
+    line = '\\join cross "etl".users_stale as kept'
+    column = line.index("users_stale") + 2
+    view = view_for(session, prefix + line, line, column)
+    assert line[:view.start] + view.entries[0].insert + line[view.end:] == "\\join cross etl.users  as kept"
+
+    ordinary = "\\join etl.users u2 "
+    view = view_for(session, prefix + ordinary, ordinary, len(ordinary))
+    assert view.labels == ["on u.user_id = u2.user_id"]
+    crossed = "\\join cross etl.users u2 "
+    assert view_for(session, prefix + crossed, crossed, len(crossed)) is None
+    assert session.column_reference(prefix + crossed, "etl.users", "region") == "u2.region"
+
+
+def test_cross_named_tables_remain_ordinary_sources(sources, tmp_path):
+    source = replace(sources["demo"], datasets={
+        "events": {
+            **sources["demo"].datasets["events"],
+            "foreign_keys": (ForeignKey(("user_id",), "cross", ("user_id",)),),
+        },
+        "cross": sources["demo"].datasets["users"],
+        "cross.users": sources["demo"].datasets["users"],
+    })
+    session = Session({source.id: source}, data_dir=tmp_path)
+    prefix = "\\from events e\n"
+    line = "\\join cr"
+    view = view_for(session, prefix + line, line, len(line))
+    table = next(entry for entry in view.entries if entry.label == "cross" and entry.insert != "cross ")
+    assert table.insert == '"cross" c '
+    line = "\\join cross."
+    view = view_for(session, prefix + line, line, len(line))
+    assert view.labels == ["cross.users"]
+    for source_text in ('"cross" c', "cross c", "cross as c"):
+        line = "\\join " + source_text + " on "
+        view = view_for(session, prefix + line, line, len(line))
+        assert view.labels == ["e.user_id = c.user_id"]
+
+
+@pytest.mark.parametrize("function_editor", [False, True])
+def test_cross_acceptance_and_fields_in_both_editors(function_editor, sources, tmp_path):
+    source = replace(sources["demo"], datasets={
+        **sources["demo"].datasets,
+        "events": {
+            **sources["demo"].datasets["events"],
+            "foreign_keys": (ForeignKey(("user_id",), "users", ("user_id",)),),
+        },
+    })
+    session = Session({source.id: source}, data_dir=tmp_path)
+
+    async def scenario():
+        app = D8RApp(session)
+        async with app.run_test(size=(150, 58)) as pilot:
+            if function_editor:
+                app.action_fn()
+                await pilot.pause()
+                editor = app.screen.query_one("#fn-body", TextArea)
+                palette = app.screen.query_one("#fn-palette")
+            else:
+                editor, palette = app.editor, app.palette
+            editor.load_text("\\from events u\n\\join\t")
+            editor.move_cursor((1, len(editor.document[1])))
+            editor.focus()
+            await pilot.pause()
+            palette.highlighted = palette.view.labels.index("cross")
+            await pilot.press("tab")
+            assert editor.text.endswith("\\join\tcross ")
+            if function_editor:
+                palette.highlighted = palette.view.labels.index("users")
+                await pilot.press("tab")
+            else:
+                tree = app.query_one("#schema-tree", Tree)
+                users = next(node for node in tree.root.children if node.data.get("name") == "users")
+                tree.select_node(users)
+                await pilot.pause()
+            assert editor.text.endswith("\\join\tcross users u2 ")
+            assert not palette.is_open  # Even with a declared FK, no ON is offered.
+            await pilot.press("enter", *"\\select u2.reg", "tab")
+            assert editor.text.endswith("\\select u2.region ")
+            assert app.focused is editor
 
     asyncio.run(scenario())

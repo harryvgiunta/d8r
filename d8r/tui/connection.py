@@ -16,6 +16,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, LoadingIndicator, Static
 
 from d8r.engine import DataSource
+from d8r.engine.connectors import BackendConnectionError, close_backend_connection, profile_secrets
 
 if TYPE_CHECKING:
     from d8r.tui.session import Session
@@ -29,6 +30,8 @@ def release_source(source: DataSource) -> None:
     try:
         if source.d1 is not None:
             source.d1.close()
+        elif source.kind == "ibis":
+            close_backend_connection(source.con)
         elif source.con is not None:
             source.con.disconnect()
     except Exception:
@@ -87,7 +90,7 @@ async def build_connection(
 
 
 def build_saved_source(
-    session: Session, *, profile: dict[str, str] | None = None,
+    session: Session, *, profile: dict | None = None,
     snapshot_path: str | None = None,
 ) -> DataSource:
     """Build only; callers own registration and stale-target checks."""
@@ -95,6 +98,8 @@ def build_saved_source(
         return session.build_sqlite_source(snapshot_path)
     if profile is None:
         raise ValueError("Connection details are required.")
+    if profile.get("kind") == "ibis":
+        return session.build_backend_source({key: value for key, value in profile.items() if key != "kind"})
     if profile.get("kind") == "postgres-live":
         return session.build_postgres_source(
             host=profile["host"], port=int(profile["port"]), database=profile["database"],
@@ -107,16 +112,20 @@ def build_saved_source(
 
 
 def saved_source_label(
-    *, profile: dict[str, str] | None = None, snapshot_path: str | None = None,
+    *, profile: dict | None = None, snapshot_path: str | None = None,
 ) -> str:
     """A database label, never a DSN or credential-bearing exception."""
     if snapshot_path:
         return Path(snapshot_path).name
     if profile is None:
         return "data source"
-    label = profile.get("database", "data source")
-    for key in ("password", "api_token"):
-        secret = profile.get(key)
+    if profile.get("kind") == "ibis" or "backend" in profile:
+        label = profile.get("display") or profile.get("backend") or "data source"
+        secrets = profile_secrets(profile)
+    else:
+        label = profile.get("database", "data source")
+        secrets = [profile.get(key, "") for key in ("password", "api_token")]
+    for secret in secrets:
         if secret:
             label = label.replace(secret, "[redacted]")
     return label
@@ -202,6 +211,9 @@ class ConnectionProgress(ConnectionStatus):
                 self._failed(f"Connection timed out after {self._timeout:g}s. Retry to connect.")
         except asyncio.CancelledError:
             raise
+        except BackendConnectionError as exc:
+            if not self._cancelled and self.is_mounted and self._valid():
+                self._failed(str(exc))
         except Exception:
             if not self._cancelled and self.is_mounted and self._valid():
                 self._failed("Could not connect. Check the connection details and access permissions, then retry.")

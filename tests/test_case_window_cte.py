@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
+import ibis
 import pytest
 
 from d8r.engine import expression
 from d8r.engine.execute import execute
+from d8r.query import ColumnDef, SchemaContext, TableDef, parse_query, payload_from_ast
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -281,6 +284,117 @@ def test_cte_chain_references_earlier_cte(con):
     fixture = load("expected_cte_chain_rows.json")
     assert result["columns"] == fixture["columns"]
     assert result["rows"] == fixture["rows"]
+
+
+GROUPED_USAGE_QUERY = r"""\with free_projects
+  \from projects
+  \where plan_id = 'free'
+  \select id as project_id, name, primary_email
+\with today_events
+  \from usage_events
+  \where created_at >= '2026-10-09'
+  \select project_id, total_tokens
+\from today_events e
+\join free_projects p on e.project_id = p.project_id
+\select p.project_id, p.name, p.primary_email, count(*) as requests, sum(e.total_tokens) as total_tokens
+\order requests desc
+\order total_tokens desc
+\limit 25"""
+
+
+@pytest.fixture
+def usage_schema():
+    return SchemaContext([
+        TableDef("projects", columns=[
+            ColumnDef("id", "int64"), ColumnDef("name", "string"),
+            ColumnDef("primary_email", "string"), ColumnDef("plan_id", "string"),
+        ]),
+        TableDef("usage_events", columns=[
+            ColumnDef("project_id", "int64"), ColumnDef("total_tokens", "int64"),
+            ColumnDef("created_at", "timestamp"),
+        ]),
+    ])
+
+
+@pytest.fixture(params=["duckdb", "sqlite"])
+def usage_db(request, usage_schema):
+    con = getattr(ibis, request.param).connect()
+    today = datetime(2026, 10, 9)
+    data = {
+        "projects": [
+            (1, "Alpha", "a@example.test", "free"),
+            (2, "Beta", "b@example.test", "free"),
+            (3, "Gamma", "c@example.test", "free"),
+            (4, "Paid", "paid@example.test", "pro"),
+            (5, "Idle", "idle@example.test", "free"),
+            (6, "Null", None, "free"),
+        ],
+        "usage_events": [
+            (1, 10, today), (1, 20, today), (1, 30, today),
+            (2, 100, today), (2, 200, datetime(2026, 10, 10)),
+            (3, 150, today), (3, None, today), (6, None, today),
+            (4, 10000, today), (99, 10000, today),
+            (1, 10000, datetime(2026, 10, 8, 23, 59, 59)),
+        ],
+    }
+    try:
+        for definition in usage_schema.tables:
+            con.create_table(definition.name, ibis.memtable(
+                data[definition.name],
+                schema={column.name: column.type for column in definition.columns},
+            ))
+        yield con
+    finally:
+        con.disconnect()
+
+
+def test_filtered_cte_join_groups_counts_totals_and_orders(usage_db, usage_schema):
+    ast = parse_query(GROUPED_USAGE_QUERY, schema=usage_schema, settled=True)
+    assert ast.errors == []
+    expression.validate_schema(ast, usage_schema)
+    result = execute(usage_db, payload_from_ast(ast))
+    assert result["columns"] == ["project_id", "name", "primary_email", "requests", "total_tokens"]
+    # Nullable DuckDB HUGEINT sums serialize as decimal strings; compare values.
+    rows = [[*row[:-1], int(row[-1]) if row[-1] is not None else None]
+            for row in result["rows"]]
+    assert rows == [
+        [1, "Alpha", "a@example.test", 3, 60],
+        [2, "Beta", "b@example.test", 2, 300],
+        [3, "Gamma", "c@example.test", 2, 150],
+        [6, "Null", None, 1, None],
+    ]
+
+
+def test_outer_filter_applies_to_both_joined_reductions(usage_db, usage_schema):
+    doc = GROUPED_USAGE_QUERY.replace(
+        "\\select p.project_id", "\\where e.total_tokens >= 20\n\\select p.project_id",
+    )
+    ast = parse_query(doc, schema=usage_schema, settled=True)
+    assert ast.errors == []
+    assert execute(usage_db, payload_from_ast(ast))["rows"] == [
+        [2, "Beta", "b@example.test", 2, 300],
+        [1, "Alpha", "a@example.test", 2, 50],
+        [3, "Gamma", "c@example.test", 1, 150],
+    ]
+
+
+@pytest.mark.parametrize("doc", [
+    GROUPED_USAGE_QUERY.replace("p.primary_email", "p.plan_id"),
+    GROUPED_USAGE_QUERY.replace("name, primary_email", "name, missing_email"),
+    GROUPED_USAGE_QUERY.replace("e.total_tokens", "e.missing_tokens"),
+])
+def test_schema_validation_rejects_missing_cte_input_and_output_fields(doc, usage_schema):
+    ast = parse_query(doc, settled=True)
+    with pytest.raises(expression.PayloadError, match="unknown column"):
+        expression.validate_schema(ast, usage_schema)
+
+
+@pytest.mark.parametrize("tables", [(), (TableDef("projects"),)])
+def test_schema_validation_requires_available_metadata(tables):
+    ast = parse_query("\\from projects\n\\select count(*) as requests", settled=True)
+    schema = SchemaContext(tables, tables_complete=False)
+    with pytest.raises(expression.PayloadError, match="schema metadata unavailable"):
+        expression.validate_schema(ast, schema)
 
 
 def test_cte_name_shadows_registered_dataset(con):

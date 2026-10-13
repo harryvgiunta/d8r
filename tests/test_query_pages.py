@@ -26,15 +26,16 @@ def test_pages_preserve_drafts_carets_names_and_offline_targets(tmp_path, monkey
             first_id = app._document_identity
             app.action_toggle_pages()
             await pilot.pause()
-            title = app.query_one("#page-title", Input)
+            await pilot.click("#page-details-toggle")
+            title = app.query_one("#page-name", Input)
             title.value = "Customer exploration"
-            title.focus()
-            await pilot.press("enter")
+            await pilot.pause()
             await pilot.click("#page-new")
             await pilot.pause()
             second_id = app._document_identity
             assert second_id != first_id
-            app.session.restore_source(target, "sqlite")
+            app._restore_page({"id": second_id, "source": target, "dialect": "sqlite",
+                               "document": "", "cursor": [0, 0]})
             app.editor.load_text("\\from private_table\n\\where unfinished")
             app.editor.move_cursor((1, 9))
             # No debounce pause: switching must snapshot the latest widget text.
@@ -43,7 +44,7 @@ def test_pages_preserve_drafts_carets_names_and_offline_targets(tmp_path, monkey
             assert app.editor.text == "\\from users\n\\select user_id"
             assert app.editor.cursor_location == (1, 8)
             assert app.session.source_key() == "demo"
-            assert app.query_one("#page-title", Input).value == "Customer exploration"
+            assert app.query_one("#page-name", Input).value == "Customer exploration"
             app.open_page(second_id)
             app.exit()
 

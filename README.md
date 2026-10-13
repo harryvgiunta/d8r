@@ -10,8 +10,9 @@ D8R is a real application, not a mockup. It is a pure-Python
 short `\command` language, that document is parsed into an AST, the AST builds a
 real [ibis](https://ibis-project.org) expression, and the rows you see come from
 real query execution on an in-process DuckDB — or, if you add one, on your own
-Cloudflare D1 or PostgreSQL database. D8R itself starts no server and needs no
-browser. `uv run d8r` is the whole app; a PostgreSQL source needs a reachable database.
+Cloudflare D1, Trino, PostgreSQL, or another supported Ibis database. D8R itself
+starts no server and needs no browser. `uv run d8r` is the whole app; remote
+sources require a reachable database and their backend's drivers/runtime.
 
 ## The model
 
@@ -59,7 +60,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
 ## The screen
 
 ```
-┌ D8R   [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ]  duckdb ───────────┐
+┌ [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ] ──────────────────────┐
 │ Schema|Pages|agents │ Document                                               │
 │  events  100 rows   │  \from events                                          │
 │   ▸ timestamp       │  \select event_type                                    │
@@ -72,24 +73,33 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   ctrl+enter run · ctrl+k compile · ctrl+o data source · \ palette · tab accept · ctrl+q quit
 ```
 
-- **Header** — the datasource picker, the dialect picker, and a pill naming the
-  backend actually in use (`duckdb`, `postgres (mock)`, `sqlite (D1 snapshot)`,
-  `sqlite (Cloudflare D1)`, `postgres (live)`). Switching either picker re-points the whole app:
-  the tree, the parser's schema seam, and the palette's offers.
-- **Schema / Pages / Agents explorer** — Schema lists the active source's datasets and
+- **Header** — the datasource and dialect pickers, without a logo or backend banner.
+  Switching source restores that source's
+  workspace: its last query page and caret, function library/draft, and agents.
+  Switching dialect changes SQL rendering, not workspace ownership.
+  **New Query**, immediately before **Functions**, opens a blank page and keeps the current draft.
+- **Schema / Pages explorer** — Schema lists the active source's datasets and
   column types. Expand a column to inspect up to 1,000 distinct values, including
   NULL, without changing the document or execution history. Enter on a column
   still inserts its name. PostgreSQL row counts remain unloaded to avoid scans.
-  **Pages** keeps editable query drafts: create, duplicate, rename, or reopen a
-  page with its caret, source, dialect and chat identity intact. Existing successful
+  **Pages** lists editable query drafts across all sources. Its search box filters
+  case-insensitively by query text, page name, or description without changing the
+  current query. New, Duplicate, Delete and reopening preserve source/dialect and
+  chat identity; Delete acts on the highlighted row. Each page shows two lines
+  (title, then source), truncated to the pane's width. Existing successful
   history seeds pages when upgrading. `\pages` and `\queries` reveal Pages; using
   either again while Pages is visible hides the explorer. Switching pages never runs
   a query or connects a database.
-  **Agents** lists all chats and their current status; select one to reopen its
+- **Right-side AI / Agents tabs** — Agents lists the active source's query and function chats and status counts; select one to reopen its
   transcript and composer. `ctrl+j` or an **Agents** button reveals this tab
   without leaving the query or function editor.
 - **Document pane** — the editor (line numbers on), with the `\` palette
   floating under the caret.
+  **Show Page Details / Hide Page Details** toggles the current page's name and
+  description fields, both autosaved with the draft. **Generate with AI** sends
+  only the current query text to the configured AI provider and saves the generated
+  name and description; it never edits or executes the query. Cancel, a page switch,
+  or changed query/details prevents an in-flight response from overwriting edits.
 - **Results / SQL / History tabs** — Results shows the executed rows, or the
   parser/engine error line when a run is refused; SQL shows the compiled
   document for the active dialect (read-only, never executed); History lists
@@ -130,8 +140,8 @@ and window support.
 ### Settings
 
 Open Settings with `ctrl+comma` or the `\settings` palette action. A persistent
-left sidebar lists General, Show/Hide Menus, Data source, Dialect, AI provider,
-and Keybindings. Highlighting a category displays its options and explanation
+left sidebar lists General, Show/Hide Menus, Theme, Value cache, Data source,
+Dialect, AI provider, and Keybindings. Highlighting a category displays its options and explanation
 in the center without changing a setting.
 
 Use Up/Down to browse, Enter or Right to focus the category's controls, and
@@ -140,10 +150,27 @@ for the current category. Tab/Shift+Tab switch panels; Left or Escape returns
 to the sidebar without losing the selected category. Escape from the sidebar
 closes Settings. Connection and provider forms return to the same page and row.
 
-**Show/Hide Menus → agents tab** hides just that tab; **AI pane (right)** hides
-or shows the assistant and its splitter. Both preferences survive restart.
-Hiding either area preserves chat drafts and running requests. `ctrl+j` reveals
-a hidden agents tab; **Ask AI** or selecting a chat reopens the right pane.
+**Colors and themes:** select **Settings → Theme**. Each palette has color
+swatches and a light/dark label. Enter or click a theme to apply it immediately
+and save it for next launch; no restart or separate Save is needed. **Nord**
+is the default; an existing saved theme is preserved. Alternatives include
+Cozy Pastel, Dracula, Catppuccin, and terminal ANSI
+palettes. Dropdowns, completion menus, editors, and results follow the selected
+theme. Changing colors never edits or runs your document. The saved JSON key is
+`"theme"` (for example `"cozy-pastel"` or `"nord"`). `NO_COLOR` remains respected;
+unset it in your terminal environment if you want colors.
+
+The query editor and function-body editor color D8R commands, keywords, function
+calls, quoted strings, numbers, `@parameters`, and operators as you type. Colors
+follow the chosen theme, including on the current line. Quoted text is kept as
+one token; unfinished input stays editable. Coloring never changes validation,
+completion, selection, undo, or query execution. Agent status labels also follow
+theme changes without retaining a background from the previous palette.
+
+**Show/Hide Menus → agents tab** and **AI pane (right)** hide their respective
+tabs. The shared **[x]** above AI / Agents closes the entire right pane and its
+splitter, from either tab. These preferences survive restart; drafts and running
+requests are preserved. `ctrl+j` reopens Agents; **Ask AI** reopens the chat.
 
 Preferences are loaded from `~/.d8r/settings.json` and saved when changed.
 You can also edit the JSON while D8R is closed; restart to load edits. Settings
@@ -159,7 +186,7 @@ The results pane's independent 10,000-row preview buffer still applies.
 
 ### Workspace recovery
 
-The named query pages (document/caret/stable identity/source/dialect), selected
+The query pages (name/description/document/caret/stable identity/source/dialect), selected
 explorer tab, last workspace or function view, unsaved function draft/target,
 query history, and target-scoped AI chats are autosaved to `workspace.json`. Editing is debounced and the latest widget
 contents are flushed on exit, including an unsent AI message. Function drafts
@@ -167,14 +194,20 @@ remain drafts: the form's **Save**/**Run preview**, an explicit **Save function*
 a workspace AI preview proposal, or a user-requested direct save from main chat
 changes the function library. Autosave alone never promotes a draft.
 
-Startup restores this state without running queries, sending AI requests, or
-opening database connections. Saved PostgreSQL, D1 and SQLite snapshot targets
-remain visibly **disconnected** until used. Press **Run** (`ctrl+enter` or `f5`)
-to reconnect automatically and execute the submitted document against that same
-target. Saved credentials and snapshot paths connect in the background with a
-compact spinner and elapsed-time bar. The bar's endpoint is a **30-second timeout**,
-not estimated database progress. Cancel, timeout, or a target change prevents late
-registration or execution. Missing credentials open the connection form; connection
+Each source owns its functions, pages and agents under a stable connection identity.
+Switching away flushes current drafts; switching back restores the last page, caret,
+function draft and view without executing anything. A new source starts with an empty
+query page. Reconnecting the same target retains its workspace. Other sources' chats
+and requests remain alive; switching does not mark their hidden replies read.
+
+Session restoration opens no database connections, runs no queries and sends no
+AI requests. After the UI mounts, only the selected saved target reconnects in
+the background, without executing its document. Other saved targets remain
+**disconnected** until selected or used. Press **Run** (`ctrl+enter` or `f5`) to
+reconnect and execute the submitted document against that same target. Saved
+credentials and snapshot paths use compact blinking dots, Cancel and a
+**30-second timeout**, not estimated database progress. Cancel, timeout, or a
+target change prevents late registration or execution. Missing credentials open the connection form; connection
 failures report in the status line. The draft never silently runs against demo data.
 Changing connection details to another target requires a fresh Run.
 The header's **Reconnect** button and source pickers still connect without running
@@ -213,15 +246,14 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   D8R restarts the provider turn with the original request, completed exchanges,
   and your new instruction. Partial replies/tool batches are discarded, not applied.
   A context read already running finishes before the replacement turn starts;
-  completed query-page updates and function saves remain and are reported.
-- Ask the workspace AI to **create, make, edit, or apply queries** and it updates
-  the IDE directly. Each complete query gets a labeled **Page**: the first replaces
-  the active draft, and the others become new pages on the same source/dialect.
-  Unrelated pages, results, and history stay unchanged. No copy/paste, extra Apply
-  click, or auto-accept toggle is required. Queries are never run automatically.
-- Questions and preview-only requests remain conversation or read-only **full
-  replacement** proposals. **Apply** updates only the editor; **Apply queries**
-  applies every labeled preview page. Neither runs queries or saves functions.
+  completed function saves remain and are reported.
+- Ask the workspace AI to **create, make, edit, or apply queries** and it returns
+  complete proposals, without asking a separate permission question. **Apply**
+  updates the current draft; **Apply queries** applies every labeled page: the
+  first replaces the active draft and the others become new pages on the same
+  source/dialect. With **Automatically Apply AI Edits** enabled, validated proposals
+  apply automatically. Unrelated pages, results and history stay unchanged.
+  Neither path runs queries or saves functions. Explanatory answers remain prose.
   Invalid, incomplete, cancelled, or stale proposals cannot be applied. Changing
   the document or function draft makes its proposal stale without losing the reply;
   switching sources or targets selects that target's saved chat.
@@ -236,7 +268,7 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
 - **Automatically Apply AI Edits** is off by default. Enabling
   it persists immediately and applies complete, validated proposals only while
   their target draft is unchanged. It never executes queries or saves functions.
-  The preference is unrelated to explicit user-requested query updates or function saves.
+  This preference controls query edits; explicit saved-function requests remain separate.
 - Ask the main assistant to create, edit, save, or apply a saved function by name.
   It calls `save_function` to validate and persist the requested definition
   directly; “apply it” after a function proposal also authorizes this save.
@@ -253,12 +285,16 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   sent until Enter/**Send**. No fields need filling first. **Apply** fills the
   draft without saving or executing, keeps the chat open, and leaves the form
   visible. Use the form's **Save** or **Run preview** when ready.
+- Genuine follow-up questions use an in-chat choice card with **Other** for custom
+  answers. After answering, the question, choices and your answer stay visible in
+  conversation history, including after switching chats, restarting, or a later
+  provider failure. The AI continues with a proposal, not another permission question.
 - **New chat** starts another conversation without deleting the current one.
-  **Close**/Escape hides the panel without changing the draft.
+  **[x]** hides the entire AI / Agents pane; Escape in the chat hides just its tab. Drafts are preserved.
 - **Settings** in the shared chat panel opens provider configuration directly and
   returns to your unsent request. The three permission toggles are in the main Settings menu.
 - **New chat** preserves previous conversations and lets multiple requests run
-  concurrently, even for the same target. **Agents** (`ctrl+j`) opens the left
+  concurrently, even for the same target. **Agents** (`ctrl+j`) opens the right-side
   **Agents** tab, which lists chat history in an oh-my-pi-style roster: coloured
   status markers, bold names, muted target/activity details and live status counts.
   **Busy** means a request is running; **Ready** means a new chat or an unread
@@ -280,11 +316,16 @@ or bounded sample rows from a registered table (sampling disabled by default;
 when enabled, 5 records per read by default, at most 20 columns, with long string cells truncated).
 It can also request
 the active target source's latest ten matching successful queries, and saved
-function definitions. These read-only context tools also expose parser-only
-validation. The separate `apply_queries` and `save_function` tools are available
-only to guarded main workspace chat for explicit user-requested mutations, never
-instructions embedded in schema, samples, history, or function bodies. They update
-local query drafts or save function definitions, not database data. No tool runs
+function definitions. The validation tool and proposal gates check syntax and build
+Ibis expressions against cached schemas without executing them. This resolves CTE
+outputs, aliases, subqueries, and concrete saved-function calls; unknown fields or
+unavailable table metadata reject the draft instead of guessing. Parameterized
+function definitions retain signature/body validation; their schema binding is
+checked when a query supplies actual arguments. Only the guarded `save_function`
+tool can persist a user-requested
+function definition. Query changes are proposals for manual Apply or opted-in
+automatic application, never a direct mutation tool. Instructions embedded in
+schema, samples, history or function bodies grant no authority. No tool runs
 arbitrary model-generated queries or shell commands, grants general file access,
 or expands the existing network boundaries. Ask for a preview when you want
 suggestions to review before applying or saving.
@@ -372,10 +413,11 @@ Logs can contain schema, sample values, and query text; review
 them before sharing. There is no automatic log file.
 
 For capability investigations, inspect the attempted `validate_d8r` text and
-its error alongside the returned schema/capabilities. That validator checks the
-D8R parser, not Ibis execution: rejection may identify a missing D8R mapping
-for an operation that Ibis supports. A parser-valid draft can still fail later
-during compilation or execution. Such Run errors remain in the Results pane;
+its error alongside the returned schema/capabilities. The validator checks the
+D8R parser and offline Ibis expression construction against cached table schemas.
+It does not contact the database, refresh metadata, compile for every dialect, or
+execute the query. A validated draft can still fail during backend compilation or
+execution, or if the database schema changed. Such Run errors remain in Results;
 the AI diagnostic log does not execute proposals to diagnose them.
 
 ## Keys
@@ -389,7 +431,8 @@ the AI diagnostic log does not execute proposals to diagnose them.
 | `up` / `down` | Move the palette highlight (with the palette closed: move the caret) |
 | `enter` | In the document: accept the highlighted suggestion — or insert a newline when there is nothing to accept. In a table: select the row under the cursor |
 | `escape` | Close the palette, or cancel the add-source form |
-| `shift+left` / `shift+right` | Narrow / widen the results column under the cell cursor |
+| `shift` + arrow keys | Extend the highlighted result cell range |
+| `alt+left` / `alt+right` | Narrow / widen the results column under the cell cursor |
 | arrows, `page up`/`page down`, `home`/`end` | Move around the results and history tables |
 | `tab` / `shift+tab` | Move focus between the panes |
 | `ctrl+q` | Quit |
@@ -442,11 +485,31 @@ follows what you type:
   comma or another command opens the relevant choices again. A completed table
   stops offering tables (a join can continue with its foreign-key predicates).
   Moving the caret alone never summons a closed palette.
-- Columns offered after `\from` come from the open tables of *this* document;
-  with no `\from` yet, the palette offers the registry's cross-dataset pool.
+- Columns come from this document's source relations, including CTEs, inline
+  subqueries and saved-function results. Derived fields carry real Ibis output
+  types, inferred offline from the schema snapshot; completion never executes
+  them. Only a document with no source or CTE uses the cross-dataset pool.
 
 `\case`, `\limit`, `\with`, `\temp` and the transaction commands take
 arguments you type yourself — the palette has no suggestions for them.
+
+## Named query blocks
+
+`\with name` defines an indented query and automatically uses its result as the
+outer source; no `\from name` is needed:
+
+```d8r
+\with totals
+  \from events
+  \select event_type, sum(amount) as total
+\select event_type, total
+\where total > 0
+```
+
+With multiple CTEs, the last complete block is the implicit source. An explicit
+`\from`, `\open`, or direct function call overrides it. A body can call a saved
+function (`\event_totals()`); its output columns and types appear in IntelliSense
+just like an ordinary CTE. Function-local CTEs remain private to that function.
 
 ## Distinct rows
 
@@ -521,18 +584,21 @@ computed outputs with `\where`.
 
 ## Table-valued functions (`\fn`)
 
-Open `\fn` from the palette to create or edit a named query with `@parameter`
-arguments. The **Source target** picker starts on the workspace's current
-datasource. It controls the body's IntelliSense, save-time validation, and
-preview execution without changing the workspace's source or dialect. Changing
-the target keeps your draft and clears the previous preview.
+Use the left explorer's **Functions** tab to browse the current source's functions.
+Click a function (or highlight it and press Enter) to open its editor; choose
+**New function…** to start a blank draft. `\fn` in the palette also opens the library.
+The **Source target** picker switches to that source's workspace while
+keeping the function editor open. It restores that source's function draft and
+library; the previous source's draft remains available when you switch back.
+The selected source controls body IntelliSense, save-time validation and preview.
 
-To reuse the current workspace query, click **To function** above the document,
-or select **Query to function** from the palette. A new draft opens with the
+To reuse the current workspace query, click **Use current query page as function**
+in the **Functions** tab, or select **Query to function** from the palette. A new draft opens with the
 document copied into its body and the current source selected. Give it a name,
 optionally replace constants with declared `@parameters`, then choose **Save**.
-Nothing runs or persists merely by opening the draft, and the workspace document
-is unchanged. A function with no parameters can be run with `\name()`.
+Opening the draft never runs a query or saves a function definition; drafts autosave
+separately and the query page is unchanged. A function with no parameters can be run
+with `\name()`.
 
 Run a saved parameterized query directly in the document, then press **Ctrl+Enter**:
 
@@ -568,10 +634,13 @@ Draft edits and AI **Apply** are autosaved separately in `workspace.json`, not
 committed as function definitions. Returning from the function editor refreshes
 IntelliSense at the existing caret, so newly saved calls appear without retyping;
 disabled or Escape-dismissed completion stays closed.
+The function header's **[x]** returns to the query while retaining the unsaved function draft.
 
-Functions are shared across sources: the selected target is an authoring/preview
-context, not a permanent binding. A later `\name(args)` or `\from name(args)` runs against that
-document's active source. Reconnect your D1 source before calling its functions.
+Functions belong to one source. The same name may have independent definitions on
+different sources; calls and completion resolve only the active source's library.
+Legacy unscoped functions migrate to the source selected when the saved state is
+first loaded, never to every source. The next save persists that ownership.
+Reconnect your D1 source before calling its functions.
 
 Function bodies support flat, sequential `\with` chains, including joins and set
 operations. Each call has its own CTE scope: local names do not collide with a
@@ -628,6 +697,61 @@ is no network behind them and no credentials. They exist to exercise the seam a
 real connection would use — and, together with the dialect picker, to make the
 point of the product: write one document, then read it back as any vendor's SQL.
 
+## Add Trino or another Ibis database
+
+Press `ctrl+o`, choose **Backend**, fill its connection fields, then **Test
+connection** or **Add**. The picker covers all 20 advertised backend types:
+DuckDB, Athena, BigQuery, ClickHouse, Databricks, DataFusion, Druid, Exasol,
+Flink, Impala, Materialize, SQL Server, MySQL, Oracle, PostgreSQL, PySpark,
+RisingWave, Snowflake, SQLite and Trino. Cloudflare D1 remains a separate choice.
+These are real connections, not the bundled vendor mocks. Choosing a SQL dialect
+alone still changes rendering only; it does not connect to that database.
+
+**Trino** is included in the default install. Enter host, port, user, **catalog**,
+schema and HTTP scheme. HTTPS/port 443 are the defaults; set your server's actual
+port. A password selects Basic authentication and requires HTTPS. A local,
+unauthenticated server can use HTTP, for example port 8080. For JWT, leave the
+password blank and enter this in the masked **Advanced Ibis connection options**:
+
+```json
+{"auth":{"type":"jwt","token":"YOUR_TOKEN"},"verify":true}
+```
+
+Advanced options also accept driver settings such as `request_timeout`,
+`session_properties`, `roles`, or `verify` with a CA certificate path. Do not
+repeat a filled form field in the JSON. Passwords and advanced options are masked.
+Schema discovery reads metadata from the selected catalog/schema; no table rows
+are counted. Explorer names are schema-qualified, and bare names resolve within
+the selected schema. Ibis table handles retain the catalog as well as the schema.
+
+DuckDB, SQLite, PostgreSQL and Trino drivers are installed by `uv sync`. Other
+backends show their optional installation command in the form, for example:
+
+```bash
+uv sync --extra mysql
+uv run --extra mysql d8r
+```
+
+Use the extra on subsequent `uv run` commands too, so dependency synchronization
+retains it. Installing an extra does not install vendor infrastructure: SQL
+Server also needs an ODBC driver; PySpark needs Java; Flink needs a separately
+installed compatible PyFlink/Java runtime and connector JARs. Native Windows and
+Python-version support varies. DataFusion requires a native wheel. The form
+documents each backend's fields and additional requirements; unavailable drivers
+produce an actionable error, never a fallback to demo data.
+
+Only **Add** saves credentials in local plaintext `memory.json`. Test/Cancel save
+nothing. Saved connections participate in the same startup, source-picker and
+Run reconnection flow as PostgreSQL/D1. Workspace files store opaque target
+identities, not these credentials. Credential rotation keeps the target identity;
+changing the backend, catalog/schema or user creates a distinct target. Protect
+configuration files and backups. Use least-privileged accounts and verified TLS.
+
+Generic connectors enable session transactions/temp tables only for the existing
+DuckDB/SQLite implementations. Other backends do not inherit those capabilities
+just because they can compile the syntax. PySpark SQL rendering requires its
+live Spark session; it is not an offline compile target.
+
 ## Add a PostgreSQL database
 
 Press `ctrl+o` (or Settings → **Data source** → **Add data source**), then choose
@@ -661,9 +785,9 @@ refresh the explorer and IntelliSense after external schema changes.
 
 Use **Test connection** before **Add**. Only Add saves the profile and password
 in local `memory.json`; Test and Cancel save nothing. Password whitespace is
-preserved. Saved profiles appear as disconnected after restart and reconnect
-when explicitly selected or when you press Run. Changing the SQL dialect affects rendering, not the
-database on which Run executes.
+preserved. Saved profiles restore disconnected; the selected profile reconnects
+after Mount without executing, and other profiles reconnect when selected or on
+Run. Changing the SQL dialect affects rendering, not the database on which Run executes.
 
 For production, use a least-privileged read-only role and the TLS mode required by
 your provider. `verify-full` validates certificates and hostnames using libpq's
@@ -738,7 +862,7 @@ Cloudflare. The active source stays unchanged until connection
 succeeds; failure or Cancel leaves the saved choice available for another attempt.
 Once connected, it appears as a normal source, without a duplicate saved entry.
 Reconnecting an unchanged profile does not rewrite its credentials. Connecting
-from the function picker changes only the function target, not the workspace.
+from the function picker restores that source's workspace and function draft.
 
 Older profiles without a token open the masked token field without attempting a
 connection. Enter the token and choose **Connect**. You can also use `ctrl+o` →
@@ -775,8 +899,8 @@ An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 | File | Saved contents |
 | --- | --- |
 | `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout, sample/schema permissions and automatic draft edits |
-| `memory.json` | Custom functions; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
-| `workspace.json` | Document/caret and stable target identity, last view, function draft, query history, completed AI conversations/composer drafts, source references and snapshot paths |
+| `memory.json` | Custom functions keyed by stable source identity; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
+| `workspace.json` | Source-local last page/view/function draft, named pages and carets, query history, target-scoped AI conversations/composer drafts, source references and snapshot paths |
 
 These files are versioned, editable JSON. Toggle preferences save immediately;
 the provider and default-row forms require **Save**. Import only fills the
@@ -795,6 +919,13 @@ terminal boot animation on future launches. Table completion inserts aliases
 (`\from projects p`) and column completion uses them (`p.id`). Declared foreign keys
 provide `\join` predicates, including composite keys. IntelliSense uses successful
 source-scoped history to rank equal-quality matches by recency.
+It also offers **whole queries** as you type a matching document prefix. These
+source-local history suggestions show successful-run counts and sort by count,
+then most recent use. Whitespace and case outside quotes are ignored for matching;
+quoted values retain exact case and spacing. Enter, Tab or a click replaces the
+entire document with the selected historical query, without running it; Undo restores
+the prior draft. Whole-query offers appear only at the end of the document, never
+inside function bodies, and respect Escape dismissal and the IntelliSense switch.
 
 A `settings.json` example (omitted keys use defaults):
 
@@ -863,17 +994,23 @@ editor. AI context reads use the same connection reservation.
 - The results table is a spreadsheet-style explorer: a **cell cursor** moves with
   the arrow keys (and page/home/end), and the executed dtypes ride along in the
   column headers (`user_id · int64`).
-- `shift+left` / `shift+right` **resize the column** under the cursor.
-- Focus the results grid and use **Shift+Up/Down** to select a row range,
-  **Space** to toggle individual rows, **Ctrl+A** to select all buffered rows,
-  and **Escape** to clear the selection. Selected rows are highlighted across
-  their full width; the grid border shows selected and buffered row counts.
-- **Ctrl+C** or **Copy rows** copies selected rows as tab-separated text with
-  column headers. With no selection it copies the current row. Tabs, quotes,
-  and embedded newlines are escaped for spreadsheet paste; NULL becomes an empty
-  cell. Clipboard delivery uses the terminal's clipboard support.
+- **Drag** across cells or **Shift-click** to highlight a rectangular range.
+  **Shift+arrow keys** extend or shrink it from its anchor. Ordinary navigation
+  clears the cell range; **Escape** clears all selection.
+- Click a **row number** or press **Shift+Space** to select a whole row;
+  click a **column header** or press **Ctrl+Space** to select a whole column.
+  Drag or Shift-click row numbers/headers to extend those ranges.
+  **Space** or **Ctrl-click a row number** toggles individual rows;
+  **Ctrl+A** (or the top-left corner) selects all buffered rows.
+  The grid border shows selected cells/rows and buffered row counts.
+- **Alt+Left/Right** resize the column under the cursor.
+- **Ctrl+C** or **Copy selection** copies only highlighted fields as tab-separated
+  text with column headers. With no selection it copies the current cell.
+  Tabs, quotes, and embedded newlines are escaped for spreadsheet paste; NULL
+  becomes an empty cell. Clipboard delivery uses the terminal's clipboard support.
 - **Export CSV…** (or **Export results** in the palette) opens a destination form.
-  Choose selected rows or all buffered rows and an explicit file path. Existing
+  Choose selected rows or all buffered rows and an explicit file path. A cell range
+  selects its intersecting rows for export; CSV always includes all columns. Existing
   files require a separate **Overwrite file** confirmation. The UTF-8 CSV uses
   raw column names, standard CSV quoting, and empty cells for NULL.
   Export captures the current buffer; it never reruns the query and does not
@@ -906,12 +1043,23 @@ written as wrapped strings. Beyond the clauses above:
 - **Row counts**: `count(*)` counts every joined/filtered row, including NULLs;
   `count(column)` counts only non-NULL values. Both support groups and window
   frames. Use an explicit alias such as `count(*) as total_requests`.
+- **Aggregate-result filters** use the same `\where`, with no `\having` command:
+  `\select event_type, count(*) as total_count` followed by
+  `\where total_count > 15` or `\where count(*) > 15`. Source-row conditions
+  joined with AND run before aggregation; aggregate conditions run afterwards.
+  OR conditions involving aggregates must use grouping keys, not ungrouped rows.
+  Repeated `\where` still replaces the previous filter; combine conditions on one line.
 - **Subqueries** are inline, on the clause's own line and in the same grammar:
   `\from (\from events \select user_id, amount \where amount > 5) as big`,
   `\join ( … ) as u on e.user_id = u.user_id`, a set-op operand
   (`\union all ( … )`), `\where user_id in (\from users \select user_id \where
   region = "us")`, and a scalar `\select (\from events \select max(amount)) as
   peak`.
+- **Cartesian joins**: `\join cross events e` pairs every current row with every
+  event, without an `on` condition or parentheses around the table name. CTE names
+  and saved-function calls work too; only inline subqueries need parentheses.
+  Inputs of M and N rows yield M × N combinations. Limit the inputs in CTEs or
+  subqueries when necessary; a final `\limit` only caps the returned result.
 - **Lateral joins / CROSS APPLY**: `\join lateral ( … ) as recent` lets the body
   read the tables to its left, and a `\limit` inside it means *per left row* —
   `\join lateral (\from events e \where e.user_id = u.user_id \order timestamp

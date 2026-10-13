@@ -105,6 +105,35 @@ def test_save_preview_and_engine_execute_full_cte_chain(project_session):
     assert result["rows"] == expected
 
 
+def test_implicit_cte_sources_execute_through_saved_function_roots(project_session):
+    session = project_session
+    session.save_fn("picked", "id", r"""\with chosen
+  \from projects
+  \where id = @id
+  \select id, name
+\with labeled
+  \from chosen
+  \select id, upper(name) as label
+\select labeled.id, labeled.label""", "")
+    session.save_fn("wrapped", "id", r"""\with result
+  \picked(@id)
+\select result.id, result.label""", "")
+    preview = session.fn_preview("wrapped", "2")
+    assert preview.error == ""
+    assert preview.columns == ["id", "label"]
+    assert preview.rows == [[2, "PROJECT-2"]]
+
+    ast = parse_query(r"""\with result
+  \wrapped(3)
+\select result.id, result.label""", schema=session.schema, settled=True)
+    assert ast.errors == []
+    assert (ast.from_.line, ast.from_.table) == (1, "result")
+    function_root = ast.with_[0].body.from_.body
+    assert (function_root.from_.line, function_root.from_.table) == (2, "result")
+    result = execute(session.source.con, payload_from_ast(ast), tables=session.tables())
+    assert result["rows"] == [[3, "PROJECT-3"]]
+
+
 def test_local_names_do_not_collide_or_leak_across_nested_and_sibling_calls(project_session):
     session = project_session
     session.save_fn("tagged", "id, tag", TAGGED_PROJECT, "")

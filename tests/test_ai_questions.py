@@ -46,8 +46,8 @@ def _answer(text="Done. Nothing executed."):
     return _frame({"content": text}) + _frame({}, "stop") + b"data: [DONE]\n\n"
 
 
-def _apply(body=BODY, call_id="apply-after-answer"):
-    return _tools(_call("apply_queries", {"queries": [{"title": "Clarified query", "body": body}]}, call_id))
+def _proposal(body=BODY):
+    return _answer("Review the clarified query.\n```d8r\n" + body + "\n```")
 
 
 def _result(request, call_id):
@@ -111,7 +111,22 @@ async def _click(pilot, widget):
     await pilot.click(widget)
 
 
-def test_option_resumes_original_request_after_timeout_without_blocking_context_or_executing(tmp_path, monkeypatch):
+def _assert_exchange(transcript, prompt, question, answer):
+    assert transcript.count(prompt) == 1
+    assert transcript.count(question["question"]) == 1
+    cursor = transcript.index(question["question"])
+    assert transcript.index(prompt) < cursor
+    for index, option in enumerate(question["options"]):
+        cursor = transcript.index(option["label"], cursor) + len(option["label"])
+        if index == question.get("recommended"):
+            assert "recommended" in transcript[cursor:].splitlines()[0].lower()
+        if description := option.get("description"):
+            cursor = transcript.index(description, cursor) + len(description)
+    assert transcript.index(answer, cursor) >= cursor
+
+
+@pytest.mark.parametrize("auto_accept", [False, True])
+def test_option_resumes_original_request_after_timeout_without_blocking_context_or_executing(tmp_path, monkeypatch, auto_accept):
     async def scenario():
         requests = []
 
@@ -127,16 +142,14 @@ def test_option_resumes_original_request_after_timeout_without_blocking_context_
                     data = _answer("The separate schema inspection finished.")
             elif (answer := _result(request, "choose-records")) is None:
                 data = _tools(_call("ask_user", QUESTION, "choose-records"))
-            elif _result(request, "apply-after-answer") is None:
-                assert answer == {"answer": "Users"}
-                data = _apply(USERS_BODY)
             else:
-                assert _result(request, "apply-after-answer")["applied"] is True
-                data = _answer()
+                assert answer == {"answer": "Users"}
+                data = _proposal(USERS_BODY)
             return httpx.Response(200, content=data)
 
         _install(monkeypatch, provider)
         session = _session(tmp_path, timeout=0.5)
+        session.update_settings(ai_auto_accept=auto_accept)
         app = D8RApp(session)
         async with app.run_test(size=(160, 62)) as pilot:
             app.editor.load_text("\\from events\n\\limit 1")
@@ -177,6 +190,12 @@ def test_option_resumes_original_request_after_timeout_without_blocking_context_
             await pilot.press("down", "enter")
             await _finished(original_chat)
             await pilot.pause()
+            _assert_exchange(str(panel.query_one("#ai-transcript", Static).content),
+                             "Which records can I inspect? Make the query once clarified", QUESTION, "Users")
+            if not auto_accept:
+                assert app.editor.text == original
+                assert not panel.query_one("#ai-apply", Button).disabled
+                await _click(pilot, panel.query_one("#ai-apply", Button))
             assert app.editor.text == USERS_BODY
             assert session.workspace["document"] == USERS_BODY
             assert session.history == history
@@ -206,12 +225,9 @@ def test_other_rejects_blank_input_caps_typing_and_resumes_with_trimmed_custom_a
             requests.append(request)
             if (answer := _result(request, "custom-records")) is None:
                 data = _tools(_call("ask_user", QUESTION, "custom-records"))
-            elif _result(request, "apply-after-answer") is None:
-                assert answer == {"answer": "Recent event types only"}
-                data = _apply()
             else:
-                assert _result(request, "apply-after-answer")["applied"] is True
-                data = _answer()
+                assert answer == {"answer": "Recent event types only"}
+                data = _proposal()
             return httpx.Response(200, content=data)
 
         _install(monkeypatch, provider)
@@ -241,6 +257,9 @@ def test_other_rejects_blank_input_caps_typing_and_resumes_with_trimmed_custom_a
             await pilot.press("enter")
             await _finished(chat)
             await pilot.pause()
+            assert app.editor.text == original
+            assert not panel.query_one("#ai-apply", Button).disabled
+            await _click(pilot, panel.query_one("#ai-apply", Button))
             assert app.editor.text == BODY
             assert not app.session.history
             assert panel.query_one("#ai-apply", Button).disabled
@@ -271,13 +290,10 @@ def test_switching_pending_chats_preserves_choice_and_custom_draft_without_cross
                     data = _answer("Detailed explanation for the second chat.")
             elif (answer := _result(request, "first-question")) is None:
                 data = _tools(_call("ask_user", first_question, "first-question"))
-            elif _result(request, "apply-after-answer") is None:
+            else:
                 assert answer == {"answer": "Only event types from the first chat"}
                 assert _result(request, "second-question") is None
-                data = _apply()
-            else:
-                assert _result(request, "apply-after-answer")["applied"] is True
-                data = _answer()
+                data = _proposal()
             return httpx.Response(200, content=data)
 
         _install(monkeypatch, provider)
@@ -320,9 +336,12 @@ def test_switching_pending_chats_preserves_choice_and_custom_draft_without_cross
             await _click(pilot, panel.query_one("#ai-question-submit", Button))
             await _finished(first)
             await pilot.pause()
+            assert app.editor.text == original
+            assert not panel.query_one("#ai-apply", Button).disabled
+            await _click(pilot, panel.query_one("#ai-apply", Button))
             assert app.editor.text == BODY and not app.session.history
             assert panel.query_one("#ai-apply", Button).disabled
-            assert len(requests) == 5
+            assert len(requests) == 4
 
     asyncio.run(scenario())
 
@@ -340,14 +359,11 @@ def test_interruption_discards_partial_tool_batch_and_cannot_replay_old_answers(
                 data = _tools(
                     _call("ask_user", initial_question, "abandoned-answer"),
                     _call("ask_user", QUESTION, "abandoned-question", 1),
-                    _call("apply_queries", {"queries": [{"title": "Must never apply", "body": BODY}]},
-                          "abandoned-apply", 2),
                 )
             else:
                 replay = json.dumps(request["messages"])
                 assert "abandoned-answer" not in replay
                 assert "abandoned-question" not in replay
-                assert "abandoned-apply" not in replay
                 assert "Abandoned custom answer" not in replay
                 if (answer := _result(request, "fresh-question")) is None:
                     data = _tools(_call("ask_user", fresh_question, "fresh-question"))
@@ -388,6 +404,10 @@ def test_interruption_discards_partial_tool_batch_and_cannot_replay_old_answers(
             assert panel.chat is chat
             assert panel.query_one("#ai-question-other", Input).value == ""
             assert app.editor.text == original and session.workspace["pages"] == pages
+            transcript = str(panel.query_one("#ai-transcript", Static).content)
+            _assert_exchange(transcript, "Make a query after clarification", initial_question, "Users")
+            assert QUESTION["question"] not in transcript
+            assert "Abandoned custom answer" not in transcript
             assert not session.busy and not session.history
             await _choose(pilot, panel, 0)
             await _finished(chat)
@@ -400,6 +420,85 @@ def test_interruption_discards_partial_tool_batch_and_cannot_replay_old_answers(
             assert len(requests) == 3
             assert "abandoned-answer" not in json.dumps(panel.messages)
             assert "abandoned-question" not in json.dumps(panel.messages)
-            assert "abandoned-apply" not in json.dumps(panel.messages)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "failure"])
+def test_answered_clarification_survives_followup_chat_switch_and_restart(tmp_path, monkeypatch, outcome):
+    async def scenario():
+        requests = []
+        prompt = "Help me choose records before explaining them"
+        custom_answer = "Only events from the last seven days"
+        final_response = "The completed explanation follows your selection."
+        pending_question = {**QUESTION, "question": "A later question that remains unanswered"}
+
+        def provider(request):
+            requests.append(request)
+            latest_prompt = next(message["content"] for message in reversed(request["messages"])
+                                 if message["role"] == "user")
+            if latest_prompt == "Continue the saved conversation":
+                assert _result(request, "retained-answer") == {"answer": custom_answer}
+                assert "unanswered-followup" not in json.dumps(request["messages"])
+                return httpx.Response(200, content=_answer("Continued from your saved answer."))
+            if _result(request, "retained-answer") is None:
+                data = _tools(_call("ask_user", QUESTION, "retained-answer"))
+            elif outcome == "failure":
+                return httpx.Response(503, content=b"unavailable")
+            elif outcome == "cancel":
+                data = _tools(_call("ask_user", pending_question, "unanswered-followup"))
+            else:
+                data = _answer(final_response)
+            return httpx.Response(200, content=data)
+
+        _install(monkeypatch, provider)
+        app = D8RApp(_session(tmp_path))
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.action_ai()
+            panel = app.ai_panel
+            original = app.editor.text
+            _send(panel, prompt)
+            chat = panel.chat
+            chat_id = chat.id
+            await _question(panel)
+            await _choose(pilot, panel, len(QUESTION["options"]))
+            custom = panel.query_one("#ai-question-other", Input)
+            custom.value = custom_answer
+            custom.focus()
+            await pilot.press("enter")
+            if outcome == "cancel":
+                await _question(panel, pending_question["question"])
+                panel.action_cancel()
+            await _finished(chat)
+            await pilot.pause()
+            assert chat.status == {"complete": "idle", "cancel": "cancelled", "failure": "error"}[outcome]
+            transcript = str(panel.query_one("#ai-transcript", Static).content)
+            _assert_exchange(transcript, prompt, QUESTION, custom_answer)
+            assert pending_question["question"] not in transcript
+            if outcome == "complete":
+                assert transcript.index(custom_answer) < transcript.index(final_response)
+            assert app.editor.text == original
+            assert not app.session.history
+            panel.action_clear()
+            assert custom_answer not in str(panel.query_one("#ai-transcript", Static).content)
+            panel.select_chat(chat_id)
+            assert str(panel.query_one("#ai-transcript", Static).content) == transcript
+
+        restarted = D8RApp(_session(tmp_path))
+        async with restarted.run_test(size=(160, 62)) as pilot:
+            restarted.open_ai_chat(chat_id)
+            panel = restarted.ai_panel
+            assert panel.chat.id == chat_id
+            assert str(panel.query_one("#ai-transcript", Static).content) == transcript
+            assert not panel.query_one("#ai-question").display
+            assert panel.query_one("#ai-apply", Button).disabled
+            assert len(requests) == 2
+            _send(panel, "Continue the saved conversation")
+            await _finished(panel.chat)
+            await pilot.pause()
+            assert panel.chat.status == "idle"
+            _assert_exchange(str(panel.query_one("#ai-transcript", Static).content),
+                             prompt, QUESTION, custom_answer)
+            assert len(requests) == 3
 
     asyncio.run(scenario())

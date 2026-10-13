@@ -129,3 +129,85 @@ def test_snapshot_path_is_remembered_without_opening_it_on_restore(sources, tmp_
     assert not path.exists()
     assert restored.saved_snapshot_path(restored.active_id) == str(path.resolve())
     assert not restored.source_connected()
+
+
+def _function_draft(source, name):
+    return {"identity": f"{source}-draft", "source": source, "selected": "", "name": name,
+            "description": "unsaved", "parameters": "n", "body": "\\from products\n\\limit @n",
+            "arguments": "2", "cursor": [1, 4]}
+
+
+def test_source_workspaces_keep_independent_documents_drafts_and_views(sources, tmp_path):
+    session = Session(sources, data_dir=tmp_path)
+    demo_draft = _function_draft("demo", "demo_copy")
+    mysql_draft = _function_draft("mysql", "products_copy")
+    session.save_workspace(document_id="demo-page", document="demo query", source="demo",
+                           function_draft=demo_draft, active_view="function")
+    session.set_active("mysql")
+    session.save_workspace(document_id="mysql-page", document="mysql query", source="mysql",
+                           function_draft=mysql_draft, active_view="workspace")
+    session.set_active("demo")
+    session.save_workspace(document_id="demo-page", document="revised demo query", source="demo",
+                           function_draft=None, active_view="workspace")
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.workspace["source_workspaces"] == {
+        "demo": {"document_id": "demo-page", "function_draft": None, "active_view": "workspace"},
+        "mysql": {"document_id": "mysql-page", "function_draft": mysql_draft, "active_view": "workspace"},
+    }
+    assert {page["source"]: page["document"] for page in restored.workspace["pages"]} == {
+        "demo": "revised demo query", "mysql": "mysql query",
+    }
+
+
+def test_legacy_cross_source_function_draft_restores_only_in_its_workspace(sources, tmp_path):
+    workspace = storage.WorkspaceStore(tmp_path)
+    draft = _function_draft("mysql", "products_copy")
+    legacy = {**workspace.document, "source": "demo", "document_id": "demo-page",
+              "document": "demo query", "function_draft": draft, "active_view": "function"}
+    del legacy["source_workspaces"]
+    contents = json.dumps(legacy).encode()
+    workspace.path.write_bytes(contents)
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.source_key() == "demo"
+    assert restored.workspace["document"] == "demo query"
+    assert restored.workspace["function_draft"] is None
+    assert restored.workspace["active_view"] == "workspace"
+    assert restored.workspace["source_workspaces"] == {
+        "demo": {"document_id": "demo-page", "function_draft": None, "active_view": "workspace"},
+        "mysql": {"document_id": "", "function_draft": draft, "active_view": "function"},
+    }
+    assert workspace.path.read_bytes() == contents
+    restored.save_workspace()
+    assert Session(sources, data_dir=tmp_path).workspace["source_workspaces"]["mysql"]["function_draft"] == draft
+
+
+def test_function_draft_save_uses_its_target_not_the_query_source(sources, tmp_path):
+    session = Session(sources, data_dir=tmp_path)
+    draft = _function_draft("mysql", "products_copy")
+    session.save_workspace(document="demo query", source="demo", function_draft=draft, active_view="function")
+    assert session.workspace["source_workspaces"]["demo"]["function_draft"] is None
+    assert session.workspace["source_workspaces"]["mysql"]["function_draft"] == draft
+    restored = Session(sources, data_dir=tmp_path)
+    assert restored.workspace["function_draft"] is None
+    assert restored.workspace["source_workspaces"]["mysql"]["function_draft"] == draft
+
+
+@pytest.mark.parametrize("states", [
+    [],
+    {"": {"document_id": "", "function_draft": None, "active_view": "workspace"}},
+    {"demo": {"document_id": "page", "active_view": "workspace"}},
+    {"demo": {"document_id": 1, "function_draft": None, "active_view": "workspace"}},
+    {"demo": {"document_id": "page", "function_draft": None, "active_view": "execute"}},
+    {"demo": {"document_id": "page", "function_draft": {"private": "secret"}, "active_view": "function"}},
+    {"demo": {"document_id": "page", "function_draft": _function_draft("mysql", "wrong"), "active_view": "function"}},
+])
+def test_invalid_source_workspaces_are_not_overwritten(sources, tmp_path, states):
+    workspace = storage.WorkspaceStore(tmp_path)
+    contents = json.dumps({**workspace.document, "source_workspaces": states}).encode()
+    workspace.path.write_bytes(contents)
+    session = Session(sources, data_dir=tmp_path)
+    assert session.workspace_error
+    assert "secret" not in session.workspace_error
+    with pytest.raises(ValueError):
+        session.save_workspace(document="new draft")
+    assert workspace.path.read_bytes() == contents

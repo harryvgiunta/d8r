@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.content import Content
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, OptionList, Static
@@ -21,6 +22,7 @@ from d8r.ai.client import AIConfig
 from d8r.ai.config import import_yolo_config
 
 from d8r.engine import DIALECT_BY_NAME, DIALECTS
+from d8r.themes import THEMES, theme_label
 
 from .add_source import AddSourceModal
 from .palette import prompt
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
 MENUS: dict[str, str] = {
     "general": "General",
     "menus": "Show/Hide Menus",
+    "theme": "Theme",
     "values": "Value cache",
     "sources": "Data source",
     "dialects": "Dialect",
@@ -93,10 +96,10 @@ class SettingsScreen(ModalScreen[None]):
         Binding("right", "details", "Details", show=False),
     ]
 
-    def __init__(self, ide: "D8RApp", **kwargs) -> None:
+    def __init__(self, ide: "D8RApp", *, menu: str = "general", **kwargs) -> None:
         super().__init__(**kwargs)
         self.ide = ide
-        self.menu = "general"
+        self.menu = menu
         self.rows: list[Row] = []
 
     @property
@@ -121,7 +124,12 @@ class SettingsScreen(ModalScreen[None]):
             yield Static("", id="settings-hint")
 
     def on_mount(self) -> None:
-        self.query_one("#settings-sidebar", OptionList).focus()
+        sidebar = self.query_one("#settings-sidebar", OptionList)
+        sidebar.highlighted = sidebar.get_option_index(self.menu)
+        if self.menu == "theme":
+            self.action_details()
+        else:
+            sidebar.focus()
         self._draw()
 
     # -- drawing ------------------------------------------------------------
@@ -136,7 +144,7 @@ class SettingsScreen(ModalScreen[None]):
         menu = self.query_one("#settings-menu", OptionList)
         menu.clear_options()
         menu.add_options(
-            [Option(prompt(row.label, row.detail), id=f"row-{index}") for index, row in enumerate(self.rows)]
+            [Option(self._row_prompt(row), id=f"row-{index}") for index, row in enumerate(self.rows)]
         )
         if self.rows:
             menu.highlighted = min(max(highlight, 0), len(self.rows) - 1)
@@ -144,22 +152,25 @@ class SettingsScreen(ModalScreen[None]):
         descriptions = {
             "general": "Control editor completion, the startup entry screen and default query rows. Row changes require Save in the editor.",
             "menus": "Show or hide workspace panes without changing your document.",
+            "theme": "Choose a palette with Enter or a click. Colors change immediately and are saved for next time. "
+                     "Nord is the default palette.",
             "values": "Autocomplete and the schema explorer share a memory-only value cache. "
                       "Values are fetched lazily on the first read of a column; there is no startup scan "
                       "or distinct-value fetch across every column. Values never go to disk and are cleared "
                       "at exit. Only these preferences are saved. Changing them clears cached values.",
-            "sources": "Connect a new Cloudflare D1 database or select an existing source. Selecting a source refreshes its schema and completion.",
+            "sources": "Connect an Ibis database or Cloudflare D1, or select an existing source. Selecting a source refreshes its schema and completion.",
             "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
             "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. Disabling reads does not remove data already shared in chat.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
         self.query_one("#settings-description", Static).update(
             f"{descriptions[self.menu]}\nSettings: {self.session.settings_path}\n"
-            "Settings and connection backups contain plaintext API keys and D1 tokens. Keep them private."
+            "Settings and connection backups contain plaintext database credentials and API keys. Keep them private."
         )
         action = {
             "general": "enter / click toggle or edit",
             "menus": "enter / click toggle",
+            "theme": "enter / click apply and save theme",
             "values": "enter / click toggle, edit or clear",
             "sources": "enter / click select or add",
             "dialects": "enter / click select",
@@ -170,7 +181,24 @@ class SettingsScreen(ModalScreen[None]):
             f"↑↓ navigate · {action} · tab switch panel · esc back / close"
         )
 
+    def _row_prompt(self, row: Row) -> Content:
+        if row.action != "theme":
+            return prompt(row.label, row.detail)
+        theme = THEMES[row.value]
+        swatches = Content.assemble(*(
+            ("  ", f"on {color}" if color else "") for color in
+            (theme.background, theme.surface, theme.primary, theme.secondary, theme.accent)
+        ))
+        return Content.assemble(swatches, "  ", prompt(row.label, row.detail))
+
     def _row_source(self) -> list[Row]:
+        if self.menu == "theme":
+            return [
+                Row(theme_label(name),
+                    ("active · " if name == self.ide.theme else "") + ("dark" if theme.dark else "light"),
+                    "theme", name)
+                for name, theme in THEMES.items()
+            ]
         if self.menu == "menus":
             return [
                 Row(
@@ -190,7 +218,7 @@ class SettingsScreen(ModalScreen[None]):
         if self.menu == "keys":
             return binding_rows()
         if self.menu == "sources":
-            return [Row("Add data source", "PostgreSQL, Cloudflare D1 or local SQLite snapshot", "add-source")] + [
+            return [Row("Add data source", "Trino, PostgreSQL, other Ibis backends or Cloudflare D1", "add-source")] + [
                 Row(
                     label,
                     "active" if source_id == self.session.active_id else
@@ -265,6 +293,8 @@ class SettingsScreen(ModalScreen[None]):
             return
         if row.action == "pane":
             self.ide.toggle_pane(row.value)
+        elif row.action == "theme":
+            self.ide.update_settings(theme=row.value)
         elif row.action == "intellisense":
             self.ide.update_settings(intellisense=not self.session.intellisense)
         elif row.action == "entry-screen":

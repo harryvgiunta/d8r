@@ -54,7 +54,7 @@ from d8r.query import (
     where_head,
 )
 from d8r.query.functions import ARITHMETIC_PRECEDENCE, MAX_EXPRESSION_DEPTH, SCALAR_FUNCTIONS, ArgumentKind, accepts_type
-from d8r.query.parser import block_bounds, keyword_positions, parse_source
+from d8r.query.parser import block_bounds, block_extent, keyword_positions, parse_source, statement_bounds
 from d8r.query.identifiers import IDENTIFIER, RELATION_NAME, relation_parts
 
 from .session import Session, looks_numeric
@@ -63,7 +63,7 @@ from .session import Session, looks_numeric
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("from", "set the source dataset"),
     ("open", "same as \\from — the dataset spelling"),
-    ("join", "append an inner join"),
+    ("join", "join aliases with == ?= =? ?? != ^= @=, or a source on keys"),
     ("union", "append a set union"),
     ("intersect", "keep only rows both sides have"),
     ("except", "subtract the other table's rows"),
@@ -90,7 +90,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("Run", "ctrl+enter · execute the document", "run"),
     ("Compile", "ctrl+k · render SQL without running", "compile"),
-    ("Data source…", "ctrl+o · add PostgreSQL, D1 or SQLite", "add-source"),
+    ("Data source…", "ctrl+o · add a database connection", "add-source"),
     ("Functions…", "\\fn · open or create a table-valued function", "fn"),
     ("Query to function", "create a function draft from this document", "query-to-fn"),
     ("Export results", "save selected or buffered rows as CSV", "export-results"),
@@ -144,6 +144,8 @@ _NUMBER_RE = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)$")
 
 # How many value rows the popup shows; the search still reads the whole pool.
 VALUE_SUGGESTIONS = 50
+QUERY_SUGGESTIONS = 10
+QUERY_PREVIEW_LENGTH = 96
 
 _CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
@@ -164,6 +166,8 @@ class Entry:
     action: str = ""
     # Characters an accept leaves behind the caret — a call completes to `fn(|)`.
     cursor_back: int = 0
+    # History accepts replace the entire document, not the contextual token.
+    replace_document: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,7 +190,7 @@ class View:
     def highlighted_is_typed(self, index: int) -> bool:
         """Whether the highlighted text is complete (Enter should be a newline)."""
         entry = self.entries[index]
-        if entry.action:
+        if entry.action or entry.replace_document:
             return False
         return entry.insert.strip().lstrip("\\") == self.token.strip()
 
@@ -331,6 +335,32 @@ class _ExpressionPosition:
     close: bool = True
     numeric_result: bool = False
     result_kind: ArgumentKind | None = None
+    # The operand the caret sits after is a bare all-columns `*`, not a
+    # multiplication: `\select *` is complete, Enter is a newline.
+    star: bool = False
+
+
+def _star_operand(text: str) -> bool:
+    """True when the segment holds a bare all-columns `*`, not multiplication.
+
+    Scanning left to right: while no operand has been seen yet, a `*` is the
+    all-columns select. An operand or a `/` ends that state; an operator or
+    whitespace keeps it open.
+    """
+    quote: str | None = None
+    operand = True
+    for char in text:
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "+-*/%":
+            operand = char != "/"
+        elif not char.isspace():
+            operand = False
+    return operand
 
 
 def _expression_position(text: str) -> _ExpressionPosition | None:
@@ -382,6 +412,16 @@ def _expression_position(text: str) -> _ExpressionPosition | None:
                 r"\s*(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)[eE]", text[current.offset:index],
             ):
                 continue
+            if (char == "*" and not text[index + 1:].strip() and current.fn is None
+                    and _star_operand(text[current.offset:index])
+                    and not any(frame.fn is not None for frame in stack)):
+                # `\select *` is the all-columns star, not a multiplication:
+                # the segment is complete, so Enter is a newline.
+                return _ExpressionPosition(
+                    current.offset, star=True,
+                    numeric_result=current.numeric_result,
+                    result_kind=current.result_kind,
+                )
             current.offset = index + 1
             current.arithmetic = True
     if quote:
@@ -541,6 +581,10 @@ def _select_entries(
         (0, name, detail, f"{name} ") for name, type_, detail in columns
         if not arithmetic or _numeric_type(type_)
     ]
+    if not arithmetic:
+        # The all-columns star is a first-class select item, matched like any
+        # other row: typing `*` narrows to it, Enter after it is a newline.
+        rows.insert(0, (0, "*", "all columns", "* "))
     rows += [(1, fn, "aggregate", f"{fn}(") for fn in _aggregate_fns(schema)]
     if not arithmetic:
         rows += [(2, fn, "temporal part", f"{fn}(") for fn in _temporal_fns(columns, schema)]
@@ -619,6 +663,8 @@ def _value_entries(
     value_lookup: Callable[[str], list[str]] | None = None,
 ) -> list[Entry]:
     """That column's distinct values, searched by what is being typed."""
+    if not _COL_PATTER.fullmatch(column):
+        return []  # Aggregate results have no source-column value cache.
     rows = [
         (0, value, f"{column} value", f"{_value_text(value)} ")
         for value in (value_lookup(column) if value_lookup is not None else session.values_for(doc, column, schema=schema))
@@ -746,7 +792,77 @@ def _default_group_columns(doc: str, schema: SchemaContext) -> str:
     return ", ".join(dict.fromkeys(item.column for item in ast.select if item.column))
 
 
+def _query_prefix(doc: str) -> str:
+    """Fold case and whitespace outside quotes, preserving literal bytes."""
+    result: list[str] = []
+    quote: str | None = None
+    for char in doc:
+        if quote is not None:
+            result.append(char)
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+            result.append(char)
+        elif char.isspace():
+            if result and result[-1] != " ":
+                result.append(" ")
+        else:
+            result.append(char.casefold())
+    return "".join(result)
+
+
+def _query_history_entries(session: Session, doc: str) -> list[Entry]:
+    """Exact documents counted by successful runs, count then newest first."""
+    prefix = _query_prefix(doc)
+    if not prefix:
+        return []
+    target = session.source_key()
+    usage: dict[str, tuple[int, int]] = {}
+    for recency, entry in enumerate(session.history):
+        if (entry.target and entry.target != target) or (not entry.target and entry.source != session.active_id):
+            continue
+        count, newest = usage.get(entry.doc, (0, recency))
+        usage[entry.doc] = (count + 1, newest)
+    matches = [
+        (query, count, newest) for query, (count, newest) in usage.items()
+        if query != doc and _query_prefix(query).startswith(prefix)
+    ]
+    matches.sort(key=lambda item: (-item[1], item[2]))
+    return [
+        Entry(
+            label=f"History ({count} {'run' if count == 1 else 'runs'}): "
+                  + query[:QUERY_PREVIEW_LENGTH].replace("\t", " ").replace("\n", " · ")[:QUERY_PREVIEW_LENGTH]
+                  + ("…" if len(query) > QUERY_PREVIEW_LENGTH else ""),
+            insert=query, detail="replace whole query", replace_document=True,
+        )
+        for query, count, _ in matches[:QUERY_SUGGESTIONS]
+    ]
+
+
 def view_for(
+    session: Session, doc: str, line: str, column: int, *, parameters: Iterable[str] = (),
+    value_lookup: Callable[[str], list[str]] | None = None, row: int | None = None,
+    query_history: bool = True,
+) -> View | None:
+    """Contextual offers plus matching whole documents, only at document end."""
+    parameters = tuple(parameters)
+    view = _context_view_for(session, doc, line, column, parameters=parameters,
+                             value_lookup=value_lookup, row=row)
+    if (not query_history or parameters or not session.intellisense
+            or column != len(line) or line != doc.rsplit("\n", 1)[-1]
+            or (row is not None and row != doc.count("\n"))):
+        return view
+    entries = _query_history_entries(session, doc)
+    if not entries:
+        return view
+    if view is None:
+        return View(0, doc, entries, phase="argument", end=column)
+    combined = [*entries, *view.entries] if view.phase == "argument" else [*view.entries, *entries]
+    return View(view.start, view.token, combined, view.phase, view.end)
+
+
+def _context_view_for(
     session: Session, doc: str, line: str, column: int, *, parameters: Iterable[str] = (),
     value_lookup: Callable[[str], list[str]] | None = None, row: int | None = None,
 ) -> View | None:
@@ -759,8 +875,24 @@ def view_for(
     if row is not None:
         lines = doc.split("\n")
         begin, stop = block_bounds(lines, row + 1)
-        doc = "\n".join(lines[begin:stop])
-        row -= begin
+        statement_begin, _ = statement_bounds(lines, row + 1)
+        prefix: list[str] = []
+        if begin > statement_begin:
+            # Keep preceding definitions as CTEs, never physical schema entries:
+            # function expansion must still reject capturing a caller's names.
+            parent = parse_query("\n".join(lines[statement_begin:stop]), schema=schema)
+            for cte in parent.with_:
+                header = statement_begin + cte.line - 1
+                if header >= begin - 1:
+                    break
+                prefix.extend(lines[header:block_extent(lines, header)])
+        body = lines[begin:stop]
+        if begin > statement_begin:
+            # The active body becomes this synthetic context's root query.
+            # Leaving it indented would append it to the preceding CTE instead.
+            body = [raw.lstrip() for raw in body]
+        doc = "\n".join([*prefix, *body])
+        row += len(prefix) - begin
     before = line[:column]
     parameter = _parameter_token(before) if parameters else None
     if parameter is not None:
@@ -807,10 +939,18 @@ def view_for(
         return View(start=slash, token=word, entries=entries, end=end) if entries else None
 
     command = word.lower()
+    cross_join = False
     if command == "join":
-        joined = _join_view(session, doc, line, column, rest, slash + 1 + len(word) + len(gap), row=row)
-        if joined is not None:
-            return joined
+        # A quoted/qualified `cross` is a table. Preserve the ordinary source
+        # form too when its complete prefix is followed by an ON predicate.
+        cross_join = bool(re.match(r"cross\s", rest, re.IGNORECASE)) and not any(
+            parse_source(rest[:position].strip()) is not None
+            for position in keyword_positions(rest, "on")
+        )
+        if not cross_join:
+            joined = _join_view(session, doc, line, column, rest, slash + 1 + len(word) + len(gap), row=row)
+            if joined is not None:
+                return joined
     arguments = DATASET_COMMANDS | SET_OP_COMMANDS | {"group", "where", "drop"}
     if command in arguments:
         token, offset = (_where_token(rest) if command != "drop" else _word(rest))
@@ -837,8 +977,11 @@ def view_for(
         entries = _offers(rows, token)
     elif command in DATASET_COMMANDS or command in SET_OP_COMMANDS:
         head = rest[:offset].split()
+        if cross_join:
+            head = head[1:]
         # `\union all |` still takes a name: the modifier is not a table.
-        modifier = head[0].lower() if head and head[0].lower() in SET_OP_MODIFIER_WORDS else ""
+        modifier = (head[0].lower() if command in SET_OP_COMMANDS and head
+                    and head[0].lower() in SET_OP_MODIFIER_WORDS else "")
         head = head[1:] if modifier else head
         if head:
             # `\from events |` is done: a table is already named there, and the
@@ -846,13 +989,17 @@ def view_for(
             # stray Enter cannot append a second one.
             return None
         rows = [
-            (0, name, detail, session.table_insert(doc, name, schema=schema)
-             if command in DATASET_COMMANDS and not line[end:].strip() else f"{name} ")
+            (0, name, detail, session.table_insert(
+                doc, '"cross"' if command == "join" and not cross_join and name.lower() == "cross" else name,
+                schema=schema,
+            ) if command in DATASET_COMMANDS and not line[end:].strip() else f"{name} ")
             for name, detail in session.dataset_entries(doc, schema=schema)
         ]
         if command in SET_OP_COMMANDS and not modifier:
             # The modifier leads the argument, and only once.
             rows += [(1, name, detail, f"{name} ") for name, detail in SET_OP_MODIFIERS]
+        if command == "join" and not cross_join:
+            rows.append((1, "cross", "Cartesian product · no ON predicate", "cross "))
         # Saved functions complete here too — accepted as a `name()` call with
         # the caret inside the parens — after the datasets, in match order.
         entries = _history_offers(session, doc, rows, token, category="dataset") + _fn_call_entries(session, token, schema)
@@ -918,7 +1065,7 @@ def _where_entries(
         return _column_offers(session, doc, token, schema)
     head = where_head(piece.strip())
     if head is None:
-        if _COL_PATTER.fullmatch(piece.strip()):
+        if _COL_PATTER.fullmatch(piece.strip()) or where_head(f"{piece.strip()} =") is not None:
             return _offers([(0, op, "operator", f"{op} ") for op in ops], token)
         # A column plus partial operator words (`amount is`, `amount n`): the
         # multi-word operators those words begin, offered as the remainder of
@@ -1125,6 +1272,7 @@ class CommandPalette(OptionList):
                     parameters=self.parameters() if self.parameters is not None else (),
                     row=row,
                     value_lookup=value_lookup,
+                    query_history=self.workspace_actions and self.parameters is None,
                 )
                 if self.session.intellisense and not self._dismissed
                 else None
@@ -1139,14 +1287,16 @@ class CommandPalette(OptionList):
             if not view.entries:
                 view = None
         if (view is not None and view.phase == "argument"
-                and (len(view.entries) == 1 or line[:column].endswith((" ", "\t")))
+                and (sum(not entry.replace_document for entry in view.entries) == 1
+                     or line[:column].endswith((" ", "\t")))
                 and (view.end is None or view.end == column)
                 and any(not entry.cursor_back and not entry.insert.startswith("\\")
                         and view.highlighted_is_typed(index)
                         for index, entry in enumerate(view.entries))):
             # A completed leaf has no next choice. Keep calls, table aliases,
             # operators and other genuine continuations, not the accepted field.
-            view = None
+            history = [entry for entry in view.entries if entry.replace_document]
+            view = View(view.start, view.token, history, view.phase, view.end) if history else None
         if view is None:
             self.close()
             return
@@ -1200,6 +1350,10 @@ class CommandPalette(OptionList):
         if self.is_open:
             if self._place():
                 self.styles.visibility = "visible"
+            elif self.editor is not None and self.editor.content_region.width < 8:
+                # Splitter clamping can briefly collapse the editor. Keep the
+                # offers concealed until its resize event supplies usable geometry.
+                self.styles.visibility = "hidden"
             else:
                 self.close()
 
@@ -1271,7 +1425,13 @@ class CommandPalette(OptionList):
                 and (newline or not entry.insert.startswith("\\"))
                 and (view.end is None or view.end == column)):
             return False
-        if entry.action:
+        if entry.replace_document:
+            last = editor.document.line_count - 1
+            editor.replace(entry.insert, (0, 0), (last, len(editor.document[last])),
+                           maintain_selection_offset=False)
+            lines = entry.insert.split("\n")
+            editor.cursor_location = (len(lines) - 1, len(lines[-1]))
+        elif entry.action:
             editor.replace("", (row, view.start), (row, column))
             editor.cursor_location = (row, view.start)
             self.post_message(self.ActionPerformed(entry.action))

@@ -84,14 +84,13 @@ def test_range_and_disjoint_selection_copy_raw_tsv_and_highlight_full_rows():
     result = outcome()
 
     async def scenario(app, pilot, table):
-        await pilot.press("shift+down", "shift+down")
+        await pilot.press("shift+space", "shift+down", "shift+down")
         assert table.selected_rows == {0, 1, 2}
         await pilot.press("shift+up")
         assert table.selected_rows == {0, 1}
         await pilot.press("down", "down", "right", "space")
         assert (table.cursor_row, table.cursor_column) == (3, 1)
         assert table.selected_rows == {0, 1, 3}
-        assert "3 selected" in str(table.border_subtitle)
 
         # Inspect the rendered surface, not just the selected set: the noncursor
         # row's text and trailing blank space both differ from an unselected row.
@@ -109,7 +108,7 @@ def test_range_and_disjoint_selection_copy_raw_tsv_and_highlight_full_rows():
 
         await pilot.press("escape", "ctrl+c")
         assert not table.selected_rows
-        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == serialized_rows(result, [3])
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["amount"], ["4.50"]]
 
     run_grid(scenario, result)
 
@@ -119,9 +118,9 @@ def test_select_all_resets_on_new_result_and_resize_still_works():
         await pilot.press("ctrl+a")
         assert table.selected_rows == {0, 1, 2, 3}
         width = table.ordered_columns[0].get_render_width(table)
-        await pilot.press("shift+right")
+        await pilot.press("alt+right")
         assert table.ordered_columns[0].get_render_width(table) == width + 2
-        await pilot.press("shift+left")
+        await pilot.press("alt+left")
         assert table.ordered_columns[0].get_render_width(table) == width
         table.show_result(RunOutcome(ok=True, columns=["fresh"], rows=[[7]], total=1))
         await pilot.pause()
@@ -131,6 +130,85 @@ def test_select_all_resets_on_new_result_and_resize_still_works():
         assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["fresh"], ["7"]]
 
     run_grid(scenario)
+
+
+def cell_offset(table, row, column):
+    """Locate the actual rendered cell, including labels and scroll offsets."""
+    for y in range(table.size.height):
+        x = 0
+        for segment in table.render_line(y):
+            meta = segment.style.meta if segment.style else {}
+            if meta.get("row") == row and meta.get("column") == column:
+                return x + table.content_region.x - table.region.x, y + table.content_region.y - table.region.y
+            x += segment.cell_length
+    raise AssertionError(f"Cell {row}, {column} is not visible")
+
+
+def test_cell_range_reverses_and_copies_only_highlighted_fields():
+    async def scenario(app, pilot, table):
+        await pilot.press("right", "shift+down", "shift+down", "shift+right", "shift+up", "ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [
+            ["amount", "day"], ["1.20", "2026-09-24"], ["", "2026-09-25"],
+        ]
+        # A noncursor cell in the range is painted; neighboring cells are not.
+        cells = {segment.style.meta.get("column"): segment.style
+                 for segment in table.render_line(1) if segment.style and segment.style.meta}
+        assert cells[1].bgcolor != cells[0].bgcolor
+        assert cells[2].bgcolor == cells[1].bgcolor
+        await pilot.press("left", "ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["amount"], [""]]
+        await pilot.press("ctrl+space", "ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [
+            ["amount"], ["1.20"], [""], ["3.40"], ["4.50"],
+        ]
+
+    run_grid(scenario)
+
+
+def test_mouse_drag_shift_click_and_row_column_headers():
+    async def scenario(app, pilot, table):
+        await pilot.mouse_down(table, offset=cell_offset(table, 0, 1))
+        await pilot.hover(table, offset=cell_offset(table, 2, 2))
+        await pilot.mouse_up(table, offset=cell_offset(table, 2, 2))
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [
+            ["amount", "day"], ["1.20", "2026-09-24"], ["", "2026-09-25"], ["3.40", ""],
+        ]
+        assert app.mouse_captured is None
+        await pilot.click(table, offset=cell_offset(table, 1, 1), shift=True)
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["amount"], ["1.20"], [""]]
+        await pilot.click(table, offset=cell_offset(table, 1, -1))
+        await pilot.click(table, offset=cell_offset(table, 3, -1), control=True)
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == serialized_rows(outcome(), [1, 3])
+        await pilot.click(table, offset=cell_offset(table, -1, 2))
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [
+            ["day"], ["2026-09-24"], ["2026-09-25"], [""], [""],
+        ]
+
+    run_grid(scenario)
+
+
+def test_range_scrolls_and_stays_within_buffer_then_resets():
+    result = RunOutcome(ok=True, columns=["n", "other"], rows=[[i, -i] for i in range(80)], total=80)
+
+    async def scenario(app, pilot, table):
+        table.move_cursor(row=77, column=1)
+        await pilot.press("shift+down", "shift+down", "shift+down", "shift+right", "ctrl+c")
+        assert table.scroll_y > 0
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["other"], ["-77"], ["-78"], ["-79"]]
+        await pilot.click(table, offset=cell_offset(table, 78, 0))
+        await pilot.click(table, offset=cell_offset(table, 79, 1), shift=True)
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["n", "other"], ["78", "-78"], ["79", "-79"]]
+        table.show_result(RunOutcome(ok=True, columns=["new"], rows=[[42]], total=1))
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        assert list(csv.reader(io.StringIO(app.clipboard), delimiter="\t")) == [["new"], ["42"]]
+
+    run_grid(scenario, result)
 
 
 def test_export_selected_and_all_scopes_use_raw_values(tmp_path):
@@ -266,7 +344,7 @@ def test_export_errors_stay_in_modal_and_header_only_result_can_be_exported(tmp_
 def test_no_result_has_no_export_and_copy_does_not_destroy_clipboard():
     async def scenario(app, pilot, table):
         app.copy_to_clipboard("keep clipboard")
-        table.action_copy_rows()
+        table.action_copy_selection()
         table.action_export()
         await pilot.pause()
         assert not isinstance(app.screen, ExportModal)

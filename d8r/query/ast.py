@@ -270,6 +270,8 @@ class WhereClause:
     # A `( … )` group: the parsed tree inside the parentheses; set only on a
     # group node, whose own flat fields are then empty.
     group: "WhereClause | None" = None
+    # A reduction on the predicate's left side; column is empty when present.
+    aggregate: AggCall | None = None
 
     def conditions(self) -> list["WhereClause"]:
         """Every condition in this line's tree, in document order.
@@ -302,6 +304,8 @@ class WhereClause:
             "value": self.value,
             "subquery": self.subquery.to_json() if self.subquery else None,
         }
+        if self.aggregate is not None:
+            data["aggregate"] = self.aggregate.to_json()
         if self.low or self.high:
             data["low"] = self.low
             data["high"] = self.high
@@ -366,7 +370,7 @@ class FromClause:
 
 @dataclass
 class JoinClause:
-    """One INNER join, with a shared key or an ANDed sequence of equality keys.
+    """A typed join, with a shared key or an ANDed sequence of keys.
 
     Two source shapes ride along: an inline `( … )` subquery (`body`, with the
     dataset name empty), and `lateral`, where the subquery may reference the
@@ -387,6 +391,9 @@ class JoinClause:
     body: QueryAST | None = None
     # Additional equality pairs, ANDed with the first left/right pair.
     keys: tuple[tuple[str, str], ...] = ()
+    kind: Literal["inner", "left", "right", "outer", "anti", "semi", "asof", "cross"] = "inner"
+    # The new relation is the written left operand, not the accumulated side.
+    reverse: bool = False
 
     def to_json(self) -> dict:
         data = {
@@ -400,6 +407,10 @@ class JoinClause:
         }
         if self.keys:
             data["keys"] = [list(pair) for pair in self.keys]
+        if self.kind != "inner":
+            data["kind"] = self.kind
+        if self.reverse:
+            data["reverse"] = True
         return data
 
 

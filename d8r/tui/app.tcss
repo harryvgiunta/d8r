@@ -1,52 +1,300 @@
-/* D8R's dark stylesheet: a data IDE in the terminal.
-   Theme tokens come from `textual-dark`, so the app stays dark by design. */
+/* Theme-relative surfaces keep the workspace soft in light and dark palettes. */
 
 Screen {
     background: $background;
     layers: base;
 }
 
-/* -- header ------------------------------------------------------------- */
-
-#header {
-    height: 3;
-    padding: 0 1;
-    background: $panel;
+/* Flat controls preserve the one-row toolbars without simulated bevels. */
+Button {
+    color: $foreground;
+    background: $surface;
+    border: round $foreground 18%;
+    text-style: none;
 }
 
-#app-title {
-    width: auto;
-    padding: 1 2 0 0;
-    text-style: bold;
-    color: $accent;
+Button:hover {
+    background: $primary 16%;
+    border: round $primary 65%;
+    background-tint: $primary 8%;
 }
 
-#header Select {
-    width: 1fr;
-    max-width: 34;
-    min-width: 12;
-    margin: 0 1 0 0;
+Button.-active {
+    background: $primary 25%;
+    border: round $primary;
+    tint: transparent;
 }
 
-#backend-pill {
-    width: auto;
+Button.-primary {
+    background: $primary 20%;
+    border: round $primary 65%;
+}
+
+Button.-success {
+    background: $success 18%;
+    border: round $success 65%;
+}
+
+Button.-warning {
+    background: $warning 18%;
+    border: round $warning 65%;
+}
+
+Button.-error {
+    background: $error 15%;
+    border: round $error 65%;
+}
+
+Button.-textual-compact {
     height: 1;
-    margin: 1 0 0 1;
-    padding: 0 2;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    border: none !important;
+}
+
+Button:focus {
+    text-style: bold underline;
+    background-tint: $primary 12%;
+}
+
+Button:disabled {
+    opacity: 55%;
+}
+
+#open-ai, #fn-ai {
     background: $accent 20%;
     color: $text;
 }
 
-#reconnect-source {
+#query-to-fn {
+    width: 1fr;
+    height: auto;
+    text-wrap: wrap;
+    background: $warning 20%;
+    color: $text;
+}
+
+#open-ai:hover, #fn-ai:hover,
+#query-to-fn:hover {
+    background-tint: $foreground 8%;
+}
+
+/* Native Select geometry and keyboard handling stay with Textual. */
+Select > SelectCurrent {
+    background: $surface;
+    color: $foreground;
+    border: round $foreground 20%;
+    padding: 0 1;
+}
+
+SelectCurrent Static#label,
+SelectCurrent .arrow {
+    color: $text-muted;
+}
+
+SelectCurrent.-has-value Static#label {
+    color: $foreground;
+}
+
+Select:hover > SelectCurrent {
+    border: round $primary 60%;
+    background-tint: $primary 6%;
+}
+
+Select:focus > SelectCurrent,
+Select.-expanded > SelectCurrent {
+    border: round $primary;
+    background-tint: $primary 10%;
+}
+
+Select:focus SelectCurrent .arrow,
+Select.-expanded SelectCurrent .arrow {
+    color: $primary;
+}
+
+Select:disabled > SelectCurrent {
+    border: round $foreground 12%;
+    background-tint: transparent;
+}
+
+Select:disabled SelectCurrent Static#label,
+Select:disabled SelectCurrent .arrow {
+    color: $text-disabled;
+}
+
+Select > SelectOverlay,
+CommandPalette {
+    background: $surface;
+    color: $foreground;
+    border: round $primary 65%;
+    padding: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $surface;
+    scrollbar-background-hover: $surface;
+    scrollbar-background-active: $surface;
+    scrollbar-color: $primary 35%;
+    scrollbar-color-hover: $primary 60%;
+    scrollbar-color-active: $primary;
+    scrollbar-corner-color: $surface;
+}
+
+Select > SelectOverlay {
+    max-height: 12;
+}
+
+Select > SelectOverlay:focus,
+CommandPalette:focus {
+    border: round $primary;
+    background-tint: transparent;
+}
+
+SelectOverlay > .option-list--option,
+CommandPalette > .option-list--option {
+    padding: 0 1;
+    color: $foreground;
+    text-style: none;
+}
+
+SelectOverlay > .option-list--option-hover,
+CommandPalette > .option-list--option-hover {
+    background: $primary 12%;
+    color: $foreground;
+    text-style: none;
+}
+
+SelectOverlay > .option-list--option-highlighted,
+SelectOverlay:focus > .option-list--option-highlighted,
+CommandPalette > .option-list--option-highlighted,
+CommandPalette:focus > .option-list--option-highlighted {
+    background: $primary 24%;
+    color: $foreground;
+    text-style: bold;
+}
+
+SelectOverlay > .option-list--option-disabled,
+CommandPalette > .option-list--option-disabled {
+    background: transparent;
+    color: $text-disabled;
+    text-style: dim;
+}
+
+SelectOverlay > .option-list--separator,
+CommandPalette > .option-list--separator {
+    color: $foreground 18%;
+}
+
+/* Active tabs retain a complete outline and a subtle theme-relative highlight. */
+Tabs {
+    height: 3;
+    background: $background;
+}
+
+Tabs Underline {
+    display: none;
+}
+
+Tabs Tab {
+    height: 3;
+    margin-right: 1;
+    padding: 0 1;
+    border: round $foreground 18%;
+    background: $panel;
+    color: $text-muted;
+}
+
+Tabs Tab:hover {
+    border: round $primary 60%;
+    color: $text;
+}
+
+Tabs Tab.-active {
+    border: round $primary;
+    background: $primary 16%;
+    color: $text;
+    text-style: bold;
+}
+
+Tabs:focus Tab.-active {
+    color: $foreground;
+    background: $primary 16%;
+    text-style: bold underline;
+}
+
+Tabs Tab:disabled {
+    color: $text-disabled;
+    border: round $panel;
+}
+
+/* -- header ------------------------------------------------------------- */
+
+#query-header {
+    height: auto;
+    background: $panel;
+}
+
+
+#query-targets {
+    height: 3;
+}
+
+
+#query-targets Select {
+    width: 1fr;
+    min-width: 12;
+}
+
+#query-targets SelectCurrent {
+    height: 3;
+    padding: 0 1;
+}
+
+#query-targets SelectCurrent Static {
+    height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#query-targets SelectOverlay {
+    min-width: 12;
+}
+
+
+#reconnect-source, #query-new {
     width: auto;
     min-width: 11;
-    margin: 1 0 0 1;
+    margin: 0 0 0 1;
 }
 
 /* -- body --------------------------------------------------------------- */
 
 #body {
     height: 1fr;
+}
+
+.pane-controls {
+    height: 1;
+    background: $panel;
+}
+
+.pane-controls .pane-title {
+    width: 1fr;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+.pane-controls Button.pane-close {
+    width: 5;
+    min-width: 5;
+    height: 1;
+    padding: 0;
+    margin: 0;
+    color: $text-muted;
+}
+
+.pane-controls Button.pane-close:hover {
+    color: $error;
 }
 
 #explorer-slot {
@@ -64,7 +312,8 @@ Screen {
     background: $surface;
 }
 
-#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages, #tab-agents {
+#explorer-tabs, #explorer-tabs ContentSwitcher, #tab-schema, #tab-pages, #tab-functions,
+#assistant-tabs, #assistant-tabs ContentSwitcher, #tab-ai, #tab-agents {
     height: 1fr;
     padding: 0;
 }
@@ -100,8 +349,11 @@ Screen {
     margin-right: 1;
 }
 
-#page-title {
-    height: 3;
+#page-search {
+    height: 1;
+    border: none;
+    padding: 0 1;
+    background: $panel;
 }
 
 #pages-list {
@@ -113,7 +365,7 @@ Screen {
     height: auto;
     padding: 0 1;
     color: $text-muted;
-    background: $panel-darken-1;
+    background: $panel;
 }
 
 #work-bench {
@@ -133,7 +385,7 @@ Screen {
     min-height: 0;
 }
 
-#function-editor, #function-output, #fn-list-pane {
+#function-editor, #function-output {
     display: none;
 }
 
@@ -145,7 +397,7 @@ Screen {
 .pane-title {
     height: 1;
     padding: 0 1;
-    background: $panel-darken-1;
+    background: $panel;
     color: $text-muted;
     text-style: bold;
 }
@@ -159,7 +411,7 @@ Screen {
 
 #document-actions, #fn-actions {
     height: 1;
-    background: $panel-darken-1;
+    background: $panel;
 }
 
 #fn-actions .pane-title {
@@ -173,8 +425,55 @@ Screen {
 }
 
 #document-actions Button {
+    width: 1fr;
+    max-width: 16;
     min-width: 0;
     padding: 0;
+}
+
+#fn-actions #fn-close {
+    width: 5;
+    min-width: 5;
+    margin: 0;
+}
+
+#page-details {
+    display: none;
+    height: auto;
+    padding: 0 1;
+    background: $panel;
+}
+
+#page-details-heading {
+    height: 1;
+}
+
+#page-details-heading .pane-title {
+    width: 1fr;
+}
+
+#page-details-heading Button {
+    min-width: 0;
+    margin-left: 1;
+}
+
+#page-name {
+    height: 3;
+}
+
+#page-description {
+    height: 4;
+    border: round $foreground 18%;
+}
+
+#page-details-status {
+    height: 1;
+    color: $text-muted;
+}
+
+#document-actions #page-details-toggle {
+    min-width: 19;
+    max-width: 19;
 }
 
 #editor {
@@ -193,11 +492,7 @@ CommandPalette {
     max-height: 8;
     text-wrap: nowrap;
     text-overflow: ellipsis;
-    scrollbar-size-vertical: 1;
     display: none;
-    background: $panel;
-    border: round $accent;
-    padding: 0 1;
 }
 
 CommandPalette.open {
@@ -235,7 +530,30 @@ CommandPalette.open {
 #results-status {
     height: 1;
     padding: 0 1;
-    background: $panel-darken-1;
+    background: $panel;
+    color: $text-muted;
+}
+
+.data-actions {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+}
+
+.data-actions Button {
+    height: 1;
+    min-width: 6;
+    margin: 0 1 0 0;
+}
+
+.data-table {
+    height: 1fr;
+}
+
+.data-status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
     color: $text-muted;
 }
 
@@ -294,7 +612,7 @@ AddSourceModal {
     padding: 0 0 1 0;
 }
 
-#d1-fields, #postgres-fields {
+#d1-fields, #postgres-fields, #backend-fields, .backend-fields {
     height: auto;
 }
 
@@ -353,7 +671,7 @@ SettingsScreen {
     max-width: 35%;
     height: 1fr;
     padding-right: 1;
-    border-right: solid $panel-lighten-2;
+    border-right: solid $foreground 18%;
 }
 
 #settings-nav-title {
@@ -391,7 +709,7 @@ SettingsScreen {
 #settings-menu {
     height: 1fr;
     background: $surface;
-    border: round $panel-lighten-2;
+    border: round $foreground 18%;
 }
 
 #settings-menu:focus {
@@ -409,7 +727,7 @@ SettingsScreen {
 #fn-list {
     height: 1fr;
     background: $surface;
-    border: round $panel-lighten-2;
+    border: none;
 }
 
 #fn-param-guide {
@@ -474,7 +792,7 @@ SettingsScreen {
 #fn-body {
     height: 1fr;
     background: $surface;
-    border: round $panel-lighten-2;
+    border: round $foreground 18%;
 }
 
 #fn-buttons {
@@ -496,13 +814,24 @@ SettingsScreen {
 
 /* -- in-layout AI assistant --------------------------------------------- */
 
-AIPanel {
+#assistant-slot {
     width: 44;
     min-width: 0;
     height: 1fr;
     border-left: solid $accent;
     padding: 0 1;
     background: $surface;
+}
+
+#assistant-controls {
+    dock: top;
+    height: 1;
+}
+
+AIPanel {
+    min-width: 0;
+    width: 1fr;
+    height: 1fr;
 }
 
 AIPanel .ai-notice {
@@ -580,7 +909,7 @@ AIPanel #ai-input {
     min-height: 6;
     max-height: 12;
     padding: 0 1;
-    border: round $panel-lighten-2;
+    border: round $foreground 18%;
     margin-top: 1;
 }
 
@@ -596,6 +925,20 @@ AIPanel Button {
 
 AIPanel #ai-apply {
     width: 2fr;
+}
+
+AIPanel #ai-apply:enabled {
+    background: #17643b;
+    color: #ffffff;
+    text-style: bold;
+}
+
+AIPanel #ai-apply:enabled:hover {
+    background: #1f7a49;
+}
+
+AIPanel #ai-apply:enabled:focus {
+    text-style: bold underline;
 }
 
 AIPanel #ai-function-details {
@@ -637,11 +980,6 @@ AIDiagnosticsScreen {
 
 /* -- independently running AI chats ------------------------------------ */
 
-#open-agents {
-    width: auto;
-    min-width: 8;
-    margin: 1 0 0 1;
-}
 
 AgentsPane {
     height: 1fr;
@@ -672,7 +1010,7 @@ AgentsPane OptionList {
     height: auto;
     padding: 0 1;
     color: $text-muted;
-    background: $panel-darken-1;
+    background: $panel;
 }
 
 AgentsPane .agents--busy {

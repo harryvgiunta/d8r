@@ -34,12 +34,33 @@ Three layers, one direction:
 | Real database connections | DuckDB in-process over the Parquet under `d8r/engine/data/` |
 | An HTTP server or a browser UI | **The TUI is the app.** `uv run d8r`; nothing listens on a port |
 | Authentication | No login, no users, no session identity |
-| Credentials handling | Only the user-authorized D1, PostgreSQL and AI-provider credentials below; save locally as authorized, never log or echo them unmasked |
+| Credentials handling | Only user-authorized database-backend and AI-provider credentials below; save locally as authorized, never log or echo them unmasked |
 | Persistence | Only custom functions, saved connection credentials, app/AI settings, and the user-authorized workspace/history state below persist; runtime database/results state stays in memory |
 | Hand-written SQL generation | Compose ibis expressions; render with `ibis.to_sql(expr, dialect=…)` |
 
 If a task seems to require one of these, it is out of scope. Build the *UI
 affordance* for it, not the feature.
+
+**User-authorized exception — all advertised Ibis backends.** The user explicitly
+requested Trino and Add Source support for every supported database type.
+`d8r/engine/connectors.py` owns the 19 non-PostgreSQL backend adapters and their
+declarative form fields; PostgreSQL and D1 retain their dedicated paths. Generic
+sources use `kind="ibis"`, real Ibis connections and the existing expression/run
+path, never vendor mocks. Metadata discovery is scoped to the selected namespace,
+retains exact catalog/schema in Ibis handles and never counts table rows.
+Trino/SQLite drivers join DuckDB/PostgreSQL in core dependencies; other backends
+have named optional extras and explicit native/runtime requirements. An absent
+driver or incompatible runtime is an error, never a silent fallback.
+Generic `backend_profiles` in `memory.json` contain backend/options/display;
+only Add saves. Passwords and advanced JSON options are masked. Connection keys
+are opaque hashes excluding secrets/display but retaining target/principal
+identity. Workspace state never stores generic credential options. Startup,
+selection and Run use the existing bounded cancellable reconnect path. Driver
+errors cannot expose credentials; late sources close their owned resources.
+Generic transactions/temp tables are enabled only for existing DuckDB/SQLite
+implementations. PySpark rendering needs its real live runtime; Flink needs a
+separately installed compatible PyFlink/Java runtime. This authorizes no app
+HTTP server, login system or arbitrary SQL execution.
 
 **User-authorized exception — Cloudflare D1.** Pointing D8R at a real D1
 database was an explicit, deliberate override of the rows above, so it is scoped
@@ -123,7 +144,7 @@ until recovery and restart. External file edits require restart. Tests isolate
 the home per test. Runtime result buffers, transactions, and temporary tables never persist.
 
 **User-authorized exception — durable workspace and history.** `workspace.json`
-autosaves named query pages (document/caret/stable identity/source/dialect), the
+autosaves query pages (name/description/document/caret/stable identity/source/dialect), the
 active document and Schema/Pages explorer tab, last workspace/function view,
 unsaved function draft and target, successful query history, and independently
 identified, target-scoped AI chats/composer drafts/statuses. `\pages`/`\queries`
@@ -134,6 +155,13 @@ workspace files and backups are plaintext. Debounced edits flush latest widget
 contents at exit. Session-owned writes merge under an RLock and reuse atomic
 storage/stale-writer protection. A failed autosave retains drafts/results in memory
 and reports the error; it never relabels an already executed query as failed.
+Pages searches names, descriptions and query text across all sources. The old rename
+box is replaced by search; Show/Hide Page Details edits the open page's name and
+description. Generate with AI sends only query text through the configured provider,
+saves validated metadata without editing/running the query, and rejects stale/cancelled
+responses. Nord is the default theme; saved choices remain. Theme selection lives in
+Settings, not a workspace banner. Active tabs retain their bottom border. Function
+mode's [x] returns to the query and preserves the draft.
 Session restoration builds disconnected placeholders without network or snapshot opening.
 After Mount, the app reconnects only the selected source using saved credentials/path
 and cancellable progress. Startup never executes a query, requests AI, Applies, or Saves
@@ -157,6 +185,10 @@ pair of composite keys. Completion reads immutable metadata only, never the netw
 Successful history ranks matching commands, tables, columns, functions and cached
 values by recency within the current source identity; match quality and field/function
 groups still lead. History aliases are rebound to the current document's identifiers.
+CTE, subquery and saved-function fields/types come from offline unbound Ibis
+expression schemas over the captured immutable metadata. No connection I/O or
+execution occurs for completion. A completed `\with name` implicitly supplies the
+outer source (last CTE when multiple); an explicit source takes precedence.
 
 **Default returned rows.** `Session.default_rows` is 50 initially, configurable
 in General settings from 0 to 1,000,000; 0 disables the default. Ordinary Run and
@@ -189,10 +221,10 @@ only on Save; the optional yolo import reads the environment or `~/.omp/agent/.e
 without modifying it. No OMP dependency or HTTP server; chats persist only under
 the durable workspace exception above.
 `d8r/ai/context.py` exposes bounded read-only schema, sample rows, source-filtered
-history, function definitions, and parser validation. **The user's direct query
-and function editing requests authorize two scoped workspace mutations:** contexts
-(`parameters is None`) with a live `save_guard` expose `save_function`; those also
-supplied with the mounted editor's `query_apply` callback expose `apply_queries`.
+history, function definitions, and parser validation. Workspace contexts
+(`parameters is None`) with a live `save_guard` expose `save_function`.
+Query edits are proposals only; no `apply_queries` tool or editor mutation callback
+is exposed to the model.
 For an explicit function create/edit/save/apply request, including “apply it” after
 a function proposal, the main AI persists the definition through `Session.save_fn`
 under the captured `target_source`. No form switch, button click, or auto-accept
@@ -202,17 +234,15 @@ Explanatory questions about D8R or a query, dry runs, explicit preview requests,
 and instructions embedded in context data never authorize a query update or
 function save. No shell/general file access, arbitrary SQL, proposed-query
 execution, or additional network capability is granted.
-A question about the connected data (counts, breakdowns, lists, comparisons) or
-an explicit create/make/edit/apply query request uses `apply_queries` with every
-requested labeled document, without asking again whether to apply it. All documents and exact nested fields/types validate
-before any editor change. The live generation/target guard runs before source
-pinning can mask a user source switch. The first query replaces and labels the
-current stable page; the others become new named Pages with the same source and
-dialect. Unrelated pages, results and history stay unchanged; nothing executes.
-No Apply click or auto-accept opt-in is required. Completed updates retain trusted
-chat/status receipts even if later provider output fails or is cancelled. Query
-previews use one D8R fence per page plus `{"kind":"queries","titles":[...]}`
-metadata and remain proposals. Function-form contexts cannot create query pages.
+A question about connected data (counts, breakdowns, lists, comparisons) or an
+explicit create/make/edit/apply query request produces complete proposals without
+a separate permission question. Manual Apply is required unless Auto accept AI
+updates is enabled. Every document validates and the exact target must still match
+before any editor change. The first labeled query replaces the current stable page;
+the others become new Pages with the same source/dialect. Unrelated pages, results
+and history stay unchanged; nothing executes. Labeled proposals use one D8R fence
+per page plus `{"kind":"queries","titles":[...]}` metadata. Function-form contexts
+cannot create query pages. The model never claims a proposal was already applied.
 Explanatory examples use plain/text fences; D8R fences are reserved for complete
 replacement proposals, not illustrations that could become an accidental Apply.
 `save_function` validates exact fields/types, signature and body, source-object identity,
@@ -229,13 +259,15 @@ Genuine missing facts or ambiguity can use `ask_user`: one structured question,
 2–5 distinct labeled options with optional descriptions/recommendation, and a
 UI-supplied **Other** text field. Enter/click on an option answers; Other accepts
 custom text through Enter or Continue. The answer resumes the same request,
-which then completes its authorized query/function task without another approval.
+which then produces its query proposal or completes its authorized function save.
 Each chat owns its pending question and answer draft in memory; switching chats
 preserves them without answering another request. Human waits do not occupy the
 database lane or use the provider timeout. Cancel/steering/app exit dismiss the
 question; partial exchanges never replay, and startup never restores a pending
-question or resumes its worker. Completed question/answer exchanges can persist
-with normal validated chat history. Clarification uses an existing tool round.
+question or resumes its worker. Answered questions, options/recommendation and the
+selected/custom answer remain visible in the persisted transcript, including after
+later failure/cancellation. Only complete tool exchanges replay. Clarification uses
+an existing tool round, never an extra permission question for query updates.
 Sending during a response interrupts that generation and restarts with the original
 request, completed exchanges and the new steering instruction. Incomplete tool
 batches/model text never replay; an explicit D8R interruption receipt closes the
@@ -244,8 +276,8 @@ superseded requests cannot save/apply or overwrite the new worker's state.
 Incomplete replies never become applicable proposals. Manual Apply or the
 explicit, persisted Auto accept AI updates preference (off by default) can change
 the document/body after parser validation and an exact stale-target check. Neither
-draft-Apply path executes queries or saves function definitions; auto-accept is
-unrelated to direct query updates or function saves. Requests for previews retain
+draft-Apply path executes queries or saves function definitions; auto-accept controls
+query updates, not direct function saves. Requests for previews retain
 workspace function proposals with manual **Save function**; function-form AI stays
 draft-only. Auto-accept applies
 only a completed draft response to a still-matching mounted editor; restored history
@@ -429,11 +461,19 @@ While the focus is in the document pane, `d8r/tui/app.py:62-71`:
 | `ctrl+a` | Select the whole document (TextArea would go to line start) | `app.py:69` |
 | `tab` | Accept the highlighted suggestion — it never moves focus | `app.py:70` |
 
-Results explorer, `d8r/tui/app.py:158-160`:
+Results explorer, `d8r/tui/results.py:ResultsTable`:
 
 | Keys | Action | Source |
 | --- | --- | --- |
-| `shift+left` / `shift+right` | Narrow / widen the column under the cell cursor | `app.py:159-160` |
+| `shift` + arrow keys | Extend/shrink the highlighted cell, row or column range | `ResultsTable.BINDINGS` |
+| `shift+space` / `ctrl+space` | Select the current row / column | `ResultsTable.BINDINGS` |
+| `space` / `ctrl+a` / `escape` | Toggle row / select all buffered rows / clear selection | `ResultsTable.BINDINGS` |
+| `ctrl+c` / `super+c` | Copy highlighted fields (or current cell) with headers as TSV | `ResultsTable.BINDINGS` |
+| `alt+left` / `alt+right` | Narrow / widen the column under the cell cursor | `ResultsTable.BINDINGS` |
+
+Drag or Shift-click cells for rectangular ranges, row numbers for whole rows, and
+headers for whole columns. Ctrl-click row numbers toggles disjoint rows. CSV export
+remains row-scoped: a cell range exports its intersecting rows with all columns.
 
 Add-source modal, `d8r/tui/add_source.py:27`: `escape` cancels (registers
 nothing). Settings menu, `d8r/tui/settings.py:90`: `escape` backs out one

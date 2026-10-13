@@ -47,11 +47,12 @@ document together.
 
 | command | argument | effect |
 | --- | --- | --- |
-| `\with` | `<name>` + indented body | defines a reusable sub-query (CTE), repeatable |
-| `\from` | `<dataset> \| ( <subquery> )` `[as] alias` | sets `from` (a later `\from`/`\open` replaces it) |
+| `\with` | `<name>` + indented body | defines a reusable sub-query (CTE), repeatable; last CTE supplies the source if none is explicit |
+| `\from` | `<dataset> \| ( <subquery> )` `[as] alias` | declares a source for alias joins; without alias joins, a later `\from`/`\open` replaces it |
 | `\open` | same as `\from` | identical to `\from` — the dataset-source spelling |
 | `\name(args)` | saved function's positional arguments, optional `[as] alias` | same source relation as `\from name(args)`; runnable on its own |
-| `\join` | `<dataset> \| ( <subquery> ) [as] alias on col[ = col]` | appends to `joins` (repeatable; always INNER) |
+| `\join` | `A.col <operator> B.col`, `A.col <type> join B.col`, or `<source> [as] alias on col[ = col]` | appends a typed alias join or an ordinary inner source join; a bare header starts a join block |
+| `\join cross` | `<source>` `[as] alias` | appends a Cartesian product; no `on` condition |
 | `\join lateral` | `( <subquery> ) [as] alias [on col[ = col]]` | appends a lateral join / `CROSS APPLY` (repeatable) |
 | `\union` | `[all\|distinct] <dataset\|cte\|( subquery )>` | appends to `setOps` (repeatable; distinct unless `all`) |
 | `\intersect` | `[all\|distinct] <dataset\|cte\|( subquery )>` | appends to `setOps` (repeatable; keeps shared rows) |
@@ -59,7 +60,7 @@ document together.
 | `\select` | expression | appends to `select` |
 | `\distinct` | — | removes duplicate output rows after projection and set operations |
 | `\unique` | — | alias for `\distinct` |
-| `\where` | `col op val [and/or ( … ) …]`, `between`, `is [not] null`, `[not] in (list\|subquery)` | sets `where` (a later `\where` replaces) |
+| `\where` | `column-or-aggregate op val [and/or ( … ) …]`, `between`, `is [not] null`, `[not] in (list\|subquery)` | filters rows or aggregate results (a later `\where` replaces) |
 | `\group` | `column[ column…]` | appends to `groupBy` |
 | `\order` | `target [asc\|desc]` | appends to `orderBy` (default `asc`) |
 | `\case` | `<alias> = when … then … [else …]` | appends a computed column (repeatable) |
@@ -73,12 +74,12 @@ document together.
 | `\commit` | — | commits the open transaction |
 
 Commands are case-insensitive (`\FROM` is `\from`); the command name is
-lowercased into the AST. A line that does not start with `\` is the error
-`` not a command — lines start with \ ``; an unknown name is
+lowercased into the AST. Outside a `\join` block, a line that does not start with
+`\` is the error `` not a command — lines start with \ ``; an unknown name is
 `unknown command "\<name>"`; a command that needs arguments and got none is
-`\<cmd> expects arguments` (`from`, `open`, `join`, `union`, `intersect`,
+`\<cmd> expects arguments` (`from`, `open`, `union`, `intersect`,
 `except`, `select`, `where`, `group`, `order`, `limit`, `case`, `with`, `temp`,
-`drop`, `savepoint`, `release`).
+`drop`, `savepoint`, `release`). `\join` may take its arguments on following lines.
 
 Argument rules:
 
@@ -130,7 +131,7 @@ Argument rules:
 - `\join users on user_id` joins dataset `users` on the shared column
   `user_id` (left side = right side). `\join users on user_id = id` names both
   sides, either may be identifier-qualified. Joins apply in document order, each
-  onto the result of everything before it, always as an INNER join. A malformed
+  onto the result of everything before it, as an INNER join in this source form. A malformed
   clause (missing `on`, or a shape the grammar does not read) is
   ``\join expects `<dataset> [as] <alias> on <col>[ = <col>]` ``.
   Composite keys use explicit equality conjunctions, for example
@@ -146,6 +147,103 @@ Argument rules:
   column parses, and the engine refuses it at build time
   (`unknown function: 'year' for float64`). Completion keeps it from happening
   interactively by filtering on the capability map.
+
+### Alias-based joins
+
+Declare tables with `\from <dataset> <alias>` (or `\open`); previously defined
+CTE names from `\with` are also available directly. An unaliased source uses
+its dataset name as its identifier. Alias joins never invent or rewrite aliases.
+Declare every source before the join that uses it. All explicit source declarations
+must participate; unused CTE definitions remain legal.
+
+| operator | join type | Ibis method |
+| --- | --- | --- |
+| `==` | inner | `inner_join` |
+| `?=` | left | `left_join` |
+| `=?` | right | `right_join` |
+| `??` | full outer | `outer_join` |
+| `!=` | anti | `anti_join` |
+| `^=` | semi | `semi_join` |
+| `@=` | backward as-of | `asof_join` |
+
+```d8r
+\from events A
+\from users B
+\join A.user_id ?= B.user_id
+\select A.user_id, B.region
+```
+
+`\join "A".user_id left join "B".user_id` is equivalent. Type keywords are
+case-insensitive; double quotes on join-reference prefixes identify the same alias.
+Aliases in declarations remain bare identifiers. An optional trailing type keyword
+must agree with the operator. `!=` selects nonmatching left rows, not unequal key
+pairs. Semi/anti return only written-left columns, without duplicating those rows.
+
+A bare `\join` owns non-command lines until the next command; blank lines and
+indentation are allowed. An inline first edge may also have continuation lines.
+
+```d8r
+\from events A
+\from users B
+\from users C
+\join
+  A.user_id == C.user_id
+  B.user_id =? A.user_id
+\select A.user_id, B.region, C.score
+```
+
+The first edge chooses the initial written-left source regardless of declaration
+order. Each later edge connects the accumulated result to exactly one fresh alias.
+Either written operand may be the fresh alias: left/right preservation always
+follows the written operands, not declaration order. A reversed semi/anti retains
+only the fresh written-left relation. Removed aliases cannot be used by later joins.
+Unknown aliases, disconnected edges, duplicate identifiers, and edges between two
+already-connected aliases are errors. Joining a table again requires a fresh alias.
+
+Composite keys belong on one edge: `A.id ?= B.id and A.region = B.region`.
+Additional terms may repeat the same join operator or use `=`; all terms must name
+the same ordered alias pair. Conflicting types and incomplete conditions are errors.
+For `@=`, the first pair matches the latest right key less than or equal to the
+left key, retaining unmatched left rows; additional pairs are equality partitions.
+Actual as-of availability depends on the Ibis backend, with no SQL fallback.
+
+Parsing normalizes these declarations into the existing `from` and ordered `joins`.
+Each join's `dataset`/`alias`/`body` describes the fresh relation; `left` references
+the accumulated relation and `right` the fresh relation. Optional `kind` defaults
+to `inner`; optional `reverse` defaults to `false` and records a fresh written-left
+operand. The AST and payload omit these fields at their defaults. Block edges keep
+their actual document line numbers. Nested CTE/function/subquery bodies use the
+same rules with their own alias scopes.
+
+### Cartesian joins
+
+`\join cross <source> [as] <alias>` pairs every accumulated row with every row
+of the new source. A table or CTE name needs no parentheses:
+
+```d8r
+\from users u
+\join cross events e
+\select u.user_id as user_id, e.event_type
+```
+
+The source may also be a qualified table, saved-function call, or parenthesized
+inline subquery. Only inline subqueries require a surrounding pair of parentheses
+and an alias. A preceding source is required. The modifier is case-insensitive;
+ordinary alias, unknown-table, function-expansion and body-validation rules apply.
+An explicit cross join takes no `on` predicate and cannot correlate its body with
+outer columns; use an ordinary join or `lateral` for those relationships.
+
+Each cross source owns a separate relation identity, including self-products.
+Subsequent ordinary or alias-based joins can reference its alias. Two inputs of
+M and N rows produce M × N rows, including duplicate combinations; either input
+being empty produces zero rows. Restrict inputs in CTEs or subqueries to bound
+the product itself; a final `\limit` caps the returned result.
+
+The AST/payload carries `kind: "cross"`, empty `left`/`right`, `lateral: false`,
+and no key pairs or reversed orientation. The engine uses Ibis `cross_join`.
+Legacy ordinary joins to a table named `cross` retain their `on` form; quote the
+name (`\join "cross" c on ...`) to make the table interpretation explicit.
+
 
 ### Schema-qualified datasets
 
@@ -352,8 +450,8 @@ and become implicit grouping keys alongside aggregates, like temporal calls.
 Constant-only calls use the literal-constant path beside aggregates: they are
 not dropped and are not grouping keys.
 
-Only `\select` gains expression syntax. `\where` and `\group` still take column
-names; compute a value in a CTE to filter or group it:
+Scalar expression syntax belongs to `\select`. `\group` still takes input column
+names; scalar row expressions need a CTE before filtering or grouping:
 
 ```d8r
 \with labeled
@@ -393,6 +491,46 @@ Other aggregates cannot take `*` and are rejected by the engine. The AST keeps
 `count(*)` as `aggregate: {"fn": "count", "arg": "*"}`. Its existing derived
 alias is `__count`; an explicit `as` alias overrides it, including for windows.
 
+### Filtering aggregate results with `\where`
+
+The same `\where` handles both input-row filtering and HAVING-style result
+filtering. Use a direct `sum`, `avg`, `count`, `min`, or `max` call, or an aggregate
+output alias (including an aggregate arithmetic alias):
+
+```d8r
+\from events
+\select event_type, count(*) as total_count
+\where total_count > 15
+```
+
+`\where count(*) > 15` is equivalent. A direct aggregate need not be selected;
+for example, selecting only `event_type` with that filter returns qualifying
+groups without adding a count column. Explicit `\group` keys and selected row
+expressions define the groups, as with selected aggregates. An aggregate filter
+with neither selected expressions nor grouping keys is rejected; it does not
+silently group every input column or expose an internal count.
+
+Independent AND conditions on source columns run before aggregation; aggregate
+conditions run afterwards, before set operations, distinct, ordering and limits.
+Thus `amount > 0 and total_count > 15` counts only positive-amount rows. An OR
+subtree containing an aggregate stays intact after aggregation. Its other column
+references must be grouping keys; an ungrouped source column is rejected rather
+than changing the grouping or boolean meaning. A global count on empty input is
+still zero, and a result filter can retain or remove that single result row.
+
+An unqualified aggregate output alias wins over an identically named source
+column. Qualify the source reference to filter input rows instead. Ordinary
+source columns, aggregate arguments, and inline reduction filters still resolve
+against the input tables. Window output aliases require a CTE. Direct arithmetic
+or scalar-call predicate operands remain unsupported; project aggregate math
+under an alias first. Repeated `\where` remains last-wins, not an implicit AND.
+
+Aggregate leaves add optional `WhereClause.aggregate: AggCall` and serialize
+`aggregate: {fn, arg, where?}` with `column: ""`; alias references retain the
+ordinary column shape. Payload conversion lowers any inline filter subqueries
+through the existing mapping. Ordinary predicate JSON is unchanged. Ibis builds
+the reductions and filters and chooses their SQL rendering; no SQL is handwritten.
+
 ### Filtered aggregates
 
 An aggregate argument may end with an inline `\where` predicate:
@@ -406,13 +544,14 @@ An aggregate argument may end with an inline `\where` predicate:
 \group customer_id
 ```
 
-`sum`, `avg`, `min`, `max`, and `count` accept the same predicate grammar as a
-query-level `\where`: AND/OR precedence, parenthesized groups, comparisons,
-`between`, NULL tests, pattern operators, lists and inline subqueries. Predicate
-columns resolve against the same open tables as the aggregate argument. Each
-predicate is independent: it restricts only that aggregate, not the source rows,
-other aggregates, or the set of groups. A query-level `\where` still restricts
-the input first. Ibis reductions receive `where=predicate`; no SQL is handwritten.
+`sum`, `avg`, `min`, `max`, and `count` accept the row-predicate grammar:
+AND/OR precedence, parenthesized groups, comparisons, `between`, NULL tests,
+pattern operators, lists and inline subqueries. Predicate columns resolve against
+the same open tables as the aggregate argument. Each predicate restricts only
+that aggregate, not the source rows, other aggregates, or the set of groups.
+Query-level row predicates restrict the input first; query-level aggregate
+predicates filter the result. Nested aggregate predicates inside a reduction's
+own filter are rejected. Ibis reductions receive `where=predicate`.
 
 `count(* \where ...)` counts matching rows, including rows with NULL aggregate
 values; `count(amount \where ...)` counts matching non-NULL amounts. A filter
@@ -481,6 +620,17 @@ operands, extra fields and oversized/cyclic raw payload trees are rejected with
   indented; a flush line ends it. The body must be non-empty
   (`\with a expects an indented body`), and the name must be a bare identifier
   (`\with expects a bare CTE name`).
+- With no explicit source in the block, the last completed, valid CTE becomes
+  its source automatically: `\with recent` plus its indented body runs without
+  an outer `\from recent`. The AST records an ordinary `FromClause` naming
+  `recent`, with the **CTE header's line number**; the document text is unchanged.
+  Outer expressions and following lateral joins address its fields as
+  `recent.column`. A `\from`, `\open`, or direct saved-function call anywhere
+  in the block takes precedence, whether before or after the CTE definitions;
+  sources inside a CTE body do not count as outer sources. An incomplete or
+  invalid last CTE does not supply a source or fall back to an earlier CTE.
+  Typing-line error suppression does not turn an unfinished body into a valid
+  source. CTE bodies can start with a direct saved-function call normally.
 - A CTE is addressable by name from a later `\from`/`\join` (and as a
   `\union`/`\intersect`/`\except` operand), in document order (a *forward*
   reference is `unknown table "x"`); nested CTEs (a `\with` inside a CTE
@@ -513,9 +663,9 @@ and empty input stays empty.
 
 The bundled events have four distinct event types; this example returns the
 first three in sorted order. Replacing `\distinct` with `\unique` is identical.
-Execution within each query block is source/joins → filter → projection and
-aggregation/computed columns → set operations → distinct → order → limit,
-regardless of where its command is written. CTEs, inline subqueries, and FN
+Execution within each query block is source/joins → row filters → projection and
+aggregation/computed columns → aggregate-result filters → set operations →
+distinct → order → limit, regardless of where its command is written. CTEs, inline subqueries, and FN
 bodies each have their own independent flag. Set-operation `all`/`distinct`
 modifiers remain independent of this row-level command.
 
@@ -699,6 +849,8 @@ their parentheses, then leaves argument text untouched.
   `\with` blocks are allowed, and later blocks can read earlier ones through
   `\from`, `\join`, set operations, and inline subqueries. Aliases, `\except`,
   `\union all`, ordering, and limits have the same semantics as in a document.
+  Without an explicit source, the function root uses its last completed CTE,
+  including when that CTE's body starts with another saved-function call.
   Local names can match names in the caller or another invocation without
   colliding or leaking; a function never captures the caller's CTEs. The ordinary
   forward-reference, duplicate-name, and dataset-shadowing checks still apply.
@@ -927,6 +1079,7 @@ statements alone carries no query and answers with their status.
   "where": {                 // or null
     "line": 3, "raw": "status = \"paid\"", "column": "status", "op": "=", "value": "paid",
     "subquery": null,        // a full QueryAST for `in`/`not in` and scalar comparisons
+    "aggregate": { "fn": "count", "arg": "*" }, // aggregate LHS only; then column is ""
     "low": "1", "high": "999.5",   // `between` only
     "values": ["a", null],   // `in`/`not in` literal list only (null is the SQL keyword)
     "group": { /* full where shape */ }, // `( … )` group only; then column/op/value are ""

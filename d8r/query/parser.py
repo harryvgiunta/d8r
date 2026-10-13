@@ -51,7 +51,7 @@ from .functions import (
     MAX_WHERE_NODES,
     SCALAR_FUNCTIONS,
 )
-from .identifiers import IDENTIFIER, RELATION_NAME
+from .identifiers import IDENTIFIER, RELATION_NAME, relation_parts
 from .schema import (
     AGGREGATES,
     TEMPORAL,
@@ -67,13 +67,11 @@ _COL_RE = re.compile(rf"^{_COL}$")
 _AGG_RE = re.compile(rf"^([A-Za-z_][A-Za-z0-9_]*)\((\*|{_COL})\)$")
 _CALL_HEAD_RE = re.compile(rf"({_IDENT})\s*\(")
 _AS_RE = re.compile(r"^(.*?)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", re.IGNORECASE)
-# `\where <column> <op> <tail>`; the tail is a value, a `between` pair, an
-# `in`/`not in` list `( a, b )`, or `( … )` for `in`/`not in` and the
-# scalar-subquery form of a comparison. `is [not] null` takes no tail.
-_WHERE_HEAD_RE = re.compile(
-    rf"^({_COL})\s+(is\s+not\s+null|is\s+null|between|not\s+in|in|!=|!~|>=|<=|ilike|like|~|=|>|<)\s*(.*)$",
-    re.IGNORECASE,
-)
+# Predicate tails are shared by column and aggregate heads. Keep the column-only
+# head for `\case`, whose branch conditions do not support aggregate expressions.
+_WHERE_OPERATOR = r"is\s+not\s+null|is\s+null|between|not\s+in|in|!=|!~|>=|<=|ilike|like|~|=|>|<"
+_WHERE_HEAD_RE = re.compile(rf"^({_COL})\s+({_WHERE_OPERATOR})\s*(.*)$", re.IGNORECASE)
+_WHERE_TAIL_RE = re.compile(rf"^\s+({_WHERE_OPERATOR})\s*(.*)$", re.IGNORECASE)
 # The `\where` operators that take an inline subquery instead of a literal.
 SUBQUERY_OPS = frozenset({"in", "not in"})
 # The operators whose operand is neither a literal nor a subquery.
@@ -86,6 +84,15 @@ _ORDER_RE = re.compile(rf"^({_COL})(?:\s+(asc|desc))?$", re.IGNORECASE)
 # may be identifier-qualified — the left usually is.
 _JOIN_ON_RE = re.compile(rf"^on\s+({_COL})(?:\s*=\s*({_COL}))?$", re.IGNORECASE)
 _JOIN_KEY_RE = re.compile(rf"^({_COL})\s*=\s*({_COL})$", re.IGNORECASE)
+_JOIN_KINDS = {
+    "==": "inner", "?=": "left", "=?": "right", "??": "outer",
+    "!=": "anti", "^=": "semi", "@=": "asof",
+}
+_JOIN_TYPE = r"(?:inner|left|right|outer|anti|semi|asof)"
+_SIMPLE_JOIN_RE = re.compile(
+    rf"^({_COL})\s*(==|\?=|=\?|\?\?|!=|\^=|@=|=|{_JOIN_TYPE}\s+join)"
+    rf"\s*({_COL})(?:\s+({_JOIN_TYPE}))?$", re.IGNORECASE,
+)
 # `\union`/`\intersect`/`\except [all|distinct] <dataset>` — the modifier comes
 # first, and absent means SQL's default (`distinct`): rows are deduplicated.
 _SET_OP_RE = re.compile(rf"^(?:(all|distinct)\s+)?({RELATION_NAME})$", re.IGNORECASE)
@@ -357,20 +364,120 @@ def _join_on(text: str) -> tuple[tuple[str, str], ...] | None:
     return tuple(pairs)
 
 
+def _simple_join(text: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Read typed alias keys; every conjunction belongs to the same join."""
+    pieces = split_logic(text, "and")
+    pairs: list[tuple[str, str]] = []
+    kind = ""
+    for index, piece in enumerate(pieces):
+        match = _SIMPLE_JOIN_RE.fullmatch(piece.strip())
+        if match is None:
+            raise ValueError("a simple join needs alias.column <operator> alias.column")
+        left, op, right, suffix = match.groups()
+        if "." not in left or "." not in right:
+            raise ValueError("simple join keys must be alias-qualified")
+        op = op.lower()
+        if op == "=":
+            if index == 0:
+                raise ValueError("use == for an inner join")
+            current = kind
+        else:
+            current = _JOIN_KINDS.get(op) or op.split()[0]
+        if (kind and current != kind) or (suffix and suffix.lower() != current):
+            raise ValueError("all keys of a join must use the same join type")
+        kind = current
+        pairs.append((left, right))
+    return kind, tuple(pairs)
+
+
+def _append_simple_join(
+    ast: QueryAST, declarations: list[FromClause], text: str, line: int,
+    opts: ParseOpts, *, first: bool, introduced: set[str],
+) -> None:
+    """Resolve one fresh relation without inventing another table instance."""
+    kind, pairs = _simple_join(text)
+    sources = {source.alias or source.table: source for source in declarations}
+    for name in opts.visible_ctes:
+        sources.setdefault(name, FromClause(line=line, table=name))
+    for source in ([ast.from_] if ast.from_ else []):
+        sources.setdefault(source.alias or source.table, source)
+    for join in ast.joins:
+        sources.setdefault(join.alias or join.dataset, FromClause(
+            line=join.line, table=join.dataset, alias=join.alias, body=join.body,
+        ))
+
+    def resolve(ref: str) -> tuple[str, str]:
+        prefix, _, column = ref.rpartition(".")
+        identifier = next((name for name in sources
+                           if relation_parts(name) == relation_parts(prefix)), None)
+        if identifier is None:
+            raise ValueError(f'unknown join alias "{prefix}"')
+        return identifier, f"{identifier}.{column}"
+
+    normalized = [(resolve(left), resolve(right)) for left, right in pairs]
+    left_id, right_id = normalized[0][0][0], normalized[0][1][0]
+    if left_id == right_id:
+        raise ValueError("a join needs two distinct aliases")
+    if any(left[0] != left_id or right[0] != right_id for left, right in normalized):
+        raise ValueError("all keys of a join must name the same ordered alias pair")
+    if first and not ast.joins:
+        ast.from_ = sources[left_id]
+        introduced.add(left_id)
+    active = {ast.from_.alias or ast.from_.table} if ast.from_ else set()
+    introduced.update(active)
+    for join in ast.joins:
+        identifier = join.alias or join.dataset
+        introduced.add(identifier)
+        if join.kind in {"semi", "anti"}:
+            if join.reverse:
+                active = {identifier}
+        else:
+            active.add(identifier)
+    left_open, right_open = left_id in active, right_id in active
+    if left_open == right_open:
+        raise ValueError(
+            "a join must introduce a new alias; use AND for additional keys"
+            if left_open else "a join must connect to an already joined alias"
+        )
+    reverse = right_open
+    fresh = left_id if reverse else right_id
+    if fresh in introduced:
+        raise ValueError(f'join alias "{fresh}" is no longer available; declare a fresh alias')
+    source = sources[fresh]
+    keys = tuple((right[1], left[1]) if reverse else (left[1], right[1])
+                 for left, right in normalized)
+    ast.joins.append(JoinClause(
+        line=line, dataset=source.table, alias=source.alias, body=source.body,
+        left=keys[0][0], right=keys[0][1], keys=keys[1:], kind=kind, reverse=reverse,
+    ))
+    introduced.add(fresh)
+
+
 
 
 def where_head(text: str) -> tuple[str, str, str] | None:
-    """A condition's `(column, op, tail)` before its operand is interpreted.
+    """A condition's textual `(lhs, op, tail)` before interpreting either side.
 
-    The parser's own first step and the palette's completion state machine's:
-    the normalized operator tells both which operand shape follows. `None`
-    when the text is not `<column> <op> …` at all. Surrounding whitespace is
-    irrelevant — pieces split off `and`/`or` carry it.
+    Shared with palette completion. The LHS is a column or balanced aggregate
+    call, including quoted values and nested groups in an inline filter. An
+    unfinished head returns `None`, just as an unfinished column condition does.
     """
-    match = _WHERE_HEAD_RE.match(text.strip())
-    if match is None:
+    text = text.strip()
+    match = _WHERE_HEAD_RE.match(text)
+    if match is not None:
+        return match.group(1), re.sub(r"\s+", " ", match.group(2).lower()), match.group(3).strip()
+    call = _CALL_HEAD_RE.match(text)
+    if call is None or call.group(1).lower() not in AGGREGATES:
         return None
-    return match.group(1), re.sub(r"\s+", " ", match.group(2).lower()), match.group(3).strip()
+    opening = call.end() - 1
+    paren = take_paren(text[opening:])
+    if paren is None:
+        return None
+    end = opening + len(paren[0]) + 2
+    tail = _WHERE_TAIL_RE.match(text[end:])
+    if tail is None:
+        return None
+    return text[:end], re.sub(r"\s+", " ", tail.group(1).lower()), tail.group(2).strip()
 
 
 def take_paren(text: str) -> tuple[str, str] | None:
@@ -639,9 +746,10 @@ def absorb(ast: QueryAST, child: QueryAST) -> None:
 
 
 def _where_condition(
-    text: str, line: int, opts: ParseOpts, ast: QueryAST, report: Callable[[str], None]
+    text: str, line: int, opts: ParseOpts, ast: QueryAST, report: Callable[[str], None],
+    *, allow_aggregate: bool = True,
 ) -> WhereClause | None:
-    """One `\\where` condition: `<column> <op> <operand>`, no joining `and`/`or`.
+    """One `\\where` condition: `<column or aggregate> <op> <operand>`.
 
     The operand is a literal, a `between low and high` pair, an `in`/`not in`
     inline list `( a, b )` or subquery `( \from … )`, a scalar-subquery
@@ -654,8 +762,28 @@ def _where_condition(
     if parts is None:
         report("\\where expects `column op value`")
         return None
-    column, op, tail = parts
-    cond = WhereClause(line=line, raw=text.strip(), column=column, op=op, value="")
+    lhs, op, tail = parts
+    aggregate: AggCall | None = None
+    column = lhs
+    if not _COL_RE.fullmatch(lhs):
+        if not allow_aggregate:
+            report("aggregate predicates cannot appear inside aggregate \\where filters")
+            return None
+        try:
+            value = parse_expression(
+                lhs, parse_where=lambda text: _aggregate_where(text, line, opts, ast)
+            )
+        except ValueError as exc:
+            report(str(exc))
+            return None
+        if not isinstance(value, AggCall):
+            report("\\where expects a column or aggregate before its operator")
+            return None
+        aggregate = value
+        column = ""
+    cond = WhereClause(
+        line=line, raw=text.strip(), column=column, op=op, value="", aggregate=aggregate,
+    )
     if op in NULL_OPS:
         if tail:
             report(f"`{op}` takes no operand")
@@ -708,7 +836,7 @@ def _where_condition(
 
 def _where_piece(
     text: str, line: int, opts: ParseOpts, ast: QueryAST,
-    report: Callable[[str], None], depth: int,
+    report: Callable[[str], None], depth: int, *, allow_aggregate: bool = True,
 ) -> WhereClause | None:
     """One piece of a `\\where`: a condition, or a `( … )` group of conditions.
 
@@ -719,7 +847,7 @@ def _where_piece(
     """
     s = text.strip()
     if not s.startswith("("):
-        return _where_condition(text, line, opts, ast, report)
+        return _where_condition(text, line, opts, ast, report, allow_aggregate=allow_aggregate)
     paren = take_paren(s)
     if paren is None:
         report("`(...)` group is unfinished — close it with )")
@@ -734,7 +862,7 @@ def _where_piece(
     if not body.strip():
         report("`(...)` group cannot be empty")
         return None
-    inner = _where_tree(body, line, opts, ast, report, depth + 1)
+    inner = _where_tree(body, line, opts, ast, report, depth + 1, allow_aggregate=allow_aggregate)
     if inner is None:
         return None
     node = WhereClause(line=line, raw=s, column="", op="", value="")
@@ -744,7 +872,7 @@ def _where_piece(
 
 def _where_tree(
     text: str, line: int, opts: ParseOpts, ast: QueryAST,
-    report: Callable[[str], None], depth: int = 0,
+    report: Callable[[str], None], depth: int = 0, *, allow_aggregate: bool = True,
 ) -> WhereClause | None:
     """An `or`-of-`and` condition tree; `(...)` pieces nest as group nodes.
 
@@ -757,7 +885,7 @@ def _where_tree(
     for segment in split_logic(text, "or"):
         group: list[WhereClause] = []
         for piece in split_logic(segment, "and"):
-            cond = _where_piece(piece, line, opts, ast, report, depth)
+            cond = _where_piece(piece, line, opts, ast, report, depth, allow_aggregate=allow_aggregate)
             if cond is None:
                 return None
             group.append(cond)
@@ -783,7 +911,9 @@ def _aggregate_where(
         raise ValueError("aggregate \\where needs a balanced predicate")
     errors: list[str] = []
     owner = ast if ast is not None else QueryAST()
-    predicate = _where_tree(text, line, opts or ParseOpts(), owner, errors.append)
+    predicate = _where_tree(
+        text, line, opts or ParseOpts(), owner, errors.append, allow_aggregate=False,
+    )
     if ast is None and owner.errors:
         raise ValueError(owner.errors[0].message)
     if predicate is None or errors:
@@ -1245,13 +1375,96 @@ def block_extent(lines: list[str], header: int) -> int:
     return j
 
 
+def statement_break(text: str) -> str | None:
+    """`"standalone"`/`"trailing"` when a stripped line ends a statement.
+
+    A line of only `;` closes the statement above it; a `;` at the end of a
+    command line closes that line's statement. The break is only real outside
+    quotes, so a value ending in `;` is never a boundary.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped == ";":
+        return "standalone"
+    if not stripped.endswith(";"):
+        return None
+    quote: str | None = None
+    for char in stripped[:-1]:
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+    return None if quote else "trailing"
+
+
+def _top_level_breaks(lines: list[str]) -> list[tuple[int, str]]:
+    """`(line index, kind)` for every statement break outside a `\\with` body."""
+    breaks: list[tuple[int, str]] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        command = _command_parts(stripped)
+        if command is not None and command[0] == "with":
+            index = block_extent(lines, index)
+            continue
+        kind = statement_break(stripped)
+        if kind is not None:
+            breaks.append((index, kind))
+        index += 1
+    return breaks
+
+
+def split_statements(doc: str) -> list[tuple[int, str]]:
+    """The document cut at `;` statement breaks: `(first line index, text)`.
+
+    Line numbers stay absolute through the offset, and a trailing `;` is
+    removed from the segment that ends with it. A document without breaks is
+    one segment, exactly as it always parsed.
+    """
+    lines = doc.split("\n")
+    segments: list[tuple[int, str]] = []
+    start = 0
+    for index, kind in _top_level_breaks(lines):
+        end = index if kind == "standalone" else index + 1
+        body = lines[start:end]
+        if kind == "trailing":
+            last = body[-1]
+            trimmed = last.rstrip()
+            body[-1] = trimmed[:-1] + last[len(trimmed):]
+        if any(line.strip() for line in body):
+            segments.append((start, "\n".join(body)))
+        start = index + 1
+    tail = lines[start:]
+    if not segments or any(line.strip() for line in tail):
+        segments.append((start, "\n".join(tail)))
+    return segments
+
+
+def statement_bounds(lines: list[str], line: int) -> tuple[int, int]:
+    """The `[start, end)` indexes of the statement owning a 1-based line.
+
+    The `;` line belongs to the statement it ends; a second query written
+    below it is its own block, so clause lookup and completion never reach
+    across the semicolon.
+    """
+    start = 0
+    for index, _kind in _top_level_breaks(lines):
+        if line <= index + 1:
+            return start, index + 1
+        start = index + 1
+    return start, len(lines)
+
+
 def block_bounds(lines: list[str], line: int) -> tuple[int, int]:
     """The `[start, end)` line indexes of the block that owns a 1-based line.
 
-    A block is the whole document or one `\\with` body; the innermost body wins,
-    which is the one the caret is editing.
+    A block is one `;`-separated statement or one `\\with` body inside it; the
+    innermost body wins, which is the one the caret is editing. The statement
+    clamp is what keeps a second query below a semicolon a block of its own.
     """
-    start, end = 0, len(lines)
+    start, end = statement_bounds(lines, line)
     while True:
         for index in range(start, end):
             command = _command_parts(lines[index].strip())
@@ -1331,6 +1544,39 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
     ast = QueryAST()
     # Each relation owns its visibility list; expansion budgets remain shared.
     opts = replace(opts, visible_ctes=list(opts.visible_ctes))
+    declarations: list[FromClause] = []
+    simple = False
+    introduced: set[str] = set()
+
+    def declare(source: FromClause) -> None:
+        declarations.append(source)
+        if not simple:
+            ast.from_ = source
+
+    def join_line(argument: str, join_line_number: int) -> None:
+        nonlocal simple
+        try:
+            _append_simple_join(ast, declarations, argument, join_line_number, opts,
+                                first=not simple, introduced=introduced)
+        except ValueError as exc:
+            if join_line_number != opts.typing_line:
+                ast.errors.append(QueryError(join_line_number, str(exc)))
+        simple = True
+
+    # An explicit source anywhere in this block wins, even after a CTE or while
+    # incomplete. Sources inside CTE bodies belong only to those bodies.
+    explicit_source = False
+    index = 0
+    while index < len(lines):
+        command = _command_parts(lines[index].strip())
+        if command is not None:
+            if command[0] == "with":
+                index = block_extent(lines, index)
+                continue
+            if command[0] in ("from", "open"):
+                explicit_source = True
+                break
+        index += 1
 
     # Errors are only reported for settled lines; `typing_line` is the last
     # non-empty line of the WHOLE document (the one being typed), where
@@ -1361,30 +1607,31 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
 
         cmd, rest = command
 
-        if not rest and cmd in NEEDS_ARGS:
+        if cmd == "with" and not explicit_source:
+            # Never keep the previous CTE as a fallback for an unfinished one.
+            ast.from_ = None
+
+        if not rest and cmd in NEEDS_ARGS and cmd != "join":
             err(f"\\{cmd} expects arguments")
-            i += 1
+            i = block_extent(lines, i) if cmd == "with" else i + 1
             continue
 
         if cmd == "with":
+            body_start = i + 1
+            j = block_extent(lines, i)
+            i = j
             w = _WITH_NAME_RE.match(rest)
             if w is None:
                 err("\\with expects a bare CTE name")
-                i += 1
                 continue
             if not opts.allow_ctes:
                 err("nested CTEs are not supported")
-                i += 1
                 continue
             name = w.group(1)
             if any(c.name == name for c in ast.with_):
                 err(f'duplicate CTE name "{name}"')
-                i += 1
                 continue
-            body_start = i + 1
-            j = block_extent(lines, i)
             body: list[str] = lines[body_start:j]
-            i = j
             if not any(b.strip() for b in body):
                 err(f"\\with {name} expects an indented body")
                 continue
@@ -1396,21 +1643,27 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     expansion_budget=opts.expansion_budget,
                     offset=body_start + opts.offset,
                     fixed_line=opts.fixed_line,
-                    typing_line=opts.typing_line,
+                    # Keep suppressed typing errors long enough to decide
+                    # whether this CTE is a usable implicit source.
+                    typing_line=0,
                     visible_ctes=opts.visible_ctes,
                     top=False,
                     allow_ctes=False,
                 ),
             )
             # Body errors belong to the document; nested CTE errors too.
-            ast.errors.extend(body_ast.errors)
+            body_valid = body_ast.from_ is not None and not body_ast.errors
+            ast.errors.extend(e for e in body_ast.errors if e.line != opts.typing_line)
             body_ast.errors = []
             ast.with_.append(WithClause(line=line, name=name, body=body_ast))
             if name not in opts.visible_ctes and any(table.name == name for table in opts.schema.tables):
                 # The CTE name shadows nothing, that's fine; only a dataset
                 # collision is worth flagging (the dataset becomes unreachable).
                 err(f'CTE name "{name}" shadows dataset "{name}"')
+                body_valid = False
             opts.visible_ctes.append(name)
+            if not explicit_source and body_valid:
+                ast.from_ = FromClause(line=line, table=name)
             continue
 
         if cmd in ("from", "open"):
@@ -1425,7 +1678,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     i += 1
                     continue
                 absorb(ast, fn_body)
-                ast.from_ = FromClause(line=line, table="", alias=alias, body=fn_body)
+                declare(FromClause(line=line, table="", alias=alias, body=fn_body))
                 i += 1
                 continue
             src = parse_source(rest)
@@ -1442,7 +1695,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     continue
                 body = parse_subquery(body_text, line, opts)
                 absorb(ast, body)
-            ast.from_ = FromClause(line=line, table=table, alias=alias, body=body)
+            declare(FromClause(line=line, table=table, alias=alias, body=body))
             # Only complain about unknown tables once the schema has loaded —
             # while the backend is offline the registry is legitimately empty.
             # CTE names defined earlier in the document count as known tables.
@@ -1461,16 +1714,48 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
             continue
 
         if cmd == "join":
+            # A block owns every non-command line up to the next command.
+            block_end = i + 1
+            while block_end < len(lines) and not lines[block_end].strip().startswith("\\"):
+                block_end += 1
+            continuation = [index for index in range(i + 1, block_end) if lines[index].strip()]
+            simple_head = _SIMPLE_JOIN_RE.fullmatch(split_logic(rest, "and")[0].strip()) if rest else None
+            if not rest or simple_head is not None or continuation:
+                if rest:
+                    join_line(rest, line)
+                for index in continuation:
+                    join_line(lines[index].strip(), opts.fixed_line if opts.fixed_line is not None
+                              else index + 1 + opts.offset)
+                if not rest and not continuation:
+                    err("\\join expects alias-qualified join conditions")
+                i = block_end
+                continue
             # `\join lateral ( … ) …` is the one source shape whose body may read
             # the left side; the `on …` tail is cut first so a dataset name, a
             # subquery body, and `on` cannot be mistaken for one another.
-            lateral_match = re.match(r"^lateral\s+", rest, re.IGNORECASE)
+            cross_match = re.match(r"^cross(?:\s+|$)", rest, re.IGNORECASE)
+            # Preserve an ordinary table named cross when its ON clause makes
+            # the existing source grammar unambiguous (cross [as] alias on ...).
+            legacy_on = keyword_positions(rest, "on") if cross_match else []
+            legacy_cross = bool(legacy_on and parse_source(rest[:legacy_on[-1]].strip()))
+            cross = cross_match is not None and not legacy_cross
+            if cross:
+                if ast.from_ is None:
+                    err("\\join cross needs a preceding source")
+                    i += 1
+                    continue
+                rest = rest[cross_match.end():].strip()
+            lateral_match = re.match(r"^lateral\s+", rest, re.IGNORECASE) if not cross else None
             lateral = lateral_match is not None
             clause = rest[lateral_match.end() :].strip() if lateral_match else rest
             on_at = keyword_positions(clause, "on")
             source_text, on_text = clause, ""
             if on_at:
                 source_text, on_text = clause[: on_at[-1]].strip(), clause[on_at[-1] :].strip()
+            if cross and on_text:
+                err("\\join cross does not accept ON conditions")
+                i += 1
+                continue
             # A registered call at the source position expands like a lateral
             # subquery whose body is the function's, arguments substituted.
             outer = [
@@ -1517,7 +1802,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         continue
                     fn_left, fn_right = fn_on[0]
                     fn_keys = fn_on[1:]
-                elif not lateral:
+                elif not lateral and not cross:
                     err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
                     i += 1
                     continue
@@ -1531,13 +1816,18 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                         lateral=lateral,
                         body=fn_body,
                         keys=fn_keys,
+                        kind="cross" if cross else "inner",
                     )
                 )
+                if cross:
+                    simple = True
                 i += 1
                 continue
             src = parse_source(source_text)
             if src is None or (lateral and src[1] is None):
                 err(
+                    "\\join cross expects `<source> [as] <alias>`"
+                    if cross else
                     "\\join lateral expects `( <subquery> ) [as] <alias> [on <col>[ = <col>]]`"
                     if lateral
                     else "\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`"
@@ -1591,7 +1881,7 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     continue
                 left_ref, right_ref = on_match[0]
                 join_keys = on_match[1:]
-            elif not lateral:
+            elif not lateral and not cross:
                 err("\\join expects `<dataset> [as] <alias> on <col>[ = <col>]`")
                 i += 1
                 continue
@@ -1605,8 +1895,11 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
                     lateral=lateral,
                     body=body,
                     keys=join_keys,
+                    kind="cross" if cross else "inner",
                 )
             )
+            if cross:
+                simple = True
             # Like `\from`: only complain once the schema has loaded.
             if (
                 body is None
@@ -1936,6 +2229,18 @@ def parse_slice(lines: list[str], opts: ParseOpts) -> QueryAST:
         err(f'unknown command "\\{cmd}"')
         i += 1
 
+    if simple:
+        used = {ast.from_.alias or ast.from_.table} if ast.from_ else set()
+        used.update(join.alias or join.dataset for join in ast.joins)
+        declared: set[str] = set()
+        for source in declarations:
+            identifier = source.alias or source.table
+            if identifier in declared and source.line != opts.typing_line:
+                ast.errors.append(QueryError(source.line, f'duplicate table identifier "{identifier}"'))
+            declared.add(identifier)
+            if identifier not in used and source.line != opts.typing_line:
+                ast.errors.append(QueryError(source.line, f'alias "{identifier}" is not joined'))
+
     validate(ast, opts)
     return ast
 
@@ -2017,6 +2322,8 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
         if ast.where:
             for cond in ast.where.conditions():
                 check(cond.line, cond.column)
+                if cond.aggregate is not None:
+                    check_expression(cond.line, cond.aggregate)
         for g in ast.group_by:
             check(g.line, g.column)
         for o in ast.order_by:
@@ -2065,16 +2372,44 @@ def validate(ast: QueryAST, opts: ParseOpts) -> None:
             term.resolves_to = None  # a real output column, not a select item
 
 
-def parse_query(doc: str, *, schema: SchemaContext = EMPTY_SCHEMA, settled: bool = False) -> QueryAST:
-    """Parse text against one immutable schema; explicit submissions are settled."""
+def parse_statements(
+    doc: str, *, schema: SchemaContext = EMPTY_SCHEMA, settled: bool = False,
+) -> list[tuple[int, str, QueryAST]]:
+    """Every `;`-separated statement: `(first line index, text, AST)`.
+
+    One shared expansion budget bounds the whole document, not each segment,
+    and the typing line is the document's last non-empty line: the last
+    segment may be half-typed, earlier ones never are. A document without a
+    break parses exactly as `parse_query` always parsed it.
+    """
     lines = doc.split("\n")
     last_content_line = 0
-    for i, raw in enumerate(lines):
+    for index, raw in enumerate(lines):
         if raw.strip():
-            last_content_line = i + 1
-    return parse_slice(lines, ParseOpts(
-        schema=schema, typing_line=0 if settled else last_content_line,
-    ))
+            last_content_line = index + 1
+    budget = ExpansionBudget()
+    return [
+        (start, text, parse_slice(text.split("\n"), ParseOpts(
+            schema=schema, expansion_budget=budget, offset=start,
+            typing_line=0 if settled else last_content_line,
+        )))
+        for start, text in split_statements(doc)
+    ]
+
+
+def parse_query(doc: str, *, schema: SchemaContext = EMPTY_SCHEMA, settled: bool = False) -> QueryAST:
+    """Parse text against one immutable schema; explicit submissions are settled.
+
+    Single-statement documents get their AST directly. For a document of
+    several, the FIRST statement's AST answers — consumers that read one query
+    read the first — and every statement's errors report at their absolute
+    lines so a settled caller still sees all of them.
+    """
+    segments = parse_statements(doc, schema=schema, settled=settled)
+    head = segments[0][2]
+    if len(segments) > 1:
+        head.errors = [error for _start, _text, ast in segments for error in ast.errors]
+    return head
 
 
 def _cond_payload(cond: WhereClause) -> dict:
@@ -2098,6 +2433,8 @@ def _cond_payload(cond: WhereClause) -> dict:
         "value": cond.value,
         "subquery": payload_from_ast(cond.subquery) if cond.subquery else None,
     }
+    if cond.aggregate is not None:
+        data["aggregate"] = _expression_payload(cond.aggregate)
     if cond.low or cond.high:
         data["low"] = cond.low
         data["high"] = cond.high
@@ -2177,6 +2514,8 @@ def payload_from_ast(ast: QueryAST) -> dict:
                 "lateral": j.lateral,
                 "body": payload_from_ast(j.body) if j.body else None,
                 **({"keys": [list(pair) for pair in j.keys]} if j.keys else {}),
+                **({"kind": j.kind} if j.kind != "inner" else {}),
+                **({"reverse": True} if j.reverse else {}),
             }
             for j in ast.joins
         ],
