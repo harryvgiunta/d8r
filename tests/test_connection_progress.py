@@ -274,6 +274,66 @@ def test_interrupted_startup_connection_cannot_register_or_execute_late(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("completion", ["success", "failure", "cancel"])
+def test_selection_swaps_workspace_before_connection_finishes(tmp_path, monkeypatch, completion):
+    from d8r.tui.app import D8RApp
+    from textual.widgets import Select
+
+    path = tmp_path / "workspace.sqlite"
+    with sqlite3.connect(path) as database:
+        database.execute("create table items (id integer)")
+    session = Session(data_dir=tmp_path / "state")
+    target = "snapshot:" + str(path.resolve())
+    session.save_workspace(sources={target: {
+        "id": "items", "display": "Items", "kind": "d1", "path": str(path),
+    }})
+    started, release = Event(), Event()
+    build = session.build_sqlite_source
+
+    def delayed(*args, **kwargs):
+        started.set()
+        if not release.wait(15):
+            raise RuntimeError("connection was not released")
+        if completion == "failure":
+            raise RuntimeError("Connection refused")
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(session, "build_sqlite_source", delayed)
+    app = D8RApp(session)
+
+    async def drive():
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            app.editor.load_text("\\from events\n\\limit 3")
+            demo_page = app._document_identity
+            try:
+                assert app.select_source(target)
+                assert session.source_key() == target
+                assert app.editor.text == ""
+                assert app.query_one("#source-select", Select).value == session.active_id
+                assert app._document_identity != demo_page
+                assert await asyncio.to_thread(started.wait, 2)
+                app.editor.load_text("\\from items")
+                page_id = app._document_identity
+                if completion == "cancel":
+                    await pilot.click(".connection-cancel")
+                release.set()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert session.source_key() == target
+                assert session.source_connected() == (completion == "success")
+                assert app.editor.text == "\\from items"
+                assert app._document_identity == page_id
+                assert not session.history
+                app.select_source("demo")
+                assert app.editor.text == "\\from events\n\\limit 3"
+                assert app._document_identity == demo_page
+            finally:
+                release.set()
+
+    asyncio.run(drive())
+
+
 @pytest.fixture
 def indexing_d1(sources, tmp_path, monkeypatch):
     """Real D1 request/SQLite execution, with full discovery held independently."""
@@ -444,7 +504,7 @@ def test_late_schema_index_respects_source_ownership(indexing_d1, change):
                 assert state.session.schema.table_by_name("events") is not None
                 assert state.session.schema.table_by_name("orders") is None
                 assert not app.query_one("#schema-index").display
-                assert len(state.session.history) == 1
+                assert not state.session.history
                 if change == "replace":
                     assert not replacement.datasets
                     assert not source.schema_indexed

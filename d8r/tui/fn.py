@@ -16,6 +16,7 @@ Draft edits and AI Apply are autosaved separately; only Save or Run preview chan
 from __future__ import annotations
 
 import json
+from time import monotonic
 
 from uuid import uuid4
 from typing import TYPE_CHECKING
@@ -115,6 +116,7 @@ class FnEditor(Vertical):
         }
         self._draft_ready = False
         self._draft_timer = None
+        self._draft_changed_at = 0.0
         self._draft_body: TextArea | None = None
         self._draft_inputs: dict[str, Input] = {}
         self._draft_snapshot: dict = {}
@@ -243,10 +245,18 @@ class FnEditor(Vertical):
     def _queue_draft_save(self) -> None:
         if not self._draft_ready or self._leaving or not self.ide._function_started:
             return
-        self._capture_draft()
-        if self._draft_timer is not None:
-            self._draft_timer.stop()
-        self._draft_timer = self.set_timer(0.2, self.flush_draft)
+        # Keep one timer alive during a key repeat; capture text only at flush.
+        self._draft_changed_at = monotonic()
+        if self._draft_timer is None:
+            self._draft_timer = self.set_timer(0.2, self._save_draft_when_idle)
+
+    def _save_draft_when_idle(self) -> None:
+        self._draft_timer = None
+        remaining = 0.2 - (monotonic() - self._draft_changed_at)
+        if remaining > 0:
+            self._draft_timer = self.set_timer(max(0.01, remaining), self._save_draft_when_idle)
+        else:
+            self.flush_draft()
 
     def flush_draft(self) -> None:
         if not self.ide._function_started:
@@ -272,13 +282,7 @@ class FnEditor(Vertical):
         if (not self._draft_ready or not isinstance(event.value, str) or event.value != event.select.value
                 or event.value == self.source_id):
             return
-        if not self.session.source_connected(event.value):
-            with self.prevent(Select.Changed):
-                event.select.value = self.source_id
-            self.ide.reconnect_source(event.value, self._source_connected)
-        elif self.ide.select_source(event.value):
-            self.ide._open_fn()
-        else:
+        if not self.ide.select_source(event.value, open_function=True):
             with self.prevent(Select.Changed):
                 event.select.value = self.source_id
 

@@ -98,6 +98,8 @@ def build_saved_source(
         return session.build_sqlite_source(snapshot_path)
     if profile is None:
         raise ValueError("Connection details are required.")
+    if profile.get("kind") == "parquet":
+        return session.build_parquet_source(profile["path"], profile.get("display", ""))
     if profile.get("kind") == "ibis":
         return session.build_backend_source({key: value for key, value in profile.items() if key != "kind"})
     if profile.get("kind") == "postgres-live":
@@ -119,6 +121,8 @@ def saved_source_label(
         return Path(snapshot_path).name
     if profile is None:
         return "data source"
+    if profile.get("kind") == "parquet":
+        return profile.get("display") or Path(profile["path"]).name
     if profile.get("kind") == "ibis" or "backend" in profile:
         label = profile.get("display") or profile.get("backend") or "data source"
         secrets = profile_secrets(profile)

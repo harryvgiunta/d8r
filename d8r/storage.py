@@ -165,6 +165,7 @@ def _settings(value: object) -> dict:
         "ai_auto_accept": False,
         "ai_allow_sample_data": False,
         "ai_allow_schema_refreshes": True,
+        "ai_test_queries": False,
         "ai": asdict(AIConfig()),
     }
     if not isinstance(value, dict) or not value.keys() <= defaults.keys():
@@ -180,7 +181,7 @@ def _settings(value: object) -> dict:
         raise ValueError("Choose a supported theme from Settings → Theme.")
     if type(document["ai_auto_accept"]) is not bool:
         raise ValueError("ai_auto_accept must be a boolean")
-    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes"):
+    for field in ("ai_allow_sample_data", "ai_allow_schema_refreshes", "ai_test_queries"):
         if type(document[field]) is not bool:
             raise ValueError(f"{field} must be a boolean")
     if type(document["value_cache_enabled"]) is not bool:
@@ -521,6 +522,8 @@ def _workspace_document(value: object) -> dict:
     if not isinstance(document["history"], list):
         raise ValueError("invalid query history")
     for entry in document["history"]:
+        if isinstance(entry, dict):
+            entry.setdefault("target", "")
         _record(entry, {"at", "source", "dialect", "rows", "ms", "doc", "target"}, "query history entry")
         for field in ("at", "source", "dialect", "doc", "target"):
             _text(entry[field], f"history {field}")

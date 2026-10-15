@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import asdict
 
 import httpx
 from textual.app import App, ComposeResult
@@ -11,6 +12,7 @@ from textual.widgets import Button, OptionList, Static, TextArea
 from d8r.ai import client
 from d8r.ai.client import AIConfig
 from d8r.ai.context import AIContext
+from d8r.storage import WorkspaceStore
 from d8r.tui.ai import AIChats, AIPanel, AITarget, AgentsPane
 from d8r.tui.session import HistoryEntry, Session
 
@@ -387,11 +389,13 @@ def test_history_context_uses_canonical_identity_and_newest_first():
     async def scenario():
         session = _session()
         key = session.source_key("demo")
-        session.history = [
+        store = WorkspaceStore(session.workspace_path.parent)
+        store.save({**store.document, "history": [asdict(entry) for entry in (
             HistoryEntry("new", "previous-slug", "duckdb", 2, 1, "newest", target=key),
             HistoryEntry("other", "demo", "duckdb", 3, 1, "wrong source", target="mysql"),
             HistoryEntry("old", "demo", "duckdb", 1, 1, "oldest", target=key),
-        ]
+        )]})
+        session = _session()
         context = AIContext(session, "demo", "")
         result = json.loads(await context.call_tool("query_history", {}))
         assert [entry["document"] for entry in result["history"]] == ["newest", "oldest"]

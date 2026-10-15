@@ -2,4 +2,14 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.env.postgres
+# Local credentials and application state must never be published.
+.env
+.env.*
+!.env.example
+.d8r/
+/memory.json*
+/settings.json*
+/workspace.json*
+
+# User result exports; checked-in fixtures live under tests/.
+/*.csv

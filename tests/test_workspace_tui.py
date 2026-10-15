@@ -65,7 +65,7 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
             assert "disconnected" in reopened.session.source.display
             assert not reopened.query_one("#schema-tree").root.children
             assert reopened.query_one("#dialect-select", Select).value == "sqlite"
-            assert reopened.query_one("#history-table", DataTable).row_count == 1
+            assert reopened.query_one("#history-table", DataTable).row_count == 0
             assert reopened.query_one("#results-table", DataTable).row_count == 0
             assert reopened.query_one("#sql-text", TextArea).text == ""
             assert not isinstance(reopened.screen, AddSourceModal)
@@ -108,8 +108,8 @@ def test_startup_reconnects_only_selected_snapshot_without_replaying_draft(tmp_p
             assert reopened.query_one("#dialect-select", Select).value == "postgres"
             assert reopened.editor.text == document
             assert reopened.editor.cursor_location == (1, 8)
-            assert len(reopened.session.history) == 1
-            assert reopened.query_one("#history-table", DataTable).row_count == 1
+            assert not reopened.session.history
+            assert reopened.query_one("#history-table", DataTable).row_count == 0
             assert reopened.query_one("#results-table", DataTable).row_count == 0
             assert reopened.query_one("#sql-text", TextArea).text == ""
             assert not isinstance(reopened.screen, AddSourceModal)
@@ -152,7 +152,7 @@ def test_failed_startup_keeps_selected_snapshot_and_draft_disconnected(tmp_path,
     asyncio.run(restore())
 
 
-def test_history_restores_snapshot_offline_and_run_reconnects_automatically(tmp_path, monkeypatch):
+def test_connection_history_restores_snapshot_and_run_reconnects(tmp_path, monkeypatch):
     data_dir = tmp_path / "state"
     first = Session(data_dir=data_dir)
     source, path = _snapshot(first, tmp_path)
@@ -189,6 +189,10 @@ def test_history_restores_snapshot_offline_and_run_reconnects_automatically(tmp_
             await pilot.pause()
             assert reopened.session.active_id == "demo"
             table = reopened.query_one("#history-table", DataTable)
+            assert table.row_count == 0
+            reopened.select_source(f"snapshot:{path.resolve()}")
+            reopened._cancel_connection()
+            await pilot.pause()
             assert table.row_count == 1
             old_identity = reopened._ai_target().identity
             reopened.query_one("#result-tabs").active = "tab-history"
@@ -555,7 +559,7 @@ def test_page_deletion_preserves_other_drafts_and_retries_failed_last_page_save(
     assert restored.history == history
 
 
-def test_pages_search_all_sources_and_metadata_without_changing_query(tmp_path):
+def test_pages_search_only_selected_source_without_changing_query(tmp_path):
     session = Session(data_dir=tmp_path)
     session.workspace["pages"] = [
         {"id": "p1", "title": "Monthly revenue", "description": "Paid orders",
@@ -575,9 +579,9 @@ def test_pages_search_all_sources_and_metadata_without_changing_query(tmp_path):
             app.query_one("#explorer-tabs", TabbedContent).active = "tab-pages"
             listing = app.query_one("#pages-list", OptionList)
             search = app.query_one("#page-search", Input)
-            for text, expected in (("REVENUE", {"p1"}), ("retention", {"p2"}),
-                                   ("email", {"p2"}), ("no matches", set()),
-                                   ("", {"p1", "p2"})):
+            for text, expected in (("REVENUE", {"p1"}), ("retention", set()),
+                                   ("email", set()), ("no matches", set()),
+                                   ("", {"p1"})):
                 search.value = text
                 await pilot.pause()
                 assert {option.id for option in listing.options} == expected
@@ -585,6 +589,7 @@ def test_pages_search_all_sources_and_metadata_without_changing_query(tmp_path):
                 assert app.editor.text == "\\from events\\limit 1"
                 assert not session.history
             search.value = "email"
+            app.select_source("postgres")
             await pilot.pause()
             listing.focus()
             listing.highlighted = 0

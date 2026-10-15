@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-from textual.widgets import Input, OptionList, Select, TextArea
+from textual.widgets import DataTable, Input, OptionList, Select, TabbedContent, TextArea
 
 from d8r.tui.app import D8RApp
 from d8r.tui.session import Session
+from d8r.tui.results import ResultsTable
 
 
 def _option_ids(app, selector):
@@ -45,7 +46,7 @@ def test_source_workspace_switch_and_restart_preserve_local_state(tmp_path):
             assert app.editor.text == ""
             assert app._document_identity not in identities.values()
             assert app.session.fns["local"].body == "\\from products"
-            assert set(identities.values()) <= _option_ids(app, "#pages-list")
+            assert not set(identities.values()) & _option_ids(app, "#pages-list")
             assert demo_chat.id not in _option_ids(app, "#agents-list")
             app.editor.load_text("\\from products\n\\select id")
             identities["mysql"] = app._document_identity
@@ -60,7 +61,7 @@ def test_source_workspace_switch_and_restart_preserve_local_state(tmp_path):
             assert app.editor.text == "\\from users\n\\limit 3"
             assert app.editor.cursor_location == (1, 7)
             assert app.session.fns["local"].body == "\\from events"
-            assert _option_ids(app, "#pages-list") == set(identities.values())
+            assert _option_ids(app, "#pages-list") == {identities["demo"], identities["demo_last"]}
             assert demo_chat.id in _option_ids(app, "#agents-list")
             app._open_fn()
             assert app.function_editor.query_one("#fn-name", Input).value == "demo_unsaved"
@@ -112,9 +113,52 @@ def test_deleting_last_source_page_never_opens_another_source(tmp_path):
             assert app.session.active_id == "mysql"
             assert app.editor.text == ""
             assert app._document_identity not in {demo_id, mysql_id}
-            assert demo_id in _option_ids(app, "#pages-list")
+            assert demo_id not in _option_ids(app, "#pages-list")
             app.select_source("demo")
             assert app._document_identity == demo_id
             assert app.editor.text == "\\from events"
+
+    asyncio.run(drive())
+
+
+def test_history_results_sql_and_pins_stay_in_their_connection(tmp_path):
+    session = Session(data_dir=tmp_path)
+    app = D8RApp(session)
+
+    async def drive():
+        async with app.run_test(size=(150, 48)) as pilot:
+            await pilot.pause()
+            app.editor.load_text("\\from events\n\\limit 2")
+            app.action_run()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            demo_page = app._document_identity
+            demo_rows = app.query_one("#results-table", ResultsTable).raw_rows
+            demo_sql = app.query_one("#sql-text", TextArea).text
+            app._pin_main_result()
+            await pilot.pause()
+            pin = next(iter(app._data_tabs))
+            app.select_source("mysql")
+            await pilot.pause()
+            assert app.query_one("#results-table", ResultsTable).raw_rows == ()
+            assert app.query_one("#sql-text", TextArea).text == ""
+            assert app.query_one("#history-table", DataTable).row_count == 0
+            assert not app.query_one("#result-tabs", TabbedContent).get_tab(pin).display
+            app.open_page(demo_page)
+            app.delete_page(demo_page)
+            assert session.active_id == "mysql"
+            assert any(page["id"] == demo_page for page in session.workspace["pages"])
+            app.editor.load_text("\\from products\n\\limit 1")
+            app.action_run()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert [entry.source for entry in session.history] == ["mysql"]
+            app.select_source("demo")
+            await pilot.pause()
+            assert app.query_one("#results-table", ResultsTable).raw_rows == demo_rows
+            assert app.query_one("#sql-text", TextArea).text == demo_sql
+            assert app.query_one("#history-table", DataTable).row_count == 1
+            assert [entry.source for entry in session.history] == ["demo"]
+            assert app.query_one("#result-tabs", TabbedContent).get_tab(pin).display
 
     asyncio.run(drive())

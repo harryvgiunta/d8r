@@ -63,7 +63,7 @@ class AIDiagnosticsScreen(ModalScreen):
             yield Static("AI diagnostics · current chat", classes="pane-title")
             yield Static("In memory only. May contain query text and data values; review before sharing.\n"
                          "Known AI and database credentials are redacted. Each chat keeps its own logs.\n"
-                         "Validation checks syntax and cached schemas offline; no query is executed or results verified.",
+                         "Validation is offline. Opt-in Test AI Queries runs bounded read-only checks; see test_query tool results for execution evidence.",
                          id="ai-log-notice", markup=False)
             yield TextArea("", read_only=True, soft_wrap=True, id="ai-log-text")
             with Horizontal(id="ai-log-buttons"):
@@ -486,7 +486,7 @@ class AIChats:
         if chat.context is None or not chat.context.saved_functions:
             return ""
         return ("Saved functions: " + ", ".join(chat.context.saved_functions)
-                + ". Query unchanged; nothing executed.")
+                + ". Query unchanged; saving does not execute it.")
 
     async def _call_tool(self, chat: AIChat, context: AIContext, name: str, args: dict, generation: int) -> str:
         """Serialize shared-connection access, not independent provider requests."""
@@ -511,7 +511,7 @@ class AIChats:
                 self.session.busy = ""
             result_fields = json.loads(result)
             if result_fields.get("saved"):
-                receipt = f'Saved function "{result_fields["name"]}". Query unchanged; nothing executed.'
+                receipt = f'Saved function "{result_fields["name"]}". Query unchanged; saving does not execute it.'
                 chat.transcript += f"D8R: {receipt}\n\n"
                 chat.status_text = receipt
                 chat.diagnostics.record("Saved function", receipt)
@@ -529,7 +529,7 @@ class AIChats:
         task = asyncio.create_task(context.call_tool(name, args))
         self.context_tasks.add(task)
         task.add_done_callback(self._context_finished)
-        # A cancelled request cannot release a sample still running in a thread.
+        # A cancelled request cannot release a sample/check still running in a thread.
         return await asyncio.shield(task)
 
     def _context_finished(self, task: asyncio.Task) -> None:
@@ -577,7 +577,7 @@ class AIChats:
             chat.pending_prompt = ""
             chat.partial = ""
             chat.status = "idle"
-            chat.diagnostics.record("Turn completed", "Complete provider response received; no query executed.")
+            chat.diagnostics.record("Turn completed", "Complete provider response received; query-check evidence is recorded separately.")
             try:
                 chat.proposal = None if context.saved_functions else context.read_proposal(answer)
             except ValueError as exc:
@@ -589,14 +589,30 @@ class AIChats:
                 if chat.proposal is not None:
                     chat.validation_error = context.validate_replacement(chat.proposal)
                     chat.diagnostics.record("Proposal validation (offline schema)",
-                                            chat.validation_error or "Valid against cached schemas; execution not checked.")
+                                            chat.validation_error or "Valid against cached schemas; offline validation alone does not check execution.")
                     if chat.validation_error:
                         chat.status = "error"
                         chat.status_text = "Needs a fix: " + chat.validation_error
                     else:
-                        chat.status_text = ("Review the draft, then Save function. Your query stays unchanged; nothing is run."
+                        chat.status_text = ("Review the draft, then Save function. Saving does not execute the query."
                                             if chat.saves_function else
-                                            "Review the draft, then Apply. Nothing is executed or saved as a function.")
+                                            "Review the draft, then Apply. Applying does not execute queries or save functions.")
+                    if self.session.ai_test_queries and chat.proposal.function is None and context.parameters is None:
+                        queries = [(query.title, query.body) for query in chat.proposal.queries] or [("Query", chat.proposal.body)]
+                        checks = []
+                        for title, body in queries:
+                            check = context.query_checks.get(body)
+                            if check is None:
+                                evidence = "execution not checked for this exact draft"
+                            elif not check.get("executed"):
+                                evidence = "runtime check failed: " + check["error"]
+                            else:
+                                evidence = f"runtime check returned {check['row_count']} rows (limit {check['limit']})"
+                            checks.append(f"{title}: {evidence}.")
+                        receipt = "\n".join(checks)
+                        chat.status_text += "\n" + receipt
+                        chat.transcript += f"D8R: {receipt}\n\n"
+                        chat.diagnostics.record("Proposal runtime checks", receipt)
         except asyncio.CancelledError:
             if generation == chat.generation:
                 chat.status = "cancelled"
@@ -690,10 +706,10 @@ class AIChats:
         chat.proposal = None
         chat.status = "idle"
         chat.diagnostics.record("Saved function" if saves_function else "Auto-applied" if automatic else "Applied",
-                                "Function definition saved; query unchanged and nothing executed." if saves_function else
-                                "Drafts updated; nothing executed or saved as a function.")
-        chat.status_text = ("Function saved. Query unchanged; nothing executed." if saves_function else
-                            "Query drafts applied. Nothing executed.")
+                                "Function definition saved; saving does not execute it." if saves_function else
+                                "Drafts updated; applying does not execute queries or save functions.")
+        chat.status_text = ("Function saved. Saving does not execute it." if saves_function else
+                            "Query drafts applied. Applying does not execute them.")
         chat.transcript += f"D8R: {chat.status_text}\n\n"
         self.persist(chat)
         self.changed(chat)
@@ -1038,6 +1054,15 @@ class AIPanel(Vertical):
         if not self._ready:
             return
         current = self.snapshot()
+        if (current.key == self._target_key and self._draft_target is not None
+                and current != self._draft_target):
+            chat = self.chat
+            was_stale = chat is not None and chat.target is not None and chat.target != self._draft_target
+            is_stale = chat is not None and chat.target is not None and chat.target != current
+            self._draft_target = current
+            if was_stale != is_stale:
+                self._draw_chat()
+            return
         if current.key != self._target_key:
             self._flush_chat()
             self._target_key = current.key

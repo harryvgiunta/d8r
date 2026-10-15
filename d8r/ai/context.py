@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from d8r.engine import capabilities_for, execute, execute_remote
 from d8r.engine.expression import PayloadError, validate_schema
 from d8r.query import FnDef, is_identifier
-from d8r.query.parser import ParseOpts, parse_slice, parse_statements
+from d8r.query.parser import ParseOpts, parse_slice, parse_statements, payload_from_ast
 
 if TYPE_CHECKING:
     from d8r.tui.session import Session
@@ -61,8 +61,8 @@ obsolete; follow the current tool definitions and these instructions.
 Report a function as saved ONLY after save_function returns saved=true. Failures
 are not success: correct validation errors or explain the actual failure. After a
 successful function save, briefly report the saved definition and factual caveats;
-do not return an extra replacement fence. Never run queries or imply that a
-proposal, applying or saving executed or verified results.
+do not return an extra replacement fence. Only test_query, when supplied, can
+verify proposed query execution. Applying or saving never executes a query.
 Apply and opt-in auto-accept update query drafts only. In the function form,
 return complete function proposals with the metadata below, never document or
 query-page replacements. Saved-function previews must also include that metadata.
@@ -292,6 +292,21 @@ keep looking up context already available. If the request cannot be represented
 with supported composition, explain the specific missing capability in normal
 prose, with no invalid replacement block. Never claim execution or verified results
 just because offline validation succeeded.
+When test_query is available, test each complete read-only query proposal before
+replying, including every member of a labeled batch. It validates and executes a
+bounded version on the captured source. Use it instead of a separate validate_d8r
+call for these queries. Inspect execution errors and retry a corrected candidate
+within the tool budget; test the exact final document after every revision.
+Report whether the check returned rows, returned zero rows, or failed. Zero rows
+is a successful execution, not proof the query is wrong: never loosen filters or
+change the user's question merely to obtain data. A row containing NULL or a
+count of zero is not evidence of matching source records. Inspect sampled values
+only when permitted. The check caps returned rows, not database work; aggregates
+and joins may scan many rows. Do not claim full-result verification or a total
+row count from this bounded check. Never test writes, transaction commands,
+unbound function parameters, or multiple statements in one call. Honor explicit
+do-not-run/dry-run instructions even when the tool is available; explain that
+execution was not checked. If checking fails or is unavailable, say so honestly.
 """
 
 FUNCTION_GUIDE = """You can create or edit a saved reusable function from workspace chat.
@@ -389,6 +404,7 @@ class AIContext:
         self._functions = MappingProxyType(dict(session.functions_for(source_id)))
         self.source = session.sources[source_id]
         self.sample_rows = session.ai_config.sample_rows
+        self.query_checks: dict[str, dict] = {}
         self.tools = [
             _tool("schema", "Read table and column schemas and backend capabilities. Optional table or search term.",
                   {"table": {"type": "string"}, "query": {"type": "string"}}),
@@ -397,10 +413,12 @@ class AIContext:
                    "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20, "uniqueItems": True}}, ("table",)),
             _tool("query_history", "Read up to 10 successful queries for this source only, as reference data.",
                   {"query": {"type": "string"}}),
-            _tool("functions", "Read in-memory function definitions. Their bodies may target other sources; check schema.",
+            _tool("functions", "Read saved function definitions for this source only.",
                   {"query": {"type": "string"}}),
             _tool("validate_d8r", "Validate syntax and fields against cached schemas, including CTEs and subqueries, without network access or execution.",
                   {"text": {"type": "string"}, "parameters": {"type": "array", "items": {"type": "string"}}}, ("text",)),
+            _tool("test_query", f"Validate and execute one read-only D8R query on this source, capped at {self.sample_rows} returned rows. Returns execution/empty-result evidence; row samples require Allow Sample Data. Never changes drafts, results or history. No transactions, temp/drop commands or multiple statements.",
+                  {"text": {"type": "string"}}, ("text",)),
         ]
         self.tools = [tool for tool in self.tools
                       if not self._read_permission_error(tool["function"]["name"])]
@@ -435,6 +453,8 @@ class AIContext:
             ))
 
     def _read_permission_error(self, name: str) -> str | None:
+        if name == "test_query" and not self.session.ai_test_queries:
+            return "Query execution checks are disabled in AI settings."
         if name == "sample_rows" and not self.session.ai_allow_sample_data:
             return "Sample data access is disabled in AI settings."
         if name == "schema" and not self.session.ai_allow_schema_refreshes:
@@ -674,10 +694,10 @@ class AIContext:
         return {"answer": answer.strip()}
 
     async def call_tool(self, name: str, args: dict) -> str:
-        failure = {"saved": False} if name == "save_function" else {}
+        failure = {"saved": False} if name == "save_function" else {"executed": False} if name == "test_query" else {}
         permission_error = self._read_permission_error(name)
         if permission_error is not None:
-            return json.dumps({"error": permission_error})
+            return json.dumps({**failure, "error": permission_error})
         definitions = {tool["function"]["name"]: tool["function"]["parameters"] for tool in self.tools}
         definition = definitions.get(name)
         if definition is None:
@@ -716,21 +736,25 @@ class AIContext:
                 return json.dumps(self._save_function(args), ensure_ascii=False)
             if name == "schema":
                 result = self._schema(args)
-            elif name == "sample_rows":
-                result = await self._sample(args["table"], args.get("limit", self.sample_rows), args.get("columns"))
+            elif name in {"sample_rows", "test_query"}:
+                result = (await self._test_query(args["text"]) if name == "test_query" else
+                          await self._sample(args["table"], args.get("limit", self.sample_rows), args.get("columns")))
                 # A disabled permission also discards a read already in flight.
                 permission_error = self._read_permission_error(name)
                 if permission_error is not None:
-                    return json.dumps({"error": permission_error})
+                    return json.dumps({**failure, "error": permission_error})
                 if self.session.sources.get(self.source_id) is not self.source:
-                    return json.dumps({"error": "The source changed; start a new chat."})
+                    return json.dumps({**failure, "error": "The source changed; start a new chat."})
+                if name == "test_query":
+                    self.query_checks[args["text"]] = {
+                        key: value for key, value in result.items() if key not in {"rows", "columns"}
+                    }
             elif name == "query_history":
                 query = args.get("query", "").casefold()
                 result = {"source": self.source_id, "history": [
                     {"document": entry.doc[:6000], "rows": entry.rows, "at": entry.at}
-                    for entry in self.session.history
-                    if (entry.target == self.source_key or not entry.target and entry.source == self.source_id)
-                    and query in entry.doc.casefold()
+                    for entry in self.session.history_for(self.source_key)
+                    if query in entry.doc.casefold()
                 ][:10]}
             elif name == "functions":
                 query = args.get("query", "").casefold()
@@ -772,6 +796,57 @@ class AIContext:
                 break
         return {"source": self.source_id, "tables": tables, "capabilities": capabilities_for(self.source),
                 "note": "At most 40 tables and 100 columns each. Use table/query to narrow."}
+
+    async def _test_query(self, text: str) -> dict:
+        """Use the ordinary engine without Session.run's mutation/history path."""
+        if not text.strip() or len(text) > 64000:
+            return {"executed": False, "error": "Supply a complete query of at most 64,000 characters."}
+        if self.source.con is None:
+            return {"executed": False, "error": "The source is disconnected; reconnect it in the IDE first."}
+        transaction = self.session.tx.get(self.source_id)
+        if transaction is not None and transaction.open:
+            return {"executed": False, "error": "Finish the open transaction before testing queries; a failed check could abort it."}
+        with self.session.target_source(self.source_id):
+            schema = self.session.schema
+            segments = parse_statements(text, schema=schema, settled=True)
+        if len(segments) != 1:
+            return {"executed": False, "error": "Test one read-only query at a time; multiple statements are not allowed."}
+        ast = segments[0][2]
+        if ast.errors:
+            error = ast.errors[0]
+            return {"executed": False, "error": f"line {error.line}: {error.message}"}
+        if ast.tx or ast.temp or ast.drop or ast.from_ is None:
+            return {"executed": False, "error": "Only read-only queries can be tested; transactions, temp and drop commands are not allowed."}
+        try:
+            validate_schema(ast, schema)
+        except PayloadError as exc:
+            return {"executed": False, "error": str(exc)}
+        payload = payload_from_ast(ast)
+        explicit_limit = payload.get("limit")
+        limit = self.sample_rows if explicit_limit is None else min(explicit_limit, self.sample_rows)
+        payload["limit"] = limit
+        tables = {name: item["table"] for name, item in self.source.datasets.items()}
+        try:
+            if self.source.kind == "d1-live":
+                result = await asyncio.to_thread(execute_remote, self.source.d1, self.source.con,
+                                                 payload, self.source.dialect, tables)
+            else:
+                result = await asyncio.to_thread(execute, self.source.con, payload, self.source.dialect, tables)
+        except Exception:
+            # Driver exceptions can include credentials and sampled values even
+            # when data sharing is disabled. Do not forward their text.
+            return {"executed": False, "error": "Query execution failed. Check expressions, value types, backend support and connection/access permissions; driver details are withheld."}
+        rows = result["rows"][:limit]
+        response = {"executed": True, "row_count": len(rows), "has_rows": bool(rows),
+                    "limit": limit, "columns": result["columns"][:20],
+                    "note": "Bounded execution check, not a total row count or full-result guarantee. "
+                            "At most 20 sample columns; string cells truncated to 500 characters."}
+        if self.session.ai_allow_sample_data:
+            response["rows"] = [[value[:500] if isinstance(value, str) else value for value in row[:20]]
+                                for row in rows]
+        else:
+            response["note"] += " Row values withheld: Allow Sample Data is off."
+        return response
 
     async def _sample(self, table: str, limit: int, projection: list[str] | None = None) -> dict:
         entry = self.source.datasets.get(table)

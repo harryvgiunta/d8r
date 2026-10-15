@@ -455,6 +455,26 @@ def test_compile_renders_sql_for_the_chosen_dialect_without_executing():
 # ---------------------------------------------------------------------------
 
 
+def test_source_picker_add_action_preserves_workspace():
+    async def scenario(app, pilot):
+        document = app.editor.text
+        active_id = app.session.active_id
+        for _ in range(2):
+            await pilot.click("#source-select")
+            options = app.query_one("#source-select").query_one(OptionList)
+            labels = [str(options.get_option_at_index(index).prompt)
+                      for index in range(1, options.option_count)]
+            assert labels == sorted(labels, key=str.casefold)
+            await pilot.press("home", "enter")
+            assert isinstance(app.screen, AddSourceModal)
+            await pilot.press("escape")
+            assert app.session.active_id == active_id
+            assert app.query_one("#source-select", Select).value == active_id
+            assert app.editor.text == document
+
+    run_app(scenario)
+
+
 def test_add_source_modal_masks_credentials_and_cancels():
     """The form is there, the token is masked, and Cancel registers nothing."""
 
@@ -2274,7 +2294,7 @@ def test_run_connection_failure_never_executes(monkeypatch, saved_d1_session):
     asyncio.run(scenario())
 
 
-def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(monkeypatch, saved_d1_session):
+def test_saved_dropdown_failure_keeps_selected_workspace_disconnected(monkeypatch, saved_d1_session):
     from d8r.engine import D1Error
     from tests.test_d1_sources import SECRET
 
@@ -2290,19 +2310,20 @@ def test_saved_dropdown_connection_failure_preserves_active_source_and_profile(m
     async def scenario():
         app = D8RApp(saved_d1_session)
         async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
             assert not calls
-            await pilot.click("#source-select")
-            await pilot.press("end", "enter")
+            app.query_one("#source-select", Select).value = app.session._profile_id(app.session.d1_profiles[0])
+            await pilot.pause()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert not isinstance(app.screen, AddSourceModal)
             assert SECRET not in text_of(app, "#status")
-            assert app.session.active_id == "demo"
-            assert app.query_one("#source-select", Select).value == "demo"
+            assert app.session.source_key() == app.session._profile_id(app.session.d1_profiles[0])
+            assert not app.session.source_connected()
+            assert app.query_one("#source-select", Select).value == app.session.active_id
             assert app.session.storage_path.read_bytes() == before
-            assert not app.session.settings_path.exists()
-            await pilot.click("#source-select")
-            await pilot.press("end", "enter")
+            assert app.session.settings_path.exists()
+            await pilot.click("#reconnect-source")
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert len(calls) == 2  # The saved choice remains available to retry.
@@ -2326,12 +2347,13 @@ def test_saved_dropdown_without_token_prompts_before_connecting(monkeypatch, sav
     async def scenario():
         app = D8RApp(session)
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.click("#source-select")
-            await pilot.press("end", "enter")
+            await pilot.pause()
+            app.query_one("#source-select", Select).value = session._profile_id(profile)
             await pilot.pause()
             modal = app.screen
             assert isinstance(modal, AddSourceModal)
-            assert not calls and session.active_id == "demo"
+            assert not calls and not session.source_connected()
+            assert session.source_key() == session._profile_id(profile)
             token = modal.query_one("#api-token", Input)
             assert token.password and token.has_focus
             token.value = SECRET

@@ -2038,7 +2038,8 @@ Ordering matters, and it is what makes a session always parseable:
 8. `WorkspaceStore(self._memory.path.parent)` + `RLock`; `self.workspace =
    deepcopy(document)`, `workspace_error = store.error`;
    `workspace["document_id"]` is filled with `uuid4().hex` when empty;
-   `self.history = [HistoryEntry(**e) for e in workspace["history"]]`.
+   history loads into a private aggregate plus stable-connection indexes; `history`
+   exposes only the active connection, and `history_for(source_id)` supports pinned reads.
 9. If the workspace names a source → `restore_source(source, dialect or None)`
    (identity only, never connects). Otherwise the just-chosen source/dialect are
    written into the workspace and `refresh_schema()` runs.
@@ -2079,10 +2080,15 @@ contexts (`target_source`) and unsaved provider forms never call this.
   `workspace_error`. The live draft is never discarded by a disk failure.
 - `load_chats()` / `load_chat(key)` / `save_chat(key, chat)` — deep-copied access to
   `workspace["chats"]`; `None` deletes the key. Used by the app-owned AI manager.
-- `_record_history(entry, outcome)` — inserts at the head of `history` and saves the
-  whole list. If the write fails, the status line is **appended to**, not replaced:
+- `_record_history(entry, outcome)` — inserts into the owner's history index and the
+  private aggregate, then persists all connections without exposing foreign entries.
+  If the write fails, the status line is **appended to**, not replaced:
   `… · history not saved: {exc}` — the query already ran, so a disk error must
   neither suggest retrying potentially stateful work nor throw away the result.
+- Query/function edits use a single idle-debounce timer; repeated keys do not recreate
+  timers or synchronously persist intermediate drafts. Explicit switches and exit flush
+  the latest widget contents. Source selection restores the offline workspace first,
+  then starts guarded background reconnect; failure does not revert the selected target.
 
 ### 1.10 Source identity
 
@@ -2380,7 +2386,7 @@ on the IDE screen copies the selection instead of the framework's help/quit prom
 | `EditorPane` (priority) | `up` | `palette_up` | Palette highlight up, else caret up |
 | `EditorPane` (priority) | `down` | `palette_down` | Palette highlight down, else caret down |
 | `EditorPane` (priority) | `enter` | `palette_enter` | Accept the highlighted offer, else insert a newline |
-| `EditorPane` (priority) | `escape` | `palette_escape` | Toggle the palette popup |
+| `EditorPane` (priority) | `escape` | `palette_escape` | Hide History offers first; otherwise toggle contextual completion |
 | `EditorPane` (priority) | `ctrl+a` | `select_all` | Select the document (TextArea would go to line start) |
 | `EditorPane` (priority) | `tab` | `palette_tab` | Accept the highlighted suggestion; never moves focus |
 | `ResultsTable` | `alt+left` | `narrow_column` | −2 columns on the cursor's column |
@@ -2873,8 +2879,9 @@ many characters an accept leaves behind the caret (a call completes to `fn(|)`).
 
 `View(start, token, entries, phase="command", end=None)` — the content plus the span
 an accept replaces. `phase` is `"command"` for the word right after the `\` and
-`"argument"` for everything a command takes; Escape's dismissal silences both and a
-fresh `\` is what lifts it. `end` lets parameter completion replace the whole token
+`"argument"` for everything a command takes. Escape first dismisses whole-query
+History offers, if present; otherwise it toggles contextual completion. A fresh
+`\` lifts both dismissals. `end` lets parameter completion replace the whole token
 even when the caret is inside it. `labels` = the entry labels;
 `highlighted_is_typed(index)` is True when the highlighted suggestion already equals
 what the user typed (`insert.strip().lstrip("\") == token.strip()`; actions are never
@@ -2998,6 +3005,12 @@ the palette has nothing to say about, or nothing left to suggest.
    - anything else → `None` (e.g. `\limit`, `\distinct`, `\with`, `\begin`: text the
      user writes).
 
+Whole-query History is appended **after** contextual entries only during the initial
+`\from`/`\open` table choice, at document end. Completed sources, aliases, later
+clauses, existing suffixes and function-body palettes never offer document replacement.
+History still ranks ordinary matching commands, columns, functions and values by
+source-scoped recency. Whole-query offers retain their own count/recency ordering.
+
 `_where_entries(session, doc, before, token, schema)` — the condition-tree state
 machine. `before` is the raw line text up to the caret; the machine takes the last
 `or`-piece of `split_logic(before, "or")`, then the last `and`-piece of
@@ -3049,7 +3062,7 @@ prefix resumes individual-column completion.
 State: `session`, `source_id` (which source the offers should read — the function
 editor's own target), `workspace_actions` (False strips action rows so a nested editor
 never offers to run the workspace), `parameters` (a callable, only in the function
-body), `editor`, `_view`, `_preferred_width`, `_dismissed`.
+body), `editor`, `_view`, `_preferred_width`, `_dismissed`, `_history_dismissed`.
 
 `is_open` is the presence of the `open` CSS class; `view` exposes the displayed `View`.
 `attach(editor)` binds it to the editor whose text and caret it follows.
@@ -3079,9 +3092,17 @@ change, caret move, tree insert, and accept:
   placement waits for layout, and resizing keeps the active caret visible.
 - Opening also calls `scroll_to_highlight()`.
 
-`close()` hides without touching the document. `escape()` is both directions: open ⇒
-close and `_dismissed = True` (holds while the user keeps typing); closed ⇒ clear the
-dismissal and `sync()`. `move(delta)` wraps at both ends.
+`close()` hides without touching the document. `escape()` first removes History
+offers and resyncs contextual completion without silencing it. `_history_dismissed`
+holds while typing, resetting on a fresh `\` or an empty document. Without History,
+open ⇒ close and `_dismissed = True`; closed ⇒ clear contextual dismissal and
+`sync()`. `move(delta)` wraps at both ends.
+
+`HistoryPreviewChanged(palette, document)` publishes the highlighted whole query on
+highlight/sync/placement changes, or `None` when it should hide. The workspace's
+passive `HistoryPreview` overlay wraps a bounded multiline excerpt, indicates clipping,
+and fits beside or above/below the offers without covering the caret. Ordinary offers,
+dismissal, or function mode hide it. Preview clicks preserve editor focus and text.
 
 `accept(index)`:
 
@@ -4194,6 +4215,26 @@ Parameterized function definitions retain signature/body checks: untyped argumen
 have no universally valid sample value. Zero-parameter definitions and concrete
 function calls in query proposals additionally build against cached schemas.
 
+`test_query` is exposed only when the persisted `ai_test_queries` setting is true
+(off by default). It accepts one complete `text` document, settles parsing,
+rejects multiple statements and transaction/temp/drop directives, and validates
+against cached schemas before using the existing `execute`/`execute_remote` path.
+Disconnected sources and open user transactions are refused. The top-level payload
+limit is capped by the captured `sample_rows`; smaller explicit limits, including
+zero, win. It never calls `Session.run`, changes results/history, or edits a draft.
+Successful results carry `executed`, bounded `row_count`, `has_rows`, `limit`, and
+up to 20 column names. Row values are included only with `ai_allow_sample_data`;
+string cells are truncated to 500 characters. Failure returns `executed: false`
+with a safe error, never raw driver details. Execution permission and source-object
+identity are rechecked after the read. The manager's existing shielded connection
+lane holds until the engine finishes, even after request cancellation/timeout.
+An output limit is not a database-work limit or a guarantee about the full result.
+The model is instructed to check final candidates, fix errors within its budget,
+and distinguish empty success from failure without altering the user's intent.
+`query_checks` retains value-free evidence keyed by the exact tested text; completed
+query proposals show checked/failed/unchecked evidence separately from model claims.
+Offline Apply validation remains independent and never runs a check itself.
+
 `save_function` separately validates its exact required fields and types. Creation
 requires `original_name: null`; editing requires the exact unchanged saved name,
 with no rename. The source object must still match, and the immutable request-start
@@ -4267,11 +4308,13 @@ the captured source. Batches validate every document and their combined title/bo
 size before any mutation. The functions tool reads the same frozen snapshot.
 
 **What this grants:** read-only metadata, bounded sample rows, this source's history
-and function library, parser feedback, and explicitly user-requested local query
-draft updates and function saves in guarded workspace contexts. **What it denies:**
-function-form query-page mutation, settings writes, general file/shell access,
-proposed-query execution, arbitrary SQL/code, cross-source history, engine error
-detail, or additional network capabilities. The tool list is fixed at construction.
+and function library, parser feedback, opt-in bounded read-only proposed-query
+execution, and explicitly user-requested local query draft updates and function
+saves in guarded workspace contexts. **What it denies:** function-form query-page
+mutation, settings writes, general file/shell access, query-check writes or transaction
+commands, arbitrary SQL/code, cross-source history, raw engine error details, or
+additional network capabilities. The tool list is fixed at construction; read
+permissions are also checked live.
 
 ---
 

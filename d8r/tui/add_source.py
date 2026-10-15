@@ -1,4 +1,4 @@
-"""Connect to supported Ibis databases, Cloudflare D1, or local SQLite.
+"""Connect to supported Ibis databases, Cloudflare D1, or local data files.
 
 Only Add remembers live credentials and transfers the source to the app.
 Test owns its connection until Add, a field change, or cancellation.
@@ -53,7 +53,7 @@ class AddSourceModal(ModalScreen):
                         "Connect saved data source" if self._initial_profile is not None else
                         "Add a data source", id="add-source-title")
             yield Static(
-                "Connect through Ibis, Cloudflare D1, or an offline SQLite snapshot. "
+                "Open a local Parquet file or connect through Ibis, Cloudflare D1, or a SQLite snapshot. "
                 "Add saves connection credentials locally in plaintext; keep connection backups private. "
                 "Test and Cancel save nothing.",
                 id="add-source-note",
@@ -61,13 +61,23 @@ class AddSourceModal(ModalScreen):
             )
             yield Label("Backend", classes="field-label")
             yield Select(
-                [("Cloudflare D1 / local SQLite snapshot", "d1"), ("PostgreSQL", "postgres"),
+                [("Local Parquet file · DuckDB", "parquet"),
+                 ("Cloudflare D1 / local SQLite snapshot", "d1"), ("PostgreSQL", "postgres"),
                  *((spec.label, name) for name, spec in BACKENDS.items())],
                 value=(self._initial_profile["backend"] if self._initial_profile and self._initial_profile.get("kind") == "ibis"
+                       else "parquet" if self._initial_profile and self._initial_profile.get("kind") == "parquet"
                        else "postgres" if self._initial_profile and self._initial_profile.get("kind") == "postgres-live" else "d1"),
                 allow_blank=False,
                 id="source-backend",
             )
+            with Vertical(id="parquet-fields"):
+                yield Static(
+                    "Open one existing local .parquet or .pq file without copying or changing it. "
+                    "Add remembers only its path and display name. Schema discovery reads metadata only. "
+                    "Query the table named data: \\from data \\limit 50", markup=False,
+                )
+                yield Label("Parquet file path", classes="field-label")
+                yield Input(placeholder="existing .parquet or .pq path — local files only", id="parquet-path")
             with Vertical(id="d1-fields"):
                 yield Static(
                     "Cloudflare dashboard: copy your Account ID from the account overview. "
@@ -162,6 +172,13 @@ class AddSourceModal(ModalScreen):
         self._show_backend()
         self._observed_fields = self._fields()
         if self._initial_profile is not None:
+            if self._initial_profile.get("kind") == "parquet":
+                with self.prevent(Input.Changed):
+                    self.query_one("#parquet-path", Input).value = self._initial_profile["path"]
+                    self.query_one("#display-name", Input).value = self._initial_profile.get("display", "")
+                self._reconnect_fields = self._fields()
+                self.call_after_refresh(self.action_add)
+                return
             if self._initial_profile.get("kind") == "ibis":
                 with self.prevent(Select.Changed, Input.Changed):
                     self._fill_backend_profile(self._initial_profile)
@@ -201,6 +218,7 @@ class AddSourceModal(ModalScreen):
         self._shown_backend = backend
         postgres = backend == "postgres"
         self.query_one("#d1-fields").display = backend == "d1"
+        self.query_one("#parquet-fields").display = backend == "parquet"
         self.query_one("#postgres-fields").display = postgres
         self.query_one("#backend-fields").display = backend in BACKENDS
         for name in BACKENDS:
@@ -209,7 +227,7 @@ class AddSourceModal(ModalScreen):
             fields = BACKENDS[backend].fields
             selector = f"#backend-{backend}-{fields[0].name}" if fields else "#backend-options"
         else:
-            selector = "#postgres-host" if postgres else "#account-id"
+            selector = "#parquet-path" if backend == "parquet" else "#postgres-host" if postgres else "#account-id"
         self.query_one(selector, Input).focus()
 
     def _fields(self) -> tuple[str, ...]:
@@ -229,7 +247,8 @@ class AddSourceModal(ModalScreen):
                 self.query_one("#postgres-password", Input).value,
                 self.query_one("#postgres-schema", Input).value.strip(),
                 str(self.query_one("#postgres-sslmode", Select).value),
-                json.dumps(options), self.query_one("#backend-options", Input).value)
+                json.dumps(options), self.query_one("#backend-options", Input).value,
+                self.query_one("#parquet-path", Input).value.strip())
 
     def _message(self, text: str, error: bool = False) -> None:
         secrets = [widget.value for widget in self.query(Input) if widget.password and widget.value]
@@ -253,6 +272,7 @@ class AddSourceModal(ModalScreen):
         if busy:
             fields = self._fields()
             target = (BACKENDS[fields[5]].label if fields[5] in BACKENDS else
+                      fields[15] if fields[5] == "parquet" else
                       fields[8] if fields[5] == "postgres" else fields[3] or fields[1])
             for secret in (fields[2], fields[10]):
                 if secret:
@@ -394,6 +414,8 @@ class AddSourceModal(ModalScreen):
 
     def _build(self, fields: tuple[str, ...]) -> DataSource:
         account_id, database, api_token, path, display = fields[:5]
+        if fields[5] == "parquet":
+            return self.session.build_parquet_source(fields[15], display)
         if fields[5] in BACKENDS:
             return self.session.build_backend_source(self._backend_profile(fields))
         if fields[5] == "postgres":
@@ -478,6 +500,8 @@ class AddSourceModal(ModalScreen):
 
     @staticmethod
     def _connection_error(fields: tuple[str, ...]) -> str:
+        if fields[5] == "parquet":
+            return "Could not open Parquet. Check the local file path, format and read permissions."
         if fields[5] == "postgres":
             return ("Could not connect to PostgreSQL or save the connection. Check the host, port (1–65535), "
                     "database, user, password, schema, TLS mode and access permissions, then try again.")

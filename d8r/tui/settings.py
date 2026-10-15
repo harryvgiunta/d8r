@@ -160,7 +160,12 @@ class SettingsScreen(ModalScreen[None]):
                       "at exit. Only these preferences are saved. Changing them clears cached values.",
             "sources": "Connect an Ibis database or Cloudflare D1, or select an existing source. Selecting a source refreshes its schema and completion.",
             "dialects": "Choose the SQL rendering target independently of the active data source. Changing dialect does not execute a query.",
-            "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. Disabling reads does not remove data already shared in chat.",
+            "ai": "Provider changes require Save. Permission toggles save immediately. Schema refreshes control AI metadata lookups, not IDE indexing. "
+                  "Test AI Queries permits read-only execution with bounded result rows; aggregates can still scan many source rows. "
+                  "Query-check failures and bounded row counts are shared even when Allow Sample Data is off; result samples are sent only when it is on. "
+                  "Sample records per read and Request timeout also govern query checks. "
+                  "Automatically applied edits update validated, unchanged drafts only; they never run queries or save functions. "
+                  "Disabling reads does not remove data already shared in chat.",
             "keys": "Keyboard shortcuts from the running app. This reference is read-only.",
         }
         self.query_one("#settings-description", Static).update(
@@ -239,11 +244,13 @@ class SettingsScreen(ModalScreen[None]):
                 Row("API key", "configured" if config.api_key else "not set", "ai", "ai-api-key"),
                 Row("AI turns/tool rounds", str(config.max_tool_rounds), "ai", "ai-tool-rounds"),
                 Row("Tool calls per round", str(config.max_tool_calls), "ai", "ai-tool-calls"),
-                Row("Sample records per read", str(config.sample_rows), "ai", "ai-sample-rows"),
+                Row("Sample records per read", f"{config.sample_rows} · samples and query checks", "ai", "ai-sample-rows"),
                 Row("Maximum attempts", str(config.max_attempts), "ai", "ai-attempts"),
-                Row("Request timeout", f"{config.timeout:g} seconds", "ai", "ai-timeout"),
+                Row("Request timeout", f"{config.timeout:g} seconds · requests and query checks", "ai", "ai-timeout"),
                 Row("Allow Sample Data", "on" if self.session.ai_allow_sample_data else "off", "ai-sample-data"),
                 Row("Allow Schema Refreshes", "on" if self.session.ai_allow_schema_refreshes else "off", "ai-schema-refreshes"),
+                Row("Test AI Queries", "on · bounded read-only checks" if self.session.ai_test_queries else
+                    "off · no query-check execution", "ai-test-queries"),
                 Row("Automatically Apply AI Edits", "on · validated drafts only" if self.session.ai_auto_accept else
                     "off · review and Apply manually", "ai-auto-accept"),
             ]
@@ -305,6 +312,8 @@ class SettingsScreen(ModalScreen[None]):
             self.ide.update_settings(ai_allow_sample_data=not self.session.ai_allow_sample_data)
         elif row.action == "ai-schema-refreshes":
             self.ide.update_settings(ai_allow_schema_refreshes=not self.session.ai_allow_schema_refreshes)
+        elif row.action == "ai-test-queries":
+            self.ide.update_settings(ai_test_queries=not self.session.ai_test_queries)
         elif row.action == "value-cache":
             self.ide.update_settings(value_cache_enabled=not self.session.value_cache_enabled)
         elif row.action == "clear-values":
@@ -329,18 +338,14 @@ class SettingsScreen(ModalScreen[None]):
                 lambda _: self._draw(event.option_index),
             )
             return
-        elif row.action == "add-source" or (row.action == "source" and
-                                            self.session.saved_source_profile(row.value) is not None):
+        elif row.action == "add-source":
             if self.ide.refuse_busy("Connect data source"):
                 return
             def source_added(source) -> None:
                 self.ide._source_added(source)
                 self._draw(event.option_index)
 
-            if row.action == "add-source":
-                self.app.push_screen(AddSourceModal(self.session), source_added)
-            else:
-                self.ide.reconnect_source(row.value, source_added)
+            self.app.push_screen(AddSourceModal(self.session), source_added)
             return
         elif row.action == "source":
             self.ide.select_source(row.value)
@@ -504,7 +509,7 @@ class AIProviderScreen(ModalScreen[None]):
                 f"Save writes provider settings and the API key to {self.ide.session.settings_path}. "
                 "Settings and connection backups contain plaintext secrets; keep them private. "
                 "Completed chats and drafts are saved locally. Sending a message shares the document, "
-                "history and permitted schema/sample reads with this provider. Use HTTPS for remote providers.", markup=False,
+                "history and permitted schema/sample reads and query-check evidence with this provider. Use HTTPS for remote providers.", markup=False,
             )
             yield Static("Base URL (including /v1), or full /chat/completions URL")
             yield Input(config.base_url, placeholder="https://yolo-auto.com/v1", id="ai-base-url")
@@ -518,10 +523,13 @@ class AIProviderScreen(ModalScreen[None]):
                          "one final answer is requested with tools disabled.", markup=False)
             yield Static("Tool calls per round (1–16)")
             yield Input(str(config.max_tool_calls), type="integer", id="ai-tool-calls")
-            yield Static("Schema, sample, history and validation reads count as tool calls; "
+            yield Static("Schema, sample, history, validation reads and query checks count as tool calls; "
                          "several calls may share a round.", markup=False)
-            yield Static("Sample records per read (1–100)")
+            yield Static("Sample records per read / query check (1–100)")
             yield Input(str(config.sample_rows), type="integer", id="ai-sample-rows")
+            yield Static("Bounds sample reads and query-check result rows; smaller explicit query limits are honored, "
+                         "including zero. Aggregates can still scan many source rows. Query checks share failures and "
+                         "bounded row counts; result samples are sent only with Allow Sample Data on.", markup=False)
             yield Static("Maximum attempts (1–5; transient failures only)")
             yield Input(str(config.max_attempts), type="integer", id="ai-attempts")
             yield Static("1 initial attempt + remaining attempts as shared retries per message, "
@@ -529,7 +537,7 @@ class AIProviderScreen(ModalScreen[None]):
             yield Static("Request timeout in seconds (without stream progress)")
             yield Input(str(config.timeout), type="number", id="ai-timeout")
             yield Static("Active streams may take longer; keepalive comments do not count as progress. "
-                         "Each context-tool read still has this total deadline.", markup=False)
+                         "Each context-tool read or query check still has this total deadline.", markup=False)
             yield Static("", id="ai-settings-error", markup=False)
             with Horizontal(id="ai-settings-buttons"):
                 yield Button("Save", id="ai-settings-save", variant="primary")

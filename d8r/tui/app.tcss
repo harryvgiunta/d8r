@@ -499,6 +499,20 @@ CommandPalette.open {
     display: block;
 }
 
+#history-preview {
+    layer: overlay;
+    position: absolute;
+    display: none;
+    width: 68;
+    height: 12;
+    border: round $primary;
+    padding: 0 1;
+    background: $panel;
+    color: $text;
+    overflow: hidden hidden;
+    text-wrap: nowrap;
+}
+
 /* -- results ------------------------------------------------------------ */
 
 #result-tabs {

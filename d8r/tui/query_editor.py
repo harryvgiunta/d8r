@@ -65,6 +65,7 @@ class QueryTextArea(TextArea):
     def get_line(self, line_index: int) -> Text:
         line = super().get_line(line_index)
         text = line.plain
+        styles: dict[str, Style] = {}
         for token in _TOKENS.finditer(text):
             kind = token.lastgroup
             start, end = token.span()
@@ -81,7 +82,8 @@ class QueryTextArea(TextArea):
                     continue
             elif kind == "command" and _CALL_TAIL.match(text, end):
                 kind = "function"
-            line.stylize(
-                self.get_component_rich_style(f"query--{kind}", partial=True), start, end,
-            )
+            style = styles.get(kind)
+            if style is None:
+                style = styles[kind] = self.get_component_rich_style(f"query--{kind}", partial=True)
+            line.stylize(style, start, end)
         return line

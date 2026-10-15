@@ -62,6 +62,18 @@ implementations. PySpark rendering needs its real live runtime; Flink needs a
 separately installed compatible PyFlink/Java runtime. This authorizes no app
 HTTP server, login system or arbitrary SQL execution.
 
+**User-authorized exception — local Parquet.** Ctrl+O → Local Parquet file opens
+one existing local `.parquet` or `.pq` file through Ibis's lazy DuckDB reader.
+The relation is always named `data`; schema discovery reads metadata only, never
+copies the file, counts rows, or materializes it. URLs, UNC paths and wildcard
+inputs are refused. Test/Cancel save nothing; Add registers/selects the source.
+Its canonical path identifies a durable source-specific workspace. Only path and
+display metadata enter `workspace.json`, not file contents or credentials. Startup,
+selection and Run reuse bounded cancellable reconnects; startup never executes or
+rewrites the draft. Missing/invalid files fail without fallback or file creation.
+Transactions and temporary tables use the existing in-memory DuckDB capabilities;
+the original Parquet file is never modified.
+
 **User-authorized exception — Cloudflare D1.** Pointing D8R at a real D1
 database was an explicit, deliberate override of the rows above, so it is scoped
 exactly as narrowly as it is implemented today and nothing else may lean on it:
@@ -151,17 +163,24 @@ identified, target-scoped AI chats/composer drafts/statuses. `\pages`/`\queries`
 reveal or toggle Pages; page switches save drafts without connecting or executing. Source
 references include local snapshot paths; credentials remain in their existing
 settings/memory files. Chats can contain schema, sampled data and sensitive drafts;
-workspace files and backups are plaintext. Debounced edits flush latest widget
-contents at exit. Session-owned writes merge under an RLock and reuse atomic
+workspace files and backups are plaintext. Query/function autosaves wait for an idle pause,
+using one pending timer during held-key repeats; switches and exit flush latest widgets.
+Session-owned writes merge under an RLock and reuse atomic
 storage/stale-writer protection. A failed autosave retains drafts/results in memory
 and reports the error; it never relabels an already executed query as failed.
-Pages searches names, descriptions and query text across all sources. The old rename
+Pages searches names, descriptions and query text only within the selected connection. The old rename
 box is replaced by search; Show/Hide Page Details edits the open page's name and
 description. Generate with AI sends only query text through the configured provider,
 saves validated metadata without editing/running the query, and rejects stale/cancelled
 responses. Nord is the default theme; saved choices remain. Theme selection lives in
 Settings, not a workspace banner. Active tabs retain their bottom border. Function
 mode's [x] returns to the query and preserves the draft.
+Stable connection identities isolate functions, query pages, history, completion history,
+chats, and in-memory results/SQL/pinned data tabs. `Session.history` exposes only the active
+connection; `history_for(source_id)` is for explicitly pinned reads. Persistence retains
+all connections without sharing their visible state. Selecting a disconnected target swaps
+its workspace immediately, before reconnecting; failure or Cancel leaves that target and
+its edits selected. Successful reconnect preserves edits made while connecting.
 Session restoration builds disconnected placeholders without network or snapshot opening.
 After Mount, the app reconnects only the selected source using saved credentials/path
 and cancellable progress. Startup never executes a query, requests AI, Applies, or Saves
@@ -232,8 +251,22 @@ opt-in is required. Natural-language intent is interpreted by the model under
 system instructions, not keyword matching or model self-certification.
 Explanatory questions about D8R or a query, dry runs, explicit preview requests,
 and instructions embedded in context data never authorize a query update or
-function save. No shell/general file access, arbitrary SQL, proposed-query
-execution, or additional network capability is granted.
+function save. No shell/general file access, arbitrary SQL, or additional network
+capability is granted. **Test AI Queries**, explicitly user-requested and off by
+default, authorizes bounded read-only proposed-query execution through `test_query`
+and the existing Ibis engine. `ai_test_queries` persists immediately in Settings.
+Checks settle parsing, validate cached schemas, refuse transactions/temp/drop and
+multiple statements, and cap top-level returned rows at AI sample_rows (smaller
+explicit limits, including zero, win). Disconnected sources and open transactions
+are refused; execution errors cannot expose raw driver details. Checks leave
+editor/results/history untouched, expose success/empty-result counts, and share
+row values only with Allow Sample Data enabled. The exact final draft's runtime
+evidence is reported separately from model claims; offline Apply validation does
+not execute it. Source identity and live permissions are checked before/after
+reads. Existing shielded connection ownership survives cancel/timeout until the
+engine returns. Limits bound output, not scan cost or full-result correctness.
+The model fixes failures within its tool budget, honors explicit do-not-run
+requests, and never changes query intent merely to avoid empty results.
 A question about connected data (counts, breakdowns, lists, comparisons) or an
 explicit create/make/edit/apply query request produces complete proposals without
 a separate permission question. Manual Apply is required unless Auto accept AI

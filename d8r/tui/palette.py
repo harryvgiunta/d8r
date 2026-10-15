@@ -834,7 +834,7 @@ def _query_history_entries(session: Session, doc: str) -> list[Entry]:
             label=f"History ({count} {'run' if count == 1 else 'runs'}): "
                   + query[:QUERY_PREVIEW_LENGTH].replace("\t", " ").replace("\n", " · ")[:QUERY_PREVIEW_LENGTH]
                   + ("…" if len(query) > QUERY_PREVIEW_LENGTH else ""),
-            insert=query, detail="replace whole query", replace_document=True,
+            insert=query, detail="replace whole query · Esc: hide history", replace_document=True,
         )
         for query, count, _ in matches[:QUERY_SUGGESTIONS]
     ]
@@ -845,7 +845,7 @@ def view_for(
     value_lookup: Callable[[str], list[str]] | None = None, row: int | None = None,
     query_history: bool = True,
 ) -> View | None:
-    """Contextual offers plus matching whole documents, only at document end."""
+    """Contextual offers first; whole-query recall only during the opening source choice."""
     parameters = tuple(parameters)
     view = _context_view_for(session, doc, line, column, parameters=parameters,
                              value_lookup=value_lookup, row=row)
@@ -853,12 +853,24 @@ def view_for(
             or column != len(line) or line != doc.rsplit("\n", 1)[-1]
             or (row is not None and row != doc.count("\n"))):
         return view
+    opening = doc.lstrip()
+    word, gap, source = _split(opening.removeprefix("\\"))
+    if (not opening.startswith("\\") or word.lower() not in {"from", "open"}
+            or not gap or "\n" in gap + source
+            or _where_token(source)[1] or _command_context(source)[0] >= 0):
+        return view
+    # A fully named table is already a source choice, even without a trailing space.
+    source_parts = relation_parts(source.casefold()) if source else None
+    if source_parts is not None and view is not None and any(
+        relation_parts(entry.label.casefold()) == source_parts for entry in view.entries
+    ):
+        return view
     entries = _query_history_entries(session, doc)
     if not entries:
         return view
     if view is None:
         return View(0, doc, entries, phase="argument", end=column)
-    combined = [*entries, *view.entries] if view.phase == "argument" else [*view.entries, *entries]
+    combined = [*view.entries, *entries]
     return View(view.start, view.token, combined, view.phase, view.end)
 
 
@@ -871,6 +883,20 @@ def _context_view_for(
     `None` means "no palette": no `\\` before the caret, a command the palette
     has nothing to say about, or nothing left to suggest for what is typed.
     """
+    before = line[:column]
+    parameter = _parameter_token(before) if parameters else None
+    if parameter is not None:
+        start, token = parameter
+        rows = ((0, name, "parameter", f"@{name}") for name in parameters)
+        entries = [
+            Entry(label=entry.insert, insert=entry.insert, detail=entry.detail)
+            for entry in _offers(rows, token[1:])
+        ]
+        end = next((end for begin, end, _ in param_spans(line) if begin == start), column)
+        return View(start, line[start:end], entries, phase="argument", end=end) if entries else None
+    slash, inline_filter = _command_context(before)
+    if slash < 0:
+        return None
     schema = session.schema
     if row is not None:
         lines = doc.split("\n")
@@ -893,20 +919,6 @@ def _context_view_for(
             body = [raw.lstrip() for raw in body]
         doc = "\n".join([*prefix, *body])
         row += len(prefix) - begin
-    before = line[:column]
-    parameter = _parameter_token(before) if parameters else None
-    if parameter is not None:
-        start, token = parameter
-        rows = ((0, name, "parameter", f"@{name}") for name in parameters)
-        entries = [
-            Entry(label=entry.insert, insert=entry.insert, detail=entry.detail)
-            for entry in _offers(rows, token[1:])
-        ]
-        end = next((end for begin, end, _ in param_spans(line) if begin == start), column)
-        return View(start, line[start:end], entries, phase="argument", end=end) if entries else None
-    slash, inline_filter = _command_context(before)
-    if slash < 0:
-        return None
     word, gap, rest = _split(before[slash + 1 :])
     if word.lower() == FN_COMMAND:
         # Saved functions complete as calls; only the explicit create row
@@ -988,10 +1000,12 @@ def _context_view_for(
             # rest of the clause (`as alias`, `on col`) takes no dataset — so a
             # stray Enter cannot append a second one.
             return None
+        taken = (session.table_identifiers(doc, schema=schema)
+                 if command in DATASET_COMMANDS and not line[end:].strip() else None)
         rows = [
             (0, name, detail, session.table_insert(
                 doc, '"cross"' if command == "join" and not cross_join and name.lower() == "cross" else name,
-                schema=schema,
+                schema=schema, taken=taken,
             ) if command in DATASET_COMMANDS and not line[end:].strip() else f"{name} ")
             for name, detail in session.dataset_entries(doc, schema=schema)
         ]
@@ -1141,6 +1155,15 @@ class CommandPalette(OptionList):
         def __init__(self, action: str) -> None:
             self.action = action
             super().__init__()
+
+    class HistoryPreviewChanged(Message):
+        """The highlighted whole query, or None when its preview must hide."""
+
+        def __init__(self, palette: CommandPalette, document: str | None) -> None:
+            super().__init__()
+            self.palette = palette
+            self.document = document
+
     class ValuesRequested(Message):
         """An on-demand read; the app owns connection sharing and background work."""
 
@@ -1169,8 +1192,12 @@ class CommandPalette(OptionList):
         self._preferred_width = 24
         # True after Escape: the offers stay shut until a `\` (or Escape) lifts it.
         self._dismissed = False
+        self._history_dismissed = False
+        self._preview_document: str | None = None
         self._value_key: tuple[int, str, str, int] | None = None
         self._value_result: list[str] | None = None
+        self._sync_pending = False
+        self._sync_scheduled = False
 
     @property
     def is_open(self) -> bool:
@@ -1211,6 +1238,22 @@ class CommandPalette(OptionList):
 
     # -- opening / closing --------------------------------------------------
 
+    def queue_sync(self) -> None:
+        """Coalesce text and selection notifications into one current-caret update."""
+        self._sync_pending = True
+        if not self._sync_scheduled:
+            self._sync_scheduled = True
+            self.call_after_refresh(self._flush_queued_sync)
+
+    def _flush_queued_sync(self) -> None:
+        self._sync_scheduled = False
+        self.flush_sync()
+
+    def flush_sync(self) -> None:
+        """Keys consume the latest offers even before the queued refresh runs."""
+        if self._sync_pending:
+            self.sync()
+
     def sync(self, *, respect_dismissal: bool = False) -> None:
         """Follow the editor's caret: offer what belongs there, or close.
 
@@ -1225,6 +1268,7 @@ class CommandPalette(OptionList):
         Settings menu's Intellisense switch, the hard off: nothing opens while
         it is off, and `ctrl+comma` is the way back to Settings.
         """
+        self._sync_pending = False
         editor = self.editor
         if self.session.busy or (respect_dismissal and self._dismissed):
             self.close()
@@ -1236,12 +1280,15 @@ class CommandPalette(OptionList):
             return
         row, column = editor.cursor_location
         line = editor.document[row]
+        if not editor.text.strip():
+            self._history_dismissed = False
         if column > 0 and (
             line[column - 1] == "\\"
             or (self.parameters is not None and line[column - 1] == "@" and _parameter_token(line[:column]))
         ):
             # An explicit `\` or function parameter `@` lifts Escape's dismissal.
             self._dismissed = False
+            self._history_dismissed = False
         request: CommandPalette.ValuesRequested | None = None
         value_key: tuple[int, str, str, int] | None = None
         value_result: list[str] | None = None
@@ -1272,7 +1319,8 @@ class CommandPalette(OptionList):
                     parameters=self.parameters() if self.parameters is not None else (),
                     row=row,
                     value_lookup=value_lookup,
-                    query_history=self.workspace_actions and self.parameters is None,
+                    query_history=(self.workspace_actions and self.parameters is None
+                                   and not self._history_dismissed),
                 )
                 if self.session.intellisense and not self._dismissed
                 else None
@@ -1319,6 +1367,7 @@ class CommandPalette(OptionList):
             # A just-shown editor has no usable geometry until layout finishes.
             # Keep its current offers, but never paint them at an old position.
             self.call_after_refresh(self.reposition)
+        self._publish_history_preview()
 
     def _place(self) -> bool:
         """Fit up to six single-line offers beside the actual rendered caret."""
@@ -1356,18 +1405,39 @@ class CommandPalette(OptionList):
                 self.styles.visibility = "hidden"
             else:
                 self.close()
+        self._publish_history_preview()
 
     def close(self) -> None:
         """Hide the palette without touching the document."""
+        self._sync_pending = False
         self._view = None
         self.remove_class("open")
+        self._publish_history_preview()
+
+    @on(OptionList.OptionHighlighted)
+    def _history_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list is self:
+            self._publish_history_preview()
+
+    def _publish_history_preview(self) -> None:
+        document = None
+        if (self.is_open and self.styles.visibility == "visible" and self._view is not None
+                and self.highlighted is not None and 0 <= self.highlighted < len(self._view.entries)):
+            entry = self._view.entries[self.highlighted]
+            if entry.replace_document:
+                document = entry.insert
+        if document is None and self._preview_document is None:
+            return
+        self._preview_document = document
+        self.post_message(self.HistoryPreviewChanged(self, document).set_sender(self))
 
     def escape(self) -> None:
-        """Escape shows and hides the popup — the same key, both ways.
-
-        Open (or offering something), it closes and stays shut while the user
-        keeps typing; closed, it lifts that dismissal and offers again.
-        """
+        """Dismiss History first, then toggle contextual completion without editing text."""
+        self.flush_sync()
+        if self._view is not None and any(entry.replace_document for entry in self._view.entries):
+            self._history_dismissed = True
+            self.sync()
+            return
         if self.is_open or (self._value_key is not None and self._value_result is None and not self._dismissed):
             self.close()
             self._dismissed = True
@@ -1391,10 +1461,9 @@ class CommandPalette(OptionList):
 
     def accept_highlighted(self, *, newline: bool = False) -> bool:
         """Accept the highlighted row; False when there is nothing to accept."""
-        if not self.is_open:
-            self.sync(respect_dismissal=True)
+        self.sync(respect_dismissal=True)
         index = self.highlighted
-        return False if index is None else self.accept(index, newline=newline)
+        return False if index is None else self._accept(index, newline=newline)
 
     def accept(self, index: int, *, newline: bool = False) -> bool:
         """Apply row `index`; False when accepting it would change nothing.
@@ -1405,6 +1474,9 @@ class CommandPalette(OptionList):
         takes, and `sum(` keeps offering its argument.
         """
         self.sync(respect_dismissal=True)
+        return self._accept(index, newline=newline)
+
+    def _accept(self, index: int, *, newline: bool = False) -> bool:
         view = self._view
         editor = self.editor
         if (view is None or editor is None or editor.read_only
@@ -1538,12 +1610,12 @@ class EditorPane(Vertical):
 
     @on(TextArea.Changed)
     def _editor_changed(self) -> None:
-        self.palette.sync()
+        self.palette.queue_sync()
 
     @on(TextArea.SelectionChanged)
     def _editor_caret_moved(self) -> None:
-        if self.palette.is_open:
-            self.palette.sync()
+        if self.palette.is_open or self.palette._sync_pending:
+            self.palette.queue_sync()
 
     @on(OptionList.OptionSelected)
     def _palette_clicked(self, event: OptionList.OptionSelected) -> None:
@@ -1553,6 +1625,7 @@ class EditorPane(Vertical):
 
     def action_palette_up(self) -> None:
         """Move the palette's highlight, or the caret when it is closed."""
+        self.palette.flush_sync()
         if self.palette.is_open:
             self.palette.move(-1)
         else:
@@ -1560,6 +1633,7 @@ class EditorPane(Vertical):
 
     def action_palette_down(self) -> None:
         """Move the palette's highlight, or the caret when it is closed."""
+        self.palette.flush_sync()
         if self.palette.is_open:
             self.palette.move(1)
         else:
@@ -1572,7 +1646,7 @@ class EditorPane(Vertical):
         closes and Enter means what it always means.
         """
         palette = self.palette
-        if palette.is_open and palette.accept_highlighted(newline=True):
+        if (palette.is_open or palette._sync_pending) and palette.accept_highlighted(newline=True):
             return
         palette.close()
         editor = self.editor

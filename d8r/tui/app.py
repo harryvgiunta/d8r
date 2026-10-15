@@ -15,7 +15,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from uuid import uuid4
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -115,6 +115,37 @@ def dataset_label(name: str, rows: int | None) -> Text:
     return Text.assemble((name, "bold"), "  ", (detail, "dim"))
 
 
+class HistoryPreview(Static):
+    """A bounded query reading surface, never an editor or a focus target."""
+
+    can_focus = False
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", markup=False, **kwargs)
+        self.document: str | None = None
+        self._rendered: tuple[str, int, int] | None = None
+        self.border_title = "History · preview"
+
+    def show_document(self, document: str, width: int, height: int) -> None:
+        key = (document, width, height)
+        if key == self._rendered:
+            return
+        self._rendered = key
+        rows = max(1, height - 2)
+        columns = max(1, width - 4)
+        excerpt = document[:columns * rows]
+        lines = Text(excerpt).wrap(self.app.console, columns, overflow="fold")
+        self.update(Text("\n").join(lines[:rows]))
+        clipped = len(excerpt) < len(document) or len(lines) > rows
+        self.border_subtitle = "… more below" if clipped else "Read only"
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Like the palette, do not let a click focus a scrollable ancestor.
+        self.app.editor.focus()
+        event.stop()
+        event.prevent_default()
+
+
 class D8RApp(App):
     """The data IDE: a `\\command` document, the live schema, and the rows."""
 
@@ -140,8 +171,7 @@ class D8RApp(App):
         "agents": "Agents tab",
         "ai": "AI pane (right)",
     }
-    # Autosave throttle while a key-repeat burst lasts (seconds): one pending
-    # flush absorbs a held key, and an error surfaces well inside a second.
+    # Autosave after typing pauses; one timer absorbs the whole key-repeat burst.
     _WORKSPACE_SAVE_INTERVAL = 0.2
 
     # Priority bindings so they win over the focused editor's own keys — the
@@ -173,7 +203,7 @@ class D8RApp(App):
         self._initial_document = (WELCOME_DOCUMENT if self._workspace_key == "demo" else "") if document is None else document
         self._workspace_editor: TextArea | None = None
         self._workspace_timer = None
-        self._workspace_saved = 0.0
+        self._workspace_edited = 0.0
         self._workspace_status: Static | None = None
         self._workspace_ready = False
         self._workspace_snapshot: dict = {}
@@ -194,6 +224,7 @@ class D8RApp(App):
         self._data_tab_seq = 0
         self._results_closed = False
         self._main_outcome: RunOutcome | None = None
+        self._workspace_outputs: dict[str, tuple[RunOutcome | None, str]] = {}
 
     def get_default_screen(self) -> Screen:
         """The IDE runs on `IdeScreen`, whose tab does not walk the panes."""
@@ -279,6 +310,7 @@ class D8RApp(App):
                     with Vertical(id="function-output"):
                         yield Static("Function preview · Run preview saves the definition", classes="pane-title")
                         yield DataTable(id="fn-grid", zebra_stripes=True, cursor_type="cell")
+                yield HistoryPreview(id="history-preview")
             yield PaneSplitter("#assistant-slot", "width", "ai", reverse=True,
                                min_size=28, min_remaining=30, id="ai-splitter")
             with Vertical(id="assistant-slot"):
@@ -397,30 +429,26 @@ class D8RApp(App):
             }
 
     def _queue_workspace_save(self) -> None:
-        """Coalesce autosaves: no pending flush is ever restarted.
-
-        Stopping and recreating a Textual `Timer` per keystroke means a
-        kernel waitable-timer and an executor round-trip per key — the lag
-        behind a held Backspace. One pending timer absorbs every keystroke
-        while the burst lasts, and a flush happens at most once per interval;
-        the exit-time `_flush_workspace` still saves the freshest text.
-        """
+        """Save after an idle interval, using one timer across a burst of edits."""
         if not self._workspace_ready or self._closing or not self.is_running:
             return
-        self._capture_workspace()
-        if self._workspace_timer is not None:
-            return
-        # A zero interval crashes Textual's timer math; an already-elapsed
-        # debounce still needs a real (tiny) delay to fire on the next tick.
-        delay = max(0.01, self._WORKSPACE_SAVE_INTERVAL - (
-            monotonic() - self._workspace_saved))
-        self._workspace_timer = self.set_timer(delay, self._flush_workspace)
+        self._workspace_edited = monotonic()
+        if self._workspace_timer is None:
+            self._workspace_timer = self.set_timer(
+                self._WORKSPACE_SAVE_INTERVAL, self._save_idle_workspace)
+
+    def _save_idle_workspace(self) -> None:
+        self._workspace_timer = None
+        remaining = self._WORKSPACE_SAVE_INTERVAL - (monotonic() - self._workspace_edited)
+        if remaining > 0:
+            self._workspace_timer = self.set_timer(max(0.01, remaining), self._save_idle_workspace)
+        else:
+            self._flush_workspace()
 
     def _flush_workspace(self) -> None:
         if self._workspace_timer is not None:
             self._workspace_timer.stop()
             self._workspace_timer = None
-        self._workspace_saved = monotonic()
         self._capture_workspace()
         if self._workspace_snapshot:
             pages = self.session.workspace["pages"]
@@ -436,6 +464,8 @@ class D8RApp(App):
 
     def _prepare_workspace_switch(self) -> None:
         """Capture outgoing widgets before their source or stable identities change."""
+        self._workspace_outputs[self._workspace_key] = (
+            self._main_outcome, self.query_one("#sql-text", TextArea).text)
         self.function_editor.flush_draft()
         self.ai_panel._flush_chat()
         self._flush_workspace()
@@ -467,6 +497,12 @@ class D8RApp(App):
         self._sync_dialect_select()
         self._refresh_header()
         self._refresh_tree()
+        self._refresh_history()
+        outcome, sql = self._workspace_outputs.get(self._workspace_key, (None, ""))
+        self._render_results(outcome or RunOutcome())
+        self._set_error(outcome.error if outcome else "")
+        self._set_sql(sql)
+        self._sync_data_tabs()
         self._sync_layout()
         self.query_one("#keymap", Static).update(FUNCTION_HINT if self.function_mode else KEY_HINTS)
         self.ai_panel.target_changed()
@@ -493,8 +529,9 @@ class D8RApp(App):
         self.query_one("#page-details", PageDetails).sync()
         search = self.query_one("#page-search", Input).value.casefold().strip()
         pages = [page for page in self.session.workspace["pages"]
-                 if not search or any(search in page.get(field, "").casefold()
-                                      for field in ("title", "description", "document"))]
+                 if page["source"] == self._workspace_key and
+                 (not search or any(search in page.get(field, "").casefold()
+                                    for field in ("title", "description", "document")))]
         rows = tuple((page["id"], page["title"], page.get("description", ""),
                       page["document"], page["source"]) for page in pages)
         # Options wrap by default, so a long title silently becomes a 4-line
@@ -574,7 +611,8 @@ class D8RApp(App):
 
     def delete_page(self, page_id: str) -> None:
         pages = self.session.workspace["pages"]
-        index = next((index for index, page in enumerate(pages) if page["id"] == page_id), None)
+        index = next((index for index, page in enumerate(pages)
+                      if page["id"] == page_id and page["source"] == self._workspace_key), None)
         if index is None:
             return
         active = page_id == self._document_identity
@@ -615,7 +653,8 @@ class D8RApp(App):
                 self.action_workspace()
             return
         self._flush_workspace()
-        page = next((item for item in self.session.workspace["pages"] if item["id"] == page_id), None)
+        page = next((item for item in self.session.workspace["pages"]
+                     if item["id"] == page_id and item["source"] == self._workspace_key), None)
         if page is None:
             return
         self._restore_page(page)
@@ -743,6 +782,7 @@ class D8RApp(App):
             return
         self.editor.load_text(proposal.body)
         self.palette.close()
+        self._flush_workspace()
         self._set_status("AI replacement applied · not executed")
 
     def refresh_functions(self) -> None:
@@ -760,8 +800,11 @@ class D8RApp(App):
     def _document_caret_changed(self) -> None:
         self._queue_workspace_save()
 
-    def _source_options(self) -> list[tuple[Content, str]]:
-        return [(Content(label), source_id) for label, source_id in self.session.source_options()]
+    def _source_options(self) -> list[tuple[Content, str | None]]:
+        return [(Content("Add new Data Souce.."), None)] + [
+            (Content(label), source_id)
+            for label, source_id in sorted(self.session.source_options(), key=lambda option: option[0].casefold())
+        ]
 
     def _dialect_options(self) -> list[tuple[Content, str]]:
         """Every advertised compile target; unavailable ones say so."""
@@ -1002,7 +1045,8 @@ class D8RApp(App):
         # never throws away a result the user pinned or a run still holding.
         self.query_one("#result-tabs").display = not self.function_mode and (
             any(self.pane_visible(name) for name in self.TAB_PANES)
-            or (bool(self._data_tabs) and not self._results_closed)
+            or (any(tab["source"] == self._workspace_key for tab in self._data_tabs.values())
+                and not self._results_closed)
         )
         self.query_one("#output-controls").display = self.query_one("#result-tabs").display
         self.query_one("#function-output").display = self.function_mode
@@ -1053,6 +1097,7 @@ class D8RApp(App):
     def on_resize(self) -> None:
         if self._workspace_ready:
             self.call_after_refresh(self._refresh_splitters)
+            self.call_after_refresh(self._place_history_preview)
 
     @on(PaneSplitter.Changed)
     def _pane_resized(self, event: PaneSplitter.Changed) -> None:
@@ -1254,13 +1299,11 @@ class D8RApp(App):
         source = self.session.source
         target_source = self.session.sources.get(source_id)
         screen = self.screen
-        function_target = self.function_editor.source_id if self.function_mode else None
 
         def valid() -> bool:
             return (not self._closing and generation == self._connection_generation
                     and self.session.source is source and screen.is_mounted
-                    and self.session.sources.get(source_id) is target_source
-                    and (self.function_editor.source_id if self.function_mode else None) == function_target)
+                    and self.session.sources.get(source_id) is target_source)
 
         def completed(built: DataSource) -> None:
             self._connection_progress = None
@@ -1440,7 +1483,8 @@ class D8RApp(App):
         A run replaces the previous run's unpinned tabs; a pinned tab keeps
         its rows across every later run until the user closes it.
         """
-        for tab_id in [key for key, tab in self._data_tabs.items() if not tab["pinned"]]:
+        for tab_id in [key for key, tab in self._data_tabs.items()
+                       if tab["source"] == self._workspace_key and not tab["pinned"]]:
             self._remove_data_tab(tab_id)
         first_new = ""
         for outcome in outcomes:
@@ -1469,10 +1513,19 @@ class D8RApp(App):
         )
         tabs = self.query_one("#result-tabs", TabbedContent)
         last = next(reversed(self._data_tabs), "")
-        self._data_tabs[tab_id] = {"pinned": pinned, "label": label}
+        self._data_tabs[tab_id] = {"pinned": pinned, "label": label, "source": self._workspace_key}
         tabs.add_pane(pane, after=last or "tab-history")
         self.call_after_refresh(table.show_result, outcome)
+        self.call_after_refresh(self._sync_data_tabs)
         return tab_id
+
+    def _sync_data_tabs(self) -> None:
+        tabs = self.query_one("#result-tabs", TabbedContent)
+        for tab_id, tab in self._data_tabs.items():
+            if tab["source"] == self._workspace_key:
+                tabs.show_tab(tab_id)
+            else:
+                tabs.hide_tab(tab_id)
 
     @on(Button.Pressed, "#results-pin")
     def _pin_main_result(self) -> None:
@@ -1550,39 +1603,43 @@ class D8RApp(App):
         if activate and self.select_source(source.id):
             detail = f"{len(source.datasets)} tables" if source.schema_indexed else "ready"
             self._set_status(f"{source.id} added · {detail}")
+        if isinstance(self.screen, SettingsScreen):
+            self.screen._draw()
 
     # -- messages -----------------------------------------------------------
 
 
     @on(Select.Changed, "#source-select")
     def _source_changed(self, event: Select.Changed) -> None:
-        if (self._workspace_ready and isinstance(event.value, str)
-                and event.value == event.select.value and event.value != self.session.active_id):
+        if not self._workspace_ready or event.value != event.select.value:
+            return
+        if event.value is None:
+            self._sync_source_select()
+            self.action_add_source()
+        elif isinstance(event.value, str) and event.value != self.session.active_id:
             self.select_source(event.value)
 
-    def select_source(self, source_id: str) -> bool:
-        """Point the session — and everything rendered from it — at a source.
-
-        One path for the header's select and the Settings menu's Data source
-        rows, so both leave the header, the tree, the dialect and the pill in
-        the same state.
-        """
+    def select_source(self, source_id: str, *, open_function: bool = False) -> bool:
+        """Select the offline workspace first; reconnect without delaying navigation."""
+        key = self.session.source_key(source_id)
+        if key != self._workspace_key:
+            if self.refuse_busy("Change data source"):
+                self._sync_source_select()
+                return False
+            self._cancel_connection()
+            self._prepare_workspace_switch()
+            source_id = self.session.restore_source(key, activate=False)
+            if not self.update_settings(source=source_id):
+                self._sync_source_select()
+                return False
+            self._load_source_workspace()
+            self._set_status(f"{self.session.active_id} workspace restored · nothing executed")
+        if open_function:
+            self._open_fn()
         if not self.session.source_connected(source_id):
             self.reconnect_source(source_id, self._source_added)
-            return False
-        if source_id == self.session.active_id:
+        else:
             self._cancel_connection()
-            return True
-        if self.refuse_busy("Change data source"):
-            self._sync_source_select()
-            return False
-        self._cancel_connection()
-        self._prepare_workspace_switch()
-        if not self.update_settings(source=source_id):
-            self._sync_source_select()
-            return False
-        self._load_source_workspace()
-        self._set_status(f"{self.session.active_id} workspace restored · nothing executed")
         return True
 
     @on(Select.Changed, "#dialect-select")
@@ -1687,6 +1744,65 @@ class D8RApp(App):
             self.session.busy = ""
         if not task.cancelled():
             task.exception()  # Also consume failures after a consumer or the app has closed.
+
+    @on(CommandPalette.HistoryPreviewChanged)
+    def _history_preview_changed(self, event: CommandPalette.HistoryPreviewChanged) -> None:
+        if event.palette is not self.palette:
+            return
+        event.stop()
+        preview = self.query_one("#history-preview", HistoryPreview)
+        preview.document = event.document
+        if event.document is None:
+            preview.display = False
+        else:
+            self._place_history_preview()
+
+    def _place_history_preview(self) -> None:
+        preview = self.query_one("#history-preview", HistoryPreview)
+        palette = self.palette
+        pane = palette.parent
+        if (preview.document is None or self.function_mode or not palette.is_open
+                or not palette.visible or pane is None or preview.parent is None):
+            preview.display = False
+            return
+        bounds = preview.parent.content_region.intersection(self.screen.region)
+        offset = palette.styles.offset
+        left = pane.content_region.x + int(offset.x.value)
+        top = pane.content_region.y + int(offset.y.value)
+        palette_width = int(palette.styles.width.value)
+        palette_height = int(palette.styles.height.value)
+        right = left + palette_width
+        bottom = top + palette_height
+        right_space = bounds.right - right - 1
+        left_space = left - bounds.x - 1
+        if max(right_space, left_space) >= 26:
+            on_right = right_space >= left_space
+            width = min(68, right_space if on_right else left_space)
+            height = min(12, bounds.height)
+            x = right + 1 if on_right else left - width - 1
+            y = max(bounds.y, min(top, bounds.bottom - height))
+        else:
+            # The workbench overlay can extend over results on small terminals;
+            # keeping it outside the offer list preserves both reading surfaces.
+            caret_y = self.editor.cursor_screen_offset.y
+            below_top = max(bottom, caret_y + 1)
+            above_bottom = min(top, caret_y)
+            below = bounds.bottom - below_top
+            above = above_bottom - bounds.y
+            place_below = below >= above
+            width = min(68, bounds.width)
+            height = min(10, below if place_below else above)
+            x = max(bounds.x, min(left, bounds.right - width))
+            y = below_top if place_below else above_bottom - height
+        if width < 8 or height < 4:
+            preview.display = False
+            return
+        preview.styles.offset = (x - preview.parent.content_region.x,
+                                 y - preview.parent.content_region.y)
+        preview.styles.width = width
+        preview.styles.height = height
+        preview.show_document(preview.document, width, height)
+        preview.display = True
 
     @on(CommandPalette.ValuesRequested)
     def _palette_values_requested(self, event: CommandPalette.ValuesRequested) -> None:

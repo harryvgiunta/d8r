@@ -354,6 +354,59 @@ def test_inline_stream_tools_and_apply_only(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_runtime_query_check_leaves_editor_history_and_visible_results_unchanged(monkeypatch):
+    evidence = []
+
+    def provider(request):
+        messages = json.loads(request.content)["messages"]
+        results = [json.loads(message["content"]) for message in messages if message["role"] == "tool"]
+        if not results:
+            call = {"index": 0, "id": "check-query", "type": "function", "function": {
+                "name": "test_query", "arguments": json.dumps({"text": PROPOSAL}),
+            }}
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                                  content=frame({"tool_calls": [call]}) + frame({}, "tool_calls") + b"data: [DONE]\n\n")
+        evidence.extend(results)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
+                              content=completion("The query returned rows."))
+
+    install_provider(monkeypatch, provider)
+
+    async def scenario():
+        session = configured()
+        session.update_settings(ai_test_queries=True)
+        app = D8RApp(session)
+        async with app.run_test(size=(160, 62)) as pilot:
+            app.editor.load_text("\\from users\n\\select user_id\n\\limit 1")
+            app.editor.focus()
+            await pilot.press("ctrl+enter")
+            await app.workers.wait_for_complete()
+            table = app.query_one("#results-table", ResultsTable)
+            visible = (list(table.raw_columns), deepcopy(table.raw_rows), table.result_total)
+            assert list(table.raw_columns) == ["user_id"]
+            assert table.result_total == 1
+            history = list(session.history)
+            editor = app.editor.text
+            pages = deepcopy(session.workspace["pages"])
+            app.action_ai()
+            panel = app.ai_panel
+            panel.query_one("#ai-input", TextArea).load_text("Check the event query without replacing my document.")
+            panel.action_send()
+            await query_chat_finished(panel.chat)
+            await pilot.pause()
+            assert evidence[0]["executed"] is True
+            assert evidence[0]["row_count"] == 2
+            assert evidence[0]["has_rows"] is True
+            assert evidence[0]["columns"] == ["event_type"]
+            assert evidence[0].get("rows") is None
+            assert app.editor.text == editor
+            assert session.workspace["pages"] == pages
+            assert session.history == history
+            assert (list(table.raw_columns), table.raw_rows, table.result_total) == visible
+
+    asyncio.run(scenario())
+
+
 def test_failed_tool_attempts_remain_copyable_without_entering_chat_history(monkeypatch):
     requests = []
     attempted = "\\from events\n\\select date_trunc(timestamp) as unsupported_attempt\n\\select 'test-secret', 'd1-private-token'"
@@ -465,7 +518,11 @@ def test_cancellation_stale_edits_and_source_isolation(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(monkeypatch):
+@pytest.mark.parametrize(("tool_name", "arguments", "permission"), [
+    ("sample_rows", {"table": "events", "limit": 2}, "ai_allow_sample_data"),
+    ("test_query", {"text": PROPOSAL}, "ai_test_queries"),
+])
+def test_cancelled_ai_read_keeps_connection_reserved_until_execution_finishes(monkeypatch, tool_name, arguments, permission):
     from d8r.ai import context as context_module
 
     started = threading.Event()
@@ -480,7 +537,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
 
     def provider(request):
         call = {"index": 0, "id": "sample", "type": "function", "function": {
-            "name": "sample_rows", "arguments": json.dumps({"table": "events", "limit": 2}),
+            "name": tool_name, "arguments": json.dumps(arguments),
         }}
         return httpx.Response(200, headers={"Content-Type": "text/event-stream"},
                              content=frame({"tool_calls": [call]}) + frame({}, "tool_calls") + b"data: [DONE]\n\n")
@@ -490,7 +547,7 @@ def test_cancelled_ai_sample_keeps_connection_reserved_until_execution_finishes(
 
     async def scenario():
         app = D8RApp(configured())
-        app.session.update_settings(ai_allow_sample_data=True)
+        app.session.update_settings(**{permission: True})
         async with app.run_test(size=(160, 62)) as pilot:
             app.editor.load_text(PROPOSAL)
             app.action_ai()
@@ -610,7 +667,7 @@ def test_context_pins_source_bounds_samples_and_never_runs_suggested_text():
         assert fn_context.validate_proposal("\\from events\n\\where event_type = @missing") is not None
         assert fn_context.validate_proposal("\\from events\n\\temp kept") is not None
         assert session.active_id == "mysql"
-        assert len(session.history) == 2
+        assert [entry.source for entry in session.history] == ["mysql"]
         assert "events" in session.sources["demo"].datasets
     asyncio.run(scenario())
 
@@ -654,6 +711,7 @@ def test_complete_function_proposals_reject_invalid_or_conflicting_definitions()
 
 @pytest.mark.parametrize(("action", "setting", "default"), [
     ("ai-sample-data", "ai_allow_sample_data", False),
+    ("ai-test-queries", "ai_test_queries", False),
     ("ai-schema-refreshes", "ai_allow_schema_refreshes", True),
     ("ai-auto-accept", "ai_auto_accept", False),
 ])

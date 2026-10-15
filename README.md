@@ -1,18 +1,22 @@
 # D8R
 
+![D8R workspace showing the schema explorer, a D8R query, and real DuckDB results from the bundled synthetic Parquet data](docs/assets/d8r-workspace.svg)
+
 Pronounced “Datuhr” — a playful take on “data”.
 
 **A keyboard-first IDE for querying data — one document, any datasource, any
 dialect, right in your terminal.**
 
-D8R is a real application, not a mockup. It is a pure-Python
-[Textual](https://textual.textualize.io) TUI: what you type is a document in a
-short `\command` language, that document is parsed into an AST, the AST builds a
-real [ibis](https://ibis-project.org) expression, and the rows you see come from
-real query execution on an in-process DuckDB — or, if you add one, on your own
-Cloudflare D1, Trino, PostgreSQL, or another supported Ibis database. D8R itself
-starts no server and needs no browser. `uv run d8r` is the whole app; remote
-sources require a reachable database and their backend's drivers/runtime.
+Explore local data or query a real database without leaving your terminal.
+D8R combines a schema explorer, saved query workspaces, contextual completion,
+and a results grid with CSV export. Optional AI assistance uses a provider you
+configure; it is not required to load data or run queries.
+
+Built with [Textual](https://textual.textualize.io) and
+[Ibis](https://ibis-project.org): the short `\command` language builds real
+database expressions, not a simulated results view. D8R starts no server and
+needs no browser. `uv run d8r` launches the app; remote databases require their
+own reachable server and backend drivers.
 
 ## The model
 
@@ -42,11 +46,14 @@ document  →  datasource (which schema it points at)  →  dialect (what SQL it
 
 ## Install and run
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git first,
+then run these commands in your terminal:
+
 ```bash
 git clone https://github.com/harryvgiunta/d8r.git
 cd d8r
-uv sync          # create/refresh the project environment (.venv)
-uv run d8r     # launch the IDE
+uv sync       # create/refresh the project environment (.venv)
+uv run d8r    # launch the IDE
 ```
 
 Dependencies are declared in `pyproject.toml` and locked in `uv.lock`; nothing
@@ -57,21 +64,30 @@ the equivalent module form.
 A fresh session opens on the `demo` source with a real query already in the
 editor, so `ctrl+enter` does something true on the very first keystroke.
 
-## The screen
+**Bring your own data:** [open a local Parquet file](#open-a-local-parquet-file)
+or [connect PostgreSQL](#add-a-postgresql-database). Both use the same schema
+explorer, query editor, results grid, and source-specific saved pages.
 
-```
-┌ [ Local demo · DuckDB + Parquet ▾ ]  [ DuckDB ▾ ] ──────────────────────┐
-│ Schema|Pages|agents │ Document                                               │
-│  events  100 rows   │  \from events                                          │
-│   ▸ timestamp       │  \select event_type                                    │
-│   ▸ user_id         │  \select sum(amount) as total                          │
-│  users  25 rows     │  \group event_type                                     │
-│                     ├─ Results │ SQL │ History ──────────────────────────────┤
-│                     │  event_type · string          total · float64          │
-│                     │  click                        …                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-  ctrl+enter run · ctrl+k compile · ctrl+o data source · \ palette · tab accept · ctrl+q quit
-```
+### Running safely on your machine
+
+D8R is a local application, **not a sandbox**. It runs Python and native database
+drivers with your user account's permissions. Use trusted data files, keep the
+environment updated, and run it as a normal user rather than as administrator.
+
+- The bundled demo runs offline. Remote database connections contact the server
+  you choose; optional AI sends context to the provider you configure. Leave AI
+  unconfigured if your queries or schema must stay local.
+- Use a **read-only database role** for review. For remote PostgreSQL, prefer
+  **`verify-full`** with your provider's certificate configuration; the form's
+  default `prefer` does not guarantee encryption or verify the server.
+- Saved passwords/API keys, query history, and AI chats are **plaintext** under
+  `~/.d8r` (or `D8R_DATA_DIR`). Protect that directory and its backups; do not
+  commit them or share exported results. See [Configuration and backups](#configuration-and-backups).
+- Row limits bound returned data, **not query cost**. Large files, joins, and
+  aggregations can still consume substantial memory, CPU, disk, or database
+  resources. Start with small queries and appropriate database-side limits.
+
+## The screen
 
 - **Header** — the datasource and dialect pickers, without a logo or backend banner.
   Switching source restores that source's
@@ -82,7 +98,7 @@ editor, so `ctrl+enter` does something true on the very first keystroke.
   column types. Expand a column to inspect up to 1,000 distinct values, including
   NULL, without changing the document or execution history. Enter on a column
   still inserts its name. PostgreSQL row counts remain unloaded to avoid scans.
-  **Pages** lists editable query drafts across all sources. Its search box filters
+  **Pages** lists editable query drafts only for the selected connection. Its search box filters
   case-insensitively by query text, page name, or description without changing the
   current query. New, Duplicate, Delete and reopening preserve source/dialect and
   chat identity; Delete acts on the highlighted row. Each page shows two lines
@@ -188,17 +204,23 @@ The results pane's independent 10,000-row preview buffer still applies.
 
 The query pages (name/description/document/caret/stable identity/source/dialect), selected
 explorer tab, last workspace or function view, unsaved function draft/target,
-query history, and target-scoped AI chats are autosaved to `workspace.json`. Editing is debounced and the latest widget
-contents are flushed on exit, including an unsent AI message. Function drafts
+query history, and target-scoped AI chats are autosaved to `workspace.json`. Query and function
+editing saves after an idle pause, not during held-key repeats; latest widget contents
+are flushed on exit, including an unsent AI message. Function drafts
 remain drafts: the form's **Save**/**Run preview**, an explicit **Save function** on
 a workspace AI preview proposal, or a user-requested direct save from main chat
 changes the function library. Autosave alone never promotes a draft.
 
-Each source owns its functions, pages and agents under a stable connection identity.
-Switching away flushes current drafts; switching back restores the last page, caret,
-function draft and view without executing anything. A new source starts with an empty
-query page. Reconnecting the same target retains its workspace. Other sources' chats
-and requests remain alive; switching does not mark their hidden replies read.
+Each connection owns its functions, pages, history, completion history and agents under
+a stable identity. Pages search and History never include another connection's entries;
+functions cannot call definitions belonging to another connection. Switching away flushes
+current drafts; switching back restores the last page, caret, function draft and view
+without executing anything. Results, SQL and pinned data tabs remain connection-local
+in memory, and do not persist across restarts. A new connection starts with an empty page.
+Selecting a disconnected connection switches workspaces immediately, before background
+reconnection finishes. Failure or Cancel leaves that workspace selected and editable.
+Reconnecting the same target preserves edits made while connecting. Other connections'
+chats and requests remain alive; switching does not mark their hidden replies read.
 
 Session restoration opens no database connections, runs no queries and sends no
 AI requests. After the UI mounts, only the selected saved target reconnects in
@@ -261,10 +283,25 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
   let the AI read bounded sample records from registered tables.
 - **Allow Schema Refreshes** is on by default. It controls the AI's schema and
   backend-capability lookups, not normal IDE schema indexing.
-  Both permissions save immediately. Disabled tools are withheld from new requests
+  These permissions save immediately. Disabled tools are withheld from new requests
   and denied in existing ones; disabling samples also discards pending sample results.
   Enabling a tool makes it available on the next message. Previously shared context
   remains in chat history; disabling a permission does not erase it.
+- **Test AI Queries** is off by default. Enable it to let the AI test each proposed
+  read-only D8R query against the chat's source, inspect execution failures and
+  bounded row counts, and revise its proposal before replying. Successful checks
+  with zero rows are reported honestly; filters are not loosened just to get data.
+  The IDE reports whether the exact final draft was checked, failed, or remains
+  unchecked, independently of the model's claims. Tests do not edit the document
+  or change the results pane/history. **Allow Sample Data** separately permits
+  sharing up to 20 result columns with the provider; it is not required for
+  execution success/row-count evidence. Checks honor smaller explicit limits,
+  including zero, and cap larger/unlimited queries at **Sample records per read**.
+  This caps returned rows, not scan cost or full-result correctness. Transactions,
+  temp/drop commands, multiple statements, disconnected sources, and checks during
+  an open transaction are refused. Cancel/timeout ends the AI wait, but an already
+  running database read retains its connection reservation until it finishes.
+  Disabling checks rejects pending results; it cannot undo a read already started.
 - **Automatically Apply AI Edits** is off by default. Enabling
   it persists immediately and applies complete, validated proposals only while
   their target draft is unchanged. It never executes queries or saves functions.
@@ -292,7 +329,7 @@ Use HTTPS for remote providers: HTTP sends the key and conversation unencrypted.
 - **New chat** starts another conversation without deleting the current one.
   **[x]** hides the entire AI / Agents pane; Escape in the chat hides just its tab. Drafts are preserved.
 - **Settings** in the shared chat panel opens provider configuration directly and
-  returns to your unsent request. The three permission toggles are in the main Settings menu.
+  returns to your unsent request. Permission toggles are in the main Settings menu.
 - **New chat** preserves previous conversations and lets multiple requests run
   concurrently, even for the same target. **Agents** (`ctrl+j`) opens the right-side
   **Agents** tab, which lists chat history in an oh-my-pi-style roster: coloured
@@ -325,10 +362,11 @@ checked when a query supplies actual arguments. Only the guarded `save_function`
 tool can persist a user-requested
 function definition. Query changes are proposals for manual Apply or opted-in
 automatic application, never a direct mutation tool. Instructions embedded in
-schema, samples, history or function bodies grant no authority. No tool runs
-arbitrary model-generated queries or shell commands, grants general file access,
-or expands the existing network boundaries. Ask for a preview when you want
-suggestions to review before applying or saving.
+schema, samples, history or function bodies grant no authority. Opt-in `test_query`
+executes only bounded read-only D8R queries through the existing Ibis engine. No tool
+runs arbitrary SQL or shell commands, grants general file access,
+or expands the existing network boundaries. Ask for a dry run with no execution for
+offline suggestions to review before applying or saving.
 
 The existing `httpx` dependency handles SSE streaming directly. Transient HTTP
 408/429/5xx and connection failures receive bounded backoff; Settings defaults
@@ -697,6 +735,32 @@ is no network behind them and no credentials. They exist to exercise the seam a
 real connection would use — and, together with the dialect picker, to make the
 point of the product: write one document, then read it back as any vendor's SQL.
 
+## Open a local Parquet file
+
+1. Press **`ctrl+o`** and choose **Local Parquet file · DuckDB** in **Backend**.
+2. Enter the path to an existing **`.parquet` or `.pq`** file. Paths with spaces
+   work; an optional display name labels its workspace.
+3. Choose **Add**. The schema explorer exposes the file as the table **`data`**.
+   **Test connection** checks it without adding a source; Test and Cancel save nothing.
+4. Enter a query and press **`ctrl+enter`** (or **F5**) to review real rows:
+
+   ```d8r
+   \from data
+   \limit 50
+   ```
+
+Use the schema explorer and completion to select columns, filter, or aggregate.
+Results supports selection, copying, and **Export CSV…**; **Pages** keeps query
+drafts for this file separately from other sources.
+
+The file is read through in-process DuckDB/Ibis, not uploaded or copied into the
+repository. Opening discovers column metadata without scanning every row; queries
+read the data they need and never modify the original Parquet file. Only the local
+path and workspace metadata persist. On restart, the selected file reconnects
+without running its saved query. Keep the file at that path; a missing or invalid
+file reports an error rather than falling back to demo data. One file per source;
+this is a local file path, not a remote URL, directory, or glob import.
+
 ## Add Trino or another Ibis database
 
 Press `ctrl+o`, choose **Backend**, fill its connection fields, then **Test
@@ -854,15 +918,15 @@ Press `ctrl+o`, or open Settings (`ctrl+comma`) → **Data source** →
    Cloudflare's compound-SELECT limit; larger schemas are discovered in full.
 
 On later launches, saved D1 profiles remain in the main **datasource dropdown**,
-Settings → **Data source**, and the function editor's source picker, marked
-**disconnected**. Selecting one, or pressing Run with it active, opens the connection
-dialog and immediately connects using its saved credentials. Run then executes
-the submitted query. Startup and merely opening the dropdown do not contact
-Cloudflare. The active source stays unchanged until connection
-succeeds; failure or Cancel leaves the saved choice available for another attempt.
-Once connected, it appears as a normal source, without a duplicate saved entry.
-Reconnecting an unchanged profile does not rewrite its credentials. Connecting
-from the function picker restores that source's workspace and function draft.
+Settings → **Data source**, and the function editor's source picker. Selecting a
+disconnected profile restores its workspace immediately and starts reconnecting with
+compact, cancellable progress. Failure or Cancel keeps that workspace selected;
+use **Reconnect** to retry. Run reconnects if necessary, then executes the captured
+query only against the unchanged target. Startup reconnects only the selected saved
+connection without running its document; merely opening the dropdown does not connect.
+Once connected, the profile appears as a normal source without a duplicate saved entry.
+Reconnecting an unchanged profile does not rewrite its credentials or discard edits
+made during connection. The function picker uses the same workspace transition.
 
 Older profiles without a token open the masked token field without attempting a
 connection. Enter the token and choose **Connect**. You can also use `ctrl+o` →
@@ -870,8 +934,8 @@ connection. Enter the token and choose **Connect**. You can also use `ctrl+o` �
 databases can connect with zero tables; this form connects rather than provisions.
 
 For offline work, enter an existing SQLite database file in **Local snapshot**.
-This overrides the live fields and never syncs with Cloudflare. Snapshot paths
-are not remembered. No bundled snapshot is opened implicitly.
+This overrides the live fields and never syncs with Cloudflare. Workspace source
+references retain the snapshot path. No bundled snapshot is opened implicitly.
 The bundled `d8r/engine/d1/d1.sqlite` is entirely synthetic: three demo
 stations and twelve temperature readings, with no production data or credentials.
 Regenerate it with `uv run python -m d8r.engine.make_data`; the generator
@@ -899,8 +963,8 @@ An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 | File | Saved contents |
 | --- | --- |
 | `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout, sample/schema permissions and automatic draft edits |
-| `memory.json` | Custom functions keyed by stable source identity; D1 profiles and API tokens; PostgreSQL host/port/database/user/schema/TLS profiles and passwords |
-| `workspace.json` | Source-local last page/view/function draft, named pages and carets, query history, target-scoped AI conversations/composer drafts, source references and snapshot paths |
+| `memory.json` | Custom functions keyed by stable source identity; D1 profiles and API tokens; PostgreSQL and generic Ibis backend profiles and credentials |
+| `workspace.json` | Source-local last page/view/function draft, named pages and carets, query history, target-scoped AI conversations/composer drafts, source references and local SQLite/Parquet paths |
 
 These files are versioned, editable JSON. Toggle preferences save immediately;
 the provider and default-row forms require **Save**. Import only fills the
@@ -919,13 +983,22 @@ terminal boot animation on future launches. Table completion inserts aliases
 (`\from projects p`) and column completion uses them (`p.id`). Declared foreign keys
 provide `\join` predicates, including composite keys. IntelliSense uses successful
 source-scoped history to rank equal-quality matches by recency.
-It also offers **whole queries** as you type a matching document prefix. These
-source-local history suggestions show successful-run counts and sort by count,
-then most recent use. Whitespace and case outside quotes are ignored for matching;
-quoted values retain exact case and spacing. Enter, Tab or a click replaces the
-entire document with the selected historical query, without running it; Undo restores
-the prior draft. Whole-query offers appear only at the end of the document, never
-inside function bodies, and respect Escape dismissal and the IntelliSense switch.
+Whole-query **History** suggestions appear only while choosing the first table in
+an opening `\from` or `\open`, below normal table/function completions. Once the
+source is complete, another clause starts, or the caret edits an existing query,
+whole-query recall stays out of IntelliSense; `\history` still opens the History pane.
+These source-local suggestions show successful-run counts and sort by count, then
+most recent use. Whitespace and case outside quotes are ignored for matching;
+quoted identifiers retain exact case and spacing. Highlighting a History offer
+(including with Up/Down) shows a larger read-only multiline preview. It follows the
+highlight without moving focus or changing the draft; long previews indicate clipping.
+Enter, Tab or a click on the offer replaces the entire document without running it;
+Undo restores the prior draft. The first Escape hides History and its preview while
+leaving contextual IntelliSense enabled. A second Escape closes contextual completion.
+History stays dismissed while typing that clause; a fresh `\` or clearing the document
+resets its dismissal. Whole-query offers never appear inside function bodies and
+respect the IntelliSense switch. Space and arrow keys retain their usual editing
+and suggestion-navigation roles.
 
 A `settings.json` example (omitted keys use defaults):
 
@@ -1090,7 +1163,7 @@ The full contract — every command and argument rule, star projections, `over (
 ## Tests
 
 ```bash
-uv run pytest -q                          # 279 tests: the language/engine contract + the TUI end to end
+uv run pytest -q                         # language/engine contract + TUI end to end
 uv run python verify/check_canonical.py   # the language gate — prints MATCH
 ```
 

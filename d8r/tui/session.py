@@ -50,6 +50,7 @@ from d8r.engine import (
 from d8r.engine.connectors import add_backend_source, profile_id, profile_secrets, validate_profile
 from d8r.engine.d1api import schema_connection
 from d8r.engine.expression import source_schemas
+from d8r.engine.parquet import add_parquet_source
 from d8r.query import (
     Capabilities,
     ColumnDef,
@@ -287,12 +288,26 @@ class Session:
         self.workspace = deepcopy(self._workspace.document)
         self.workspace_error = self._workspace.error
         self.workspace["document_id"] = self.workspace["document_id"] or uuid4().hex
-        self.history = [HistoryEntry(**entry) for entry in self.workspace["history"]]
+        self._history = [HistoryEntry(**entry) for entry in self.workspace["history"]]
+        self._source_history: dict[str, list[HistoryEntry]] = {}
+        for entry in self._history:
+            if not entry.target:
+                # Saved identities outrank reusable registry slugs. Ambiguous
+                # legacy rows stay durable but belong to no active workspace.
+                owners = [key for key, saved in self.workspace["sources"].items()
+                          if saved["id"] == entry.source]
+                entry.target = (owners[0] if len(owners) == 1 else
+                                self.source_key(entry.source) if not owners else "")
+            if entry.target:
+                self._source_history.setdefault(entry.target, []).append(entry)
+        self.workspace["history"] = [asdict(entry) for entry in self._history]
         self._completion_usage: dict[str, tuple[int, tuple[TableDef, ...], dict[tuple[str, str, str], int]]] = {}
         if not self.workspace["pages"]:
             seen: set[tuple[str, str, str]] = set()
-            for entry in reversed(self.history):
-                identity = (entry.doc, entry.target or entry.source, entry.dialect)
+            for entry in reversed(self._history):
+                if not entry.target:
+                    continue
+                identity = (entry.doc, entry.target, entry.dialect)
                 if identity in seen or identity == (
                     self.workspace["document"], self.workspace["source"], self.workspace["dialect"],
                 ):
@@ -306,8 +321,8 @@ class Session:
             self.restore_source(self.workspace["source"], self.workspace["dialect"] or None)
         else:
             selected = settings["source"]
-            if (selected in self.sources or self.saved_source_profile(selected) is not None
-                    or selected in self.workspace["sources"]):
+            if (selected in self.sources or any(self.source_key(name) == selected for name in self.sources)
+                    or self.saved_source_profile(selected) is not None or selected in self.workspace["sources"]):
                 self.restore_source(selected, settings["dialect"])
             else:
                 self.refresh_schema()
@@ -338,6 +353,19 @@ class Session:
         selected_workspace = source_workspaces[self.workspace["source"]]
         self.workspace["function_draft"] = deepcopy(selected_workspace["function_draft"])
         self.workspace["active_view"] = selected_workspace["active_view"]
+
+    @property
+    def history(self) -> list[HistoryEntry]:
+        """Newest-first history for the active connection, including target scopes."""
+        return self.history_for()
+
+    def history_for(self, source_id: str | None = None) -> list[HistoryEntry]:
+        """Read one stable target's history without switching the active source."""
+        key = self.source_key(source_id)
+        history = self._source_history.get(key)
+        if history is None:
+            history = self._source_history[key] = []
+        return history
 
     @property
     def fns(self) -> dict[str, FnDef]:
@@ -383,6 +411,11 @@ class Session:
         return self._settings.document["ai_allow_schema_refreshes"]
 
     @property
+    def ai_test_queries(self) -> bool:
+        """Whether AI tools may execute bounded, read-only query checks."""
+        return self._settings.document["ai_test_queries"]
+
+    @property
     def entry_screen(self) -> bool:
         """Whether startup plays the optional terminal entry animation."""
         return self._settings.document["entry_screen"]
@@ -399,6 +432,7 @@ class Session:
         default_rows: int | None = None, ai_auto_accept: bool | None = None,
         ai_allow_sample_data: bool | None = None,
         ai_allow_schema_refreshes: bool | None = None,
+        ai_test_queries: bool | None = None,
         pane_sizes: dict[str, int] | None = None,
         value_cache_enabled: bool | None = None,
         value_cache_limit: int | None = None,
@@ -426,8 +460,7 @@ class Session:
                 raise ValueError("The selected data source is not registered.")
             if dialect is None:
                 dialect = self.remembered_dialect(self.sources[source])
-            selected = self.sources[source]
-            document["source"] = self.source_key(source) if selected.kind == "ibis" else source
+            document["source"] = self.source_key(source)
         if dialect is not None:
             document["dialect"] = dialect
             remembered_key = self.source_key(source) if source is not None else self.source_key()
@@ -443,6 +476,8 @@ class Session:
             document["ai_allow_sample_data"] = ai_allow_sample_data
         if ai_allow_schema_refreshes is not None:
             document["ai_allow_schema_refreshes"] = ai_allow_schema_refreshes
+        if ai_test_queries is not None:
+            document["ai_test_queries"] = ai_test_queries
         if value_cache_enabled is not None:
             document["value_cache_enabled"] = value_cache_enabled
         if value_cache_limit is not None:
@@ -511,7 +546,7 @@ class Session:
                 if source.con is not None:
                     sources[self.source_key(source.id)] = {
                         "id": source.id, "display": source.display, "kind": source.kind,
-                        "path": str(source.dir.expanduser().resolve()) if source.kind == "d1" else "",
+                        "path": str(source.dir.expanduser().resolve()) if source.kind in {"d1", "parquet"} else "",
                     }
             document["sources"] = sources
             self.workspace = document
@@ -552,9 +587,10 @@ class Session:
 
     def _record_history(self, entry: HistoryEntry, outcome: RunOutcome) -> None:
         with self._workspace_lock:
-            self.history.insert(0, entry)
+            self._history.insert(0, entry)
+            self.history_for(entry.target).insert(0, entry)
             try:
-                self.save_workspace(history=[asdict(item) for item in self.history])
+                self.save_workspace(history=[asdict(item) for item in self._history])
             except ValueError as exc:
                 # The query already ran. A disk error must not suggest a retry
                 # of potentially stateful work or throw away its result.
@@ -572,7 +608,7 @@ class Session:
         source = self.sources.get(source_id)
         if source is not None and source.connection_key:
             return source.connection_key
-        if source is None or source.con is None:
+        if source is None:
             return source_id
         if source.d1 is not None:
             return f"saved-d1:{source.d1.account_id}:{source.d1.database_uuid.lower()}"
@@ -592,6 +628,7 @@ class Session:
 
     def restore_source(self, key: str, dialect: str | None = None, *, activate: bool = True) -> str:
         """Restore target identity, never open a snapshot or contact a service."""
+        key = self.source_key(key)
         source_id = next((name for name in self.sources if self.source_key(name) == key), None)
         if source_id is None:
             saved = self.workspace["sources"].get(key, {})
@@ -604,8 +641,9 @@ class Session:
             source_id = key
             self.sources[key] = DataSource(
                 id=key, display=f"{label} · disconnected", doc="Reconnect explicitly to use this target.",
-                kind="disconnected", dialect=backend or dialect or ("postgres" if key.startswith("saved-postgres:") else "sqlite"),
-                dir=Path(saved.get("path") or "."), connection_key=key if backend else "",
+                kind="disconnected", dialect=backend or dialect or ("duckdb" if saved.get("kind") == "parquet" else
+                                                                  "postgres" if key.startswith("saved-postgres:") else "sqlite"),
+                dir=Path(saved.get("path") or "."), connection_key=key,
             )
         if activate:
             self.set_active(source_id)
@@ -702,6 +740,9 @@ class Session:
     def saved_source_profile(self, source_id: str) -> dict | None:
         """Resolve a saved picker entry without connecting or changing schemas."""
         source_id = self.source_key(source_id)
+        saved = self.workspace["sources"].get(source_id)
+        if saved and saved["kind"] == "parquet" and saved["path"]:
+            return {"kind": "parquet", "path": saved["path"], "display": saved["display"]}
         backend = next((profile for profile in self.backend_profiles
                         if profile_id(profile) == source_id), None)
         if backend is not None:
@@ -734,7 +775,7 @@ class Session:
         ] + [
             (f"{source['display']} · disconnected", key)
             for key, source in self.workspace["sources"].items()
-            if source["kind"] == "d1" and key not in registered
+            if source["kind"] in {"d1", "parquet"} and key not in registered
         ]
 
     def set_active(self, source_id: str) -> None:
@@ -776,6 +817,10 @@ class Session:
             previous = self.sources.get(source.id)
             if previous is not None and previous is not source:
                 self.clear_value_cache(source.id)
+                if previous.kind == "parquet" and previous.con is not None:
+                    previous.con.disconnect()
+                    self.tx.pop(source.id, None)
+                    self._dropped.pop(source.id, None)
             self.sources[source.id] = source
         if activate:
             self.set_active(source.id)
@@ -891,11 +936,20 @@ class Session:
         ctes = [(cte.name, "cte") for cte in parse_query(doc, schema=schema).with_]
         return [*ctes, *datasets]
 
-    def table_insert(self, doc: str, name: str, *, schema: SchemaContext | None = None) -> str:
-        """A selected table gets a short, collision-free document identifier."""
+    def table_identifiers(self, doc: str, *, schema: SchemaContext | None = None) -> set[str]:
+        """Names already occupied by document aliases and registered relations."""
         schema = self.schema if schema is None else schema
         taken = {table.identifier.lower() for table in self.open_tables(doc, schema=schema)}
         taken.update(relation_basename(table.name).lower() for table in schema.tables)
+        return taken
+
+    def table_insert(
+        self, doc: str, name: str, *, schema: SchemaContext | None = None,
+        taken: set[str] | None = None,
+    ) -> str:
+        """A selected table gets a short, collision-free document identifier."""
+        if taken is None:
+            taken = self.table_identifiers(doc, schema=schema)
         base = relation_basename(name)[0].lower()
         if not re.fullmatch(r"[a-z_]", base):
             base = "t"
@@ -958,8 +1012,6 @@ class Session:
                         collect(value, opened, rank)
 
         for rank, entry in enumerate(self.history):
-            if (entry.target and entry.target != target) or (not entry.target and entry.source != self.active_id):
-                continue
             ast = parse_query(entry.doc, settled=True)
             collect(ast.to_json(), [], rank)
             for command in re.findall(r"(?m)^\s*\\([A-Za-z_][A-Za-z0-9_]*)", entry.doc):
@@ -1175,6 +1227,10 @@ class Session:
         """Build (not register) a local D1/SQLite snapshot source."""
         hint = display or Path(path).stem
         return add_sqlite_source(self.next_source_id(hint or "snapshot"), path, display or None)
+
+    def build_parquet_source(self, path: str, display: str = "") -> DataSource:
+        """Build a lazy local source without registering or persisting anything."""
+        return add_parquet_source(path, display)
 
     def build_live_source(
         self,

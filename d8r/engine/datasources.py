@@ -316,7 +316,7 @@ def capabilities_for(source: "DataSource") -> dict:
             },
         }
     caps = {**CAPABILITIES, "backend": f"{source.dialect} (mock)"}
-    if source.kind == "demo":
+    if source.kind in {"demo", "parquet"}:
         caps = CAPABILITIES
     elif source.kind == "d1":
         caps = {
@@ -596,7 +596,7 @@ class DataSource:
     id: str
     display: str
     doc: str
-    kind: str  # "demo" | "mock" | "d1" | "d1-live" | "postgres-live" | "ibis" | "disconnected"
+    kind: str  # "demo" | "mock" | "parquet" | "d1" | "d1-live" | "postgres-live" | "ibis" | "disconnected"
     dialect: str  # suggested default compile dialect
     dir: Path
     con: object = field(default=None, repr=False)

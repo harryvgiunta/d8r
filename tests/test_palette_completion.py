@@ -312,6 +312,41 @@ def test_tab_advances_from_command_to_table_and_closes_completed_fields():
     asyncio.run(scenario())
 
 
+def test_accept_uses_the_highlight_after_an_unprocessed_edit():
+    async def scenario():
+        app = D8RApp()
+        async with app.run_test(size=(120, 42)) as pilot:
+            app.editor.load_text("\\from ")
+            app.editor.move_cursor((0, len(app.editor.text)))
+            app.editor.focus()
+            await pilot.pause()
+            app.palette.highlighted = app.palette.view.labels.index("users")
+
+            # Typing narrows two rows to one before the editor's Changed and
+            # SelectionChanged messages reach the palette. Tab must consume
+            # the new highlight, not the former second row's stale index.
+            app.editor.insert("u")
+            assert app.palette.accept_highlighted()
+            assert app.editor.text.split()[:2] == ["\\from", "users"]
+            await pilot.pause()
+            assert not app.palette.is_open
+
+            await pilot.press(*(["backspace"] * (len(app.editor.text) - len("\\from users"))))
+            assert "users" in app.palette.view.labels
+            await pilot.press("escape", "backspace")
+            await pilot.pause()
+            assert not app.palette.is_open
+            await pilot.press("escape")
+            assert "users" in app.palette.view.labels
+            app.editor.move_cursor((0, 3))
+            await pilot.pause()
+            assert "\\from" in app.palette.view.labels
+            await pilot.press("tab")
+            assert app.editor.text.startswith("\\from ")
+
+    asyncio.run(scenario())
+
+
 def test_popup_fits_rendered_caret_after_wrapping_resizing_and_scrolling():
     async def scenario():
         app = D8RApp()

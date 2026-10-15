@@ -1216,10 +1216,15 @@ typed, inserted from the schema tree, or **accepted** — recomputes the view, s
 an accept lands in the offers the same characters typed by hand would have
 produced and a clause jump shows the offers at the line it lands on. A bare
 caret move only carries an already-open popup along; it never summons one, so
-the arrows stay the document's own. Escape toggles the popup — shut while
-typing continues, open again on the next Escape — and its dismissal silences
-the whole popup; a fresh `\` (or that second Escape) is what brings it back. The
-Settings menu's Intellisense switch is the hard off: nothing opens while it is
+the arrows stay the document's own. Whole-query History offers are confined to
+the opening `\from`/`\open` table choice, below contextual completions; a completed
+source or another clause suppresses them. Highlighting History opens a passive
+multiline preview, never an editor update. With History visible, Escape hides only
+those offers and their preview, leaving contextual completion enabled. Otherwise
+Escape toggles the popup — shut while typing continues, open again on the next
+Escape. History's separate dismissal lasts until a fresh `\` or an empty document;
+a fresh `\` also lifts the contextual popup's dismissal.
+The Settings menu's Intellisense switch is the hard off: nothing opens while it is
 off, and `ctrl+comma` opens Settings without the palette. A `\where` value
 search reads the whole distinct pool the session fetched per column
 (`VALUE_POOL_LIMIT`), showing at most `VALUE_SUGGESTIONS` matches.

@@ -39,13 +39,16 @@ def test_pages_preserve_drafts_carets_names_and_offline_targets(tmp_path, monkey
             app.editor.load_text("\\from private_table\n\\where unfinished")
             app.editor.move_cursor((1, 9))
             # No debounce pause: switching must snapshot the latest widget text.
+            app.select_source("demo")
             app.open_page(first_id)
             await pilot.pause()
             assert app.editor.text == "\\from users\n\\select user_id"
             assert app.editor.cursor_location == (1, 8)
             assert app.session.source_key() == "demo"
             assert app.query_one("#page-name", Input).value == "Customer exploration"
-            app.open_page(second_id)
+            app.select_source(target)
+            await pilot.pause()
+            await pilot.press("escape")
             app.exit()
 
     asyncio.run(edit())
@@ -66,7 +69,8 @@ def test_pages_preserve_drafts_carets_names_and_offline_targets(tmp_path, monkey
             assert restored.session.source_key() == target
             assert not restored.session.source_connected()
             assert restored.query_one("#explorer-tabs", TabbedContent).active == "tab-pages"
-            assert restored.query_one("#pages-list", OptionList).option_count == 2
+            assert restored.query_one("#pages-list", OptionList).option_count == 1
+            restored.select_source("demo")
             restored.open_page(first_id)
             assert restored.editor.text == "\\from users\n\\select user_id"
             assert restored._document_identity == first_id
