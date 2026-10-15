@@ -20,6 +20,7 @@ from threading import RLock
 from uuid import uuid4
 
 from d8r.ai.client import AIConfig
+from d8r.credentials import CredentialError
 
 from d8r.engine import (
     D1Error,
@@ -230,6 +231,13 @@ class TxState:
 # ---------------------------------------------------------------------------
 
 
+class _MissingAIConfig(AIConfig):
+    """Keep provider metadata editable while rejecting every network request."""
+
+    def validate(self) -> None:
+        raise CredentialError("The saved AI API key is unavailable. Unlock the OS vault or re-enter it in Settings → AI provider.")
+
+
 class Session:
     """The app's state: which source is live, what dialect, what has run.
 
@@ -270,6 +278,9 @@ class Session:
         self.d1_profiles: list[dict[str, str]] = self._memory.document["d1_profiles"]
         self.postgres_profiles: list[dict[str, str]] = self._memory.document["postgres_profiles"]
         self.backend_profiles: list[dict] = self._memory.document["backend_profiles"]
+        self._session_only: dict[str, set[str]] = {
+            "d1_profiles": set(), "postgres_profiles": set(), "backend_profiles": set(),
+        }
         self._settings = SettingsStore(self._memory.path.parent)
         settings = self._settings.document
         if settings["source"] in self.sources:
@@ -282,7 +293,8 @@ class Session:
         self.value_cache_limit: int = settings["value_cache_limit"]
         self.pane_visibility: dict[str, bool] = dict(settings["panes"])
         self.pane_sizes: dict[str, int] = dict(settings["pane_sizes"])
-        self.ai_config = AIConfig(**settings["ai"])
+        self.ai_credentials_missing = self._settings.ai_credentials_missing
+        self.ai_config = (_MissingAIConfig if self.ai_credentials_missing else AIConfig)(**settings["ai"])
         self._workspace = WorkspaceStore(self._memory.path.parent)
         self._workspace_lock = RLock()
         self.workspace = deepcopy(self._workspace.document)
@@ -382,7 +394,7 @@ class Session:
 
     @property
     def storage_path(self) -> Path:
-        """The local JSON file containing functions and saved database credentials."""
+        """The local JSON file containing functions and public connection metadata."""
         return self._memory.path
 
     @property
@@ -394,6 +406,13 @@ class Session:
     def memory_error(self) -> str:
         """An actionable startup read error, or an empty string."""
         return "\n".join(error for error in (self._memory.error, self._settings.error, self.workspace_error) if error)
+
+    @property
+    def credential_warning(self) -> str:
+        """Sanitized migration, unavailable-vault, and cleanup status."""
+        return "\n".join(dict.fromkeys(warning for warning in (
+            self._memory.credential_warning, self._settings.credential_warning,
+        ) if warning))
 
     @property
     def ai_auto_accept(self) -> bool:
@@ -438,6 +457,7 @@ class Session:
         value_cache_limit: int | None = None,
         entry_screen: bool | None = None,
         theme: str | None = None,
+        persist_ai: bool = True,
     ) -> None:
         """Save explicit preference changes before applying them to the session.
 
@@ -467,7 +487,12 @@ class Session:
             remembered = {**document["source_dialects"], remembered_key: dialect}
             document["source_dialects"] = remembered
         if ai is not None:
-            document["ai"] = asdict(ai)
+            if any((ai.base_url, ai.model, ai.api_key)):
+                ai.validate()
+            else:
+                ai.validate_limits()
+            if persist_ai:
+                document["ai"] = asdict(ai)
         if default_rows is not None:
             document["default_rows"] = default_rows
         if ai_auto_accept is not None:
@@ -484,7 +509,8 @@ class Session:
             document["value_cache_limit"] = value_cache_limit
         if source is not None:
             self._persist_legacy_function_sources()
-        self._settings.save(document)
+        if ai is None or persist_ai or document != self._settings.document:
+            self._settings.save(document, replace_ai=ai is not None and persist_ai)
         self.source_dialects = dict(self._settings.document["source_dialects"])
         with self._value_cache_lock:
             enabled = self._settings.document["value_cache_enabled"]
@@ -504,6 +530,7 @@ class Session:
             self.dialect = dialect
         if ai is not None:
             self.ai_config = ai
+            self.ai_credentials_missing = False
         if default_rows is not None:
             self.default_rows = default_rows
 
@@ -663,61 +690,75 @@ class Session:
         if isinstance(functions, list) and functions:
             self._save_memory(self.fns, self.d1_profiles)
 
+    def _profile_identity(self, group: str, profile: dict) -> str:
+        if group == "d1_profiles":
+            return self._profile_id(profile)
+        if group == "postgres_profiles":
+            return self._postgres_profile_id(profile)
+        return profile_id(profile)
+
     def _save_memory(self, fns: dict[str, FnDef], profiles: list[dict[str, str]],
                      postgres_profiles: list[dict[str, str]] | None = None,
-                     backend_profiles: list[dict] | None = None) -> None:
+                     backend_profiles: list[dict] | None = None,
+                     *, persistent: tuple[str, str] | None = None) -> None:
         functions = {**self._source_functions, self.source_key(): fns}
+        supplied = {"d1_profiles": profiles,
+                    "postgres_profiles": self.postgres_profiles if postgres_profiles is None else postgres_profiles,
+                    "backend_profiles": self.backend_profiles if backend_profiles is None else backend_profiles}
+        durable = {}
+        for group, items in supplied.items():
+            saved = {self._profile_identity(group, profile): profile for profile in self._memory.document[group]}
+            durable[group] = []
+            for profile in items:
+                identity = self._profile_identity(group, profile)
+                if identity in self._session_only[group] and persistent != (group, identity):
+                    if identity in saved:
+                        durable[group].append(saved[identity])
+                else:
+                    durable[group].append(profile)
         self._memory.save({key: [
             {"name": fn.name, "params": list(fn.params), "body": fn.body, "description": fn.doc}
             for fn in definitions.values()
-        ] for key, definitions in functions.items()}, profiles,
-            self.postgres_profiles if postgres_profiles is None else postgres_profiles,
-            self.backend_profiles if backend_profiles is None else backend_profiles)
+        ] for key, definitions in functions.items()}, durable["d1_profiles"],
+            durable["postgres_profiles"], durable["backend_profiles"])
+
+    def _remember_profile(self, group: str, profile: dict, *, persist: bool) -> None:
+        profile = self._memory.validate_profile(group, profile)
+        identity = self._profile_identity(group, profile)
+        profiles = list(getattr(self, group))
+        for index, saved in enumerate(profiles):
+            if self._profile_identity(group, saved) == identity:
+                profiles[index] = profile
+                break
+        else:
+            profiles.append(profile)
+        if persist:
+            supplied = {"profiles": self.d1_profiles, "postgres_profiles": self.postgres_profiles,
+                        "backend_profiles": self.backend_profiles}
+            supplied["profiles" if group == "d1_profiles" else group] = profiles
+            self._save_memory(self.fns, **supplied, persistent=(group, identity))
+            self._session_only[group].discard(identity)
+        else:
+            self._session_only[group].add(identity)
+        setattr(self, group, profiles)
 
     def remember_d1(
-        self, account_id: str, database: str, display: str, api_token: str = "",
+        self, account_id: str, database: str, display: str, api_token: str = "", *, persist: bool = True,
     ) -> None:
-        """Persist connection identifiers and the explicitly supplied API token."""
-        profile = {"account_id": account_id, "database": database, "display": display,
-                   "api_token": api_token}
-        profiles = list(self.d1_profiles)
-        for index, saved in enumerate(profiles):
-            if saved["account_id"] == account_id and saved["database"] == database:
-                profiles[index] = profile
-                break
-        else:
-            profiles.append(profile)
-        self._save_memory(self.fns, profiles)
-        self.d1_profiles = profiles
+        """Remember explicit credentials durably, or only for this session."""
+        self._remember_profile("d1_profiles", {
+            "account_id": account_id, "database": database, "display": display, "api_token": api_token,
+        }, persist=persist)
 
-    def remember_postgres(self, profile: dict[str, str]) -> None:
-        """Save credentials only following explicit Add; failure keeps prior state."""
+    def remember_postgres(self, profile: dict[str, str], *, persist: bool = True) -> None:
+        """Remember credentials only after Add; failed saves preserve prior state."""
         profile = {key: value for key, value in profile.items() if key != "kind"}
         profile["port"] = str(int(profile["port"]))
-        identity = self._postgres_profile_id(profile)
-        profiles = list(self.postgres_profiles)
-        for index, saved in enumerate(profiles):
-            if self._postgres_profile_id(saved) == identity:
-                profiles[index] = dict(profile)
-                break
-        else:
-            profiles.append(dict(profile))
-        self._save_memory(self.fns, self.d1_profiles, profiles)
-        self.postgres_profiles = profiles
+        self._remember_profile("postgres_profiles", profile, persist=persist)
 
-    def remember_backend(self, profile: dict) -> None:
-        """Save a normalized profile only after Add, without sharing nested options."""
-        profile = validate_profile(profile)
-        identity = profile_id(profile)
-        profiles = list(self.backend_profiles)
-        for index, saved in enumerate(profiles):
-            if profile_id(saved) == identity:
-                profiles[index] = profile
-                break
-        else:
-            profiles.append(profile)
-        self._save_memory(self.fns, self.d1_profiles, backend_profiles=profiles)
-        self.backend_profiles = profiles
+    def remember_backend(self, profile: dict, *, persist: bool = True) -> None:
+        """Remember a normalized profile without sharing nested options."""
+        self._remember_profile("backend_profiles", validate_profile(profile), persist=persist)
 
     @staticmethod
     def _postgres_profile_id(profile: dict[str, str]) -> str:

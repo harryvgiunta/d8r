@@ -1,13 +1,14 @@
-"""Local credential/settings storage with atomic writes and stale-session protection.
+"""Atomic metadata/settings storage; credentials live only in the OS vault.
 
 New directories and files are owner-only on POSIX; Windows uses filesystem ACLs.
-JSON files (and their backups) contain plaintext credentials.
+Legacy plaintext files migrate only after every credential has been secured.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 import tempfile
@@ -15,8 +16,9 @@ import time
 from uuid import UUID
 
 from d8r.ai.client import AIConfig
+from d8r.credentials import CredentialError, CredentialVault
 from d8r.engine.datasources import DIALECT_BY_NAME
-from d8r.engine.connectors import profile_id, validate_profile
+from d8r.engine.connectors import BACKENDS, profile_id, validate_profile
 from d8r.themes import DEFAULT_THEME, THEMES
 
 # How long a lock or temp file may exist before it is assumed to belong to a
@@ -219,6 +221,80 @@ def _settings(value: object) -> dict:
     return document
 
 
+def _reference(value: object) -> None:
+    if value is not None:
+        _text(value, "credential reference", nonempty=True)
+
+
+def _backend_metadata(profile: dict) -> dict:
+    public = {field.name for field in BACKENDS[profile["backend"]].fields if not field.secret}
+    return {"backend": profile["backend"], "display": profile["display"],
+            "options": {key: value for key, value in profile["options"].items() if key in public},
+            "connection_id": profile_id(profile)}
+
+
+def _memory_document(value: object) -> dict:
+    if not isinstance(value, dict) or value.get("version") != 2:
+        return _validate(value)
+    document = _record(value, {"version", "functions", "d1_profiles", "postgres_profiles", "backend_profiles"}, "memory")
+    if type(document["version"]) is not int:
+        raise ValueError("invalid memory version")
+    legacy = {**document, "version": 1, "backend_profiles": []}
+    for group, secret in (("d1_profiles", "api_token"), ("postgres_profiles", "password")):
+        if not isinstance(document[group], list):
+            raise ValueError("invalid saved profiles")
+        legacy[group] = []
+        for profile in document[group]:
+            if not isinstance(profile, dict) or "credential_ref" not in profile or secret in profile:
+                raise ValueError("invalid credential metadata")
+            _reference(profile["credential_ref"])
+            legacy[group].append({**{key: value for key, value in profile.items() if key != "credential_ref"}, secret: ""})
+    _validate(legacy)
+    if not isinstance(document["backend_profiles"], list):
+        raise ValueError("invalid backend profiles")
+    identities = set()
+    for profile in document["backend_profiles"]:
+        _record(profile, {"backend", "display", "options", "connection_id", "credential_ref"}, "backend metadata")
+        backend = profile["backend"]
+        if not isinstance(backend, str) or backend not in BACKENDS:
+            raise ValueError("invalid saved backend")
+        _text(profile["display"], "backend display")
+        _reference(profile["credential_ref"])
+        identity = profile["connection_id"]
+        if not isinstance(identity, str) or len(identity) != 64 or any(c not in "0123456789abcdef" for c in identity):
+            raise ValueError("invalid backend identity")
+        if identity in identities:
+            raise ValueError("duplicate backend profile")
+        identities.add(identity)
+        public = {field.name for field in BACKENDS[backend].fields if not field.secret}
+        options = profile["options"]
+        if not isinstance(options, dict) or not options.keys() <= public:
+            raise ValueError("invalid public connection options")
+        if any(not isinstance(item, (str, int, bool)) for item in options.values()):
+            raise ValueError("invalid public connection option")
+        if any(field.required and field.name not in options for field in BACKENDS[backend].fields):
+            raise ValueError("missing public connection option")
+    return deepcopy(document)
+
+
+def _settings_document(value: object) -> dict:
+    if not isinstance(value, dict) or value.get("version") != 2:
+        return _settings(value)
+    if type(value["version"]) is not int:
+        raise ValueError("invalid settings version")
+    ai = value.get("ai")
+    if not isinstance(ai, dict) or "api_key_ref" not in ai or "api_key" in ai:
+        raise ValueError("invalid AI credential metadata")
+    _reference(ai["api_key_ref"])
+    document = _settings({**value, "version": 1, "ai": {
+        **{key: item for key, item in ai.items() if key != "api_key_ref"}, "api_key": "",
+    }})
+    document["version"] = 2
+    document["ai"].pop("api_key")
+    document["ai"]["api_key_ref"] = ai["api_key_ref"]
+    return document
+
+
 class _JSONStore:
     """One loaded snapshot; errors preserve the file and block unsafe writes."""
 
@@ -349,30 +425,251 @@ class _JSONStore:
         self.document = document
 
 
-class MemoryStore(_JSONStore):
-    """Durable function definitions and saved database credentials (schema v1)."""
+class _CredentialStore(_JSONStore):
+    """Keep the validated disk snapshot separate from hydrated runtime values."""
+
+    _missing_warning = "Saved credentials are unavailable in the OS credential vault. Unlock the vault or re-enter credentials; affected connections are blocked. Metadata and references are preserved."
+
+    def _credential_state(self) -> None:
+        self._vault = CredentialVault(self.path.parent)
+        self._disk = deepcopy(self.document)
+        self._secret_values: dict[str, str] = {}
+        self.credential_warning = ""
+
+    def _warn(self, message: str) -> None:
+        if message not in self.credential_warning:
+            self.credential_warning = "\n".join(filter(None, (self.credential_warning, message)))
+
+    def _missing(self) -> None:
+        self._warn(self._missing_warning)
+
+    def _clear_missing(self) -> None:
+        self.credential_warning = "\n".join(
+            line for line in self.credential_warning.splitlines() if line != self._missing_warning
+        )
+
+    def _get(self, reference: str | None) -> str | None:
+        if reference is None:
+            return None
+        try:
+            value = self._vault.get(reference)
+        except CredentialError:
+            value = None
+        if value is None:
+            self._missing()
+        else:
+            self._secret_values[reference] = value
+        return value
+
+    def _discard(self, references: set[str]) -> None:
+        for reference in references:
+            try:
+                self._vault.delete(reference)
+            except CredentialError:
+                self._warn("An unused credential could not be removed from the OS vault. The committed file and its credentials remain valid.")
+            self._secret_values.pop(reference, None)
+
+    def _reference_for(self, payload: str | None, previous: str | None, created: set[str]) -> str | None:
+        # An explicit empty secret is keyless authentication, not a lost entry.
+        # Persist null so local/passwordless targets need no credential service.
+        if payload is None or payload == "":
+            return None
+        if previous is not None and previous in self._secret_values and self._secret_values[previous] == payload:
+            return previous
+        reference = self._vault.put(payload)
+        created.add(reference)
+        self._secret_values[reference] = payload
+        return reference
+
+    @staticmethod
+    def _references(document: dict) -> set[str]:
+        if document["version"] != 2:
+            return set()
+        if "ai" in document:
+            reference = document["ai"]["api_key_ref"]
+            return {reference} if reference is not None else set()
+        return {profile["credential_ref"] for group in ("d1_profiles", "postgres_profiles", "backend_profiles")
+                for profile in document[group] if profile["credential_ref"] is not None}
+
+    def _commit(self, disk: dict, runtime: dict) -> None:
+        previous = self._references(self._disk)
+        self._save(disk)
+        self._disk = self.document
+        self.document = deepcopy(runtime)
+        self._discard(previous - self._references(self._disk))
+
+    def _migrate(self, save) -> None:
+        try:
+            save()
+        except ValueError:
+            self._warn("Legacy credentials could not be moved to the OS vault. The original plaintext file is unchanged; unlock the vault and restart, or use session-only credentials. Existing external backups may also contain plaintext credentials.")
+        else:
+            self._warn("Legacy credentials were moved to the OS vault. Existing external backups may still contain plaintext credentials; remove or protect those backups yourself.")
+
+
+class MemoryStore(_CredentialStore):
+    """Functions and public connection metadata, with immutable vault references."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
         super().__init__(data_dir, "memory", {
-            "version": 1, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": [],
-        }, _validate)
+            "version": 2, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": [],
+        }, _memory_document)
+        self._credential_state()
+        if self.error:
+            return
+        if self.document["version"] == 1:
+            original = json.loads(self._snapshot) if self._snapshot else {}
+            has_credentials = (any("api_token" in profile for profile in original.get("d1_profiles", []))
+                               or bool(original.get("postgres_profiles")) or bool(original.get("backend_profiles")))
+            if has_credentials:
+                self._migrate(lambda: self.save(self.document["functions"], self.document["d1_profiles"]))
+            return
+        runtime = {**deepcopy(self.document), "version": 1}
+        for group, secret in (("d1_profiles", "api_token"), ("postgres_profiles", "password"), ("backend_profiles", None)):
+            profiles = []
+            for stored in self._disk[group]:
+                reference = stored["credential_ref"]
+                value = self._get(reference)
+                profile = {key: deepcopy(item) for key, item in stored.items() if key != "credential_ref"}
+                missing = reference is not None and value is None
+                if secret is not None:
+                    profile[secret] = value if value is not None else ""
+                elif not missing:
+                    try:
+                        hidden = json.loads(value, object_pairs_hook=_object, parse_constant=_constant) if value is not None else {}
+                        if not isinstance(hidden, dict) or hidden.keys() & profile["options"].keys():
+                            raise ValueError("invalid saved options")
+                        hydrated = validate_profile({"backend": profile["backend"], "display": profile["display"],
+                                                     "options": {**profile["options"], **hidden}})
+                        if _backend_metadata(hydrated) != profile:
+                            raise ValueError("saved connection identity mismatch")
+                        profile = hydrated
+                    except (ValueError, TypeError, RecursionError):
+                        missing = True
+                if missing:
+                    profile["credentials_missing"] = True
+                    self._missing()
+                profiles.append(profile)
+            runtime[group] = profiles
+        self.document = runtime
+
+    @staticmethod
+    def _identity(group: str, profile: dict):
+        if group == "d1_profiles":
+            return profile["account_id"], profile["database"].lower()
+        if group == "postgres_profiles":
+            return tuple(profile[key] for key in ("host", "port", "database", "user", "schema", "sslmode"))
+        return profile.get("connection_id") or profile_id(profile)
+
+    @staticmethod
+    def validate_profile(group: str, profile: dict) -> dict:
+        document = {"version": 1, "functions": {}, "d1_profiles": [], "postgres_profiles": [], "backend_profiles": []}
+        document[group] = [profile]
+        return _validate(document)[group][0]
 
     def save(self, functions: dict[str, list[dict]], profiles: list[dict[str, str]],
              postgres_profiles: list[dict[str, str]] | None = None,
              backend_profiles: list[dict] | None = None) -> None:
-        self._save({"version": 1, "functions": functions, "d1_profiles": profiles,
+        if self.error:
+            raise ValueError(self.error)
+        supplied = {"d1_profiles": profiles,
                     "postgres_profiles": self.document["postgres_profiles"] if postgres_profiles is None else postgres_profiles,
-                    "backend_profiles": self.document["backend_profiles"] if backend_profiles is None else backend_profiles})
+                    "backend_profiles": self.document["backend_profiles"] if backend_profiles is None else backend_profiles}
+        # Validate the entire proposed document before writing any vault entries.
+        complete = {}
+        for group, items in supplied.items():
+            if not isinstance(items, list):
+                raise ValueError("invalid saved profiles")
+            complete[group] = []
+            for profile in items:
+                if isinstance(profile, dict) and profile.get("credentials_missing"):
+                    if profile not in self.document[group]:
+                        raise CredentialError("Re-enter missing credentials before changing this connection.")
+                else:
+                    complete[group].append(profile)
+        normalized = _validate({"version": 1, "functions": functions, **complete})
+        runtime = {"version": 1, "functions": normalized["functions"]}
+        disk = {"version": 2, "functions": normalized["functions"]}
+        pending = []
+        for group, items in supplied.items():
+            old = {self._identity(group, profile): profile for profile in self._disk[group]}
+            valid = iter(normalized[group])
+            runtime[group], disk[group] = [], []
+            for profile in items:
+                missing = profile.get("credentials_missing", False)
+                profile = deepcopy(profile) if missing else next(valid)
+                previous = old.get(self._identity(group, profile), {})
+                if missing:
+                    metadata = deepcopy(previous)
+                elif group == "backend_profiles":
+                    metadata = _backend_metadata(profile)
+                    hidden = {key: value for key, value in profile["options"].items() if key not in metadata["options"]}
+                    payload = json.dumps(hidden, sort_keys=True, ensure_ascii=False, separators=(",", ":")) if hidden else None
+                else:
+                    secret = "api_token" if group == "d1_profiles" else "password"
+                    metadata = {key: value for key, value in profile.items() if key != secret}
+                    payload = profile[secret]
+                if not missing:
+                    metadata["credential_ref"] = None
+                    pending.append((metadata, payload, previous.get("credential_ref")))
+                disk[group].append(metadata)
+                runtime[group].append(profile)
+        _memory_document(disk)
+        created: set[str] = set()
+        try:
+            for metadata, payload, previous in pending:
+                metadata["credential_ref"] = self._reference_for(payload, previous, created)
+            self._commit(disk, runtime)
+        except Exception:
+            self._discard(created)
+            raise
+        if not any(profile.get("credentials_missing") for group in supplied for profile in runtime[group]):
+            self._clear_missing()
 
 
-class SettingsStore(_JSONStore):
-    """Editable app/AI preferences (settings schema v1), with safe snapshot saves."""
+class SettingsStore(_CredentialStore):
+    """Editable preferences; provider API keys never enter the JSON snapshot."""
 
     def __init__(self, data_dir: Path | None = None) -> None:
-        super().__init__(data_dir, "settings", _settings({}), _settings)
+        super().__init__(data_dir, "settings", _settings({}), _settings_document)
+        self._credential_state()
+        self.ai_credentials_missing = False
+        if self.error:
+            return
+        if self.document["version"] == 1:
+            if self._snapshot is not None and any(self.document["ai"][key] for key in ("base_url", "model", "api_key")):
+                self._migrate(lambda: self.save(self.document))
+            return
+        reference = self.document["ai"]["api_key_ref"]
+        value = self._get(reference)
+        self.ai_credentials_missing = reference is not None and value is None
+        ai = {key: item for key, item in self.document["ai"].items() if key != "api_key_ref"}
+        self.document = {**self.document, "version": 1, "ai": {**ai, "api_key": value if value is not None else ""}}
 
-    def save(self, document: dict) -> None:
-        self._save(document)
+    def save(self, document: dict, *, replace_ai: bool = False) -> None:
+        if self.error:
+            raise ValueError(self.error)
+        runtime = _settings(document)
+        ai = runtime["ai"]
+        unchanged = not replace_ai and ai == self.document["ai"] and self._disk["version"] == 2
+        public = {key: value for key, value in ai.items() if key != "api_key"}
+        disk = {**runtime, "version": 2, "ai": {**public, "api_key_ref": None}}
+        created: set[str] = set()
+        try:
+            if unchanged:
+                disk["ai"]["api_key_ref"] = self._disk["ai"]["api_key_ref"]
+            elif ai["base_url"] or ai["model"] or ai["api_key"]:
+                previous = self._disk["ai"].get("api_key_ref") if public == {
+                    key: value for key, value in self._disk["ai"].items() if key not in {"api_key_ref", "api_key"}
+                } else None
+                disk["ai"]["api_key_ref"] = self._reference_for(ai["api_key"], previous, created)
+            self._commit(disk, runtime)
+        except Exception:
+            self._discard(created)
+            raise
+        if not unchanged:
+            self.ai_credentials_missing = False
+            self._clear_missing()
 
 
 def _cursor(value: object) -> None:

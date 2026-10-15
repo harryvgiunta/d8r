@@ -51,8 +51,10 @@ retains exact catalog/schema in Ibis handles and never counts table rows.
 Trino/SQLite drivers join DuckDB/PostgreSQL in core dependencies; other backends
 have named optional extras and explicit native/runtime requirements. An absent
 driver or incompatible runtime is an error, never a silent fallback.
-Generic `backend_profiles` in `memory.json` contain backend/options/display;
-only Add saves. Passwords and advanced JSON options are masked. Connection keys
+Generic `backend_profiles` in `memory.json` contain public metadata, original
+connection identity and opaque credential references. Masked fields and all advanced
+options live in the system keyring; only Add with Remember enabled saves them.
+Remember off selects session-only use. Passwords and advanced JSON options are masked. Connection keys
 are opaque hashes excluding secrets/display but retaining target/principal
 identity. Workspace state never stores generic credential options. Startup,
 selection and Run use the existing bounded cancellable reconnect path. Driver
@@ -87,7 +89,7 @@ ibis tables carrying the D1 database's real schemas and compile to SQLite SQL
 exactly like every other source; only the execution seam differs — the compiled
 SQLite SQL is POSTed to D1's `/query`|`/raw` endpoints instead of run on a local
 connection (`execute_remote` in `d8r/engine/execute.py`). The client uses the
-token per request; explicit **Add** saves it locally for reuse. Tokens are never
+token per request; explicit **Add** with Remember enabled saves it in the system keyring for reuse. Tokens are never
 logged or rendered unmasked (the modal's API-token input is `password=True`,
 and the built source never renders it). Startup reconnects only the selected saved source.
 Live D1 connects with a lightweight authenticated probe, not full schema discovery.
@@ -108,7 +110,8 @@ schema and SSL mode. It discovers accessible user schemas' tables/views together
 without row-count scans or extension installation. The selected schema remains
 the default for bare table names; qualified and quoted schema prefixes complete
 across schemas without network I/O while typing. Test/Cancel save nothing; Add
-saves PostgreSQL profiles and passwords in `memory.json`. Passwords are masked,
+saves public PostgreSQL profiles in `memory.json` and passwords in the system keyring
+when Remember is enabled; otherwise the connection is session-only. Passwords are masked,
 preserved verbatim and never logged. Saved targets restore disconnected; explicit
 selection or workspace Run reconnects. Run reuses saved PostgreSQL/D1 credentials
 or a SQLite snapshot path through compact nonmodal connection progress, then executes the captured
@@ -130,20 +133,36 @@ volume; its password lives in gitignored `.env.postgres`. This authorizes no
 other database/network backend, server, login system or arbitrary SQL execution.
 
 **User-authorized exception — local configuration.** `d8r/storage.py` stores
-custom functions (name, ordered parameters, body, description) and D1 profiles
-(account ID, resolved database UUID, display label, API token) in `memory.json`.
-`settings.json` stores Intellisense, the optional entry screen (off by default),
-pane visibility, selected source/dialect, default returned rows, and AI provider URL/model/API key/tool-round/call/sample
-limits/attempts/timeout. Configuration files are editable JSON under
-`~/.d8r` on every platform; `D8R_DATA_DIR` overrides that home, and explicit
-`Session(data_dir=...)` wins. Settings displays the resolved settings path.
-These files and backups contain plaintext secrets: protect them. New directories
-and files use owner-only POSIX modes; Windows relies on filesystem ACLs.
+custom functions (name, ordered parameters, body, description) and public database
+profile metadata plus opaque credential references in version-2 `memory.json`.
+Version-2 `settings.json` stores preferences, provider URL/model/limits, and an
+`api_key_ref`, never the API key. `d8r/credentials.py` delegates secret storage to
+the maintained Python `keyring` library. Library discovery selects native Windows
+Credential Manager, macOS Keychain, or Linux Secret Service/KWallet; D8R refuses
+null, plaintext and arbitrary third-party backends. No custom cryptography/vault.
+Credentials include D1 tokens, PostgreSQL passwords, AI API keys, and generic
+secret fields plus ALL advanced options. Immutable UUID refs are scoped to the
+canonical data directory. New values are written and read-back-verified before
+atomic JSON replacement; stale/failed writes cannot overwrite old secrets.
+Superseded entries are deleted only after commit; cleanup failures are warnings.
+Legacy plaintext files validate completely, then migrate without plaintext backups.
+Failed migration retains original bytes and warns that plaintext remains; existing
+external backups/snapshots are not erased. Missing/locked vaults preserve valid
+metadata/functions/references but block connecting or AI requests with missing
+credentials. Unrelated saves reuse unchanged refs without keyring access.
+Forms offer explicit Remember-off session-only use; later preference/function
+saves never persist those secrets. Native OS entry-size limits apply; errors never
+fall back to plaintext. Copying JSON to a different home/account/machine does not
+transfer secrets. Linux requires an unlocked native service/D-Bus session; KWallet
+may need system dbus-python. Configuration lives under `~/.d8r`; `D8R_DATA_DIR`
+overrides it and explicit `Session(data_dir=...)` wins. Settings shows the path.
+Metadata, queries/chats and backups remain sensitive plaintext; protect them.
+New directories/files use owner-only POSIX modes; Windows uses filesystem ACLs.
 `Session` loads configuration without network or schema-dependent function-body validation.
 Function Save/Run preview and Delete persist definitions immediately, as do
 explicit user-requested workspace AI saves through `save_function` and manual
 **Save function** on preview proposals. Query/function-form AI Apply and ordinary
-edits autosave drafts only. D1 Add saves credentials; Test and Cancel do not.
+edits autosave drafts only. Remembered D1 Add saves credentials in the keyring; Test and Cancel do not.
 Saved profiles fill the masked token; legacy token-free profiles still load.
 Toggle preferences save on change; AI provider and default-row forms require explicit Save.
 Import only fills the form. Unavailable workspace targets restore as disconnected,
@@ -153,7 +172,8 @@ and stale-session detection protect all local files; a lock or
 temp file left by a crashed save clears itself after a minute. Invalid/unreadable
 files remain untouched, surface a safe UI error, and block saves to that file
 until recovery and restart. External file edits require restart. Tests isolate
-the home per test. Runtime result buffers, transactions, and temporary tables never persist.
+both the data home and credential backend per test; only explicit isolated runtime
+smokes touch the native OS store. Runtime results, transactions, and temp tables never persist.
 
 **User-authorized exception — durable workspace and history.** `workspace.json`
 autosaves query pages (name/description/document/caret/stable identity/source/dialect), the
@@ -161,8 +181,8 @@ active document and Schema/Pages explorer tab, last workspace/function view,
 unsaved function draft and target, successful query history, and independently
 identified, target-scoped AI chats/composer drafts/statuses. `\pages`/`\queries`
 reveal or toggle Pages; page switches save drafts without connecting or executing. Source
-references include local snapshot paths; credentials remain in their existing
-settings/memory files. Chats can contain schema, sampled data and sensitive drafts;
+references include local snapshot paths; credential values live in the system
+keyring, with references only in settings/memory. Chats can contain schema, sampled data and sensitive drafts;
 workspace files and backups are plaintext. Query/function autosaves wait for an idle pause,
 using one pending timer during held-key repeats; switches and exit flush latest widgets.
 Session-owned writes merge under an RLock and reuse atomic

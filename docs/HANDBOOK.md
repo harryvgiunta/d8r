@@ -99,8 +99,8 @@ see `tests/test_tui.py::test_the_tui_reaches_no_http_server`):
 | Schema snapshot (tables, capabilities, column pool, functions) | `Session.refresh_schema()` | none — rebuilt per source connection |
 | Transactions, temp tables | `Session.tx` → `d8r/engine/tx.py` | none — per connection, in memory |
 | Result buffers, history rows | `Session` | history *commands* persist; rows do not |
-| Custom functions, database profiles + credentials | `d8r/storage.py` | `memory.json`, plaintext — protect it |
-| App/AI settings | `d8r/storage.py` | `settings.json`, plaintext secrets |
+| Custom functions and public database profiles | `d8r/storage.py` | `memory.json`; secret values live in the native OS keyring |
+| App/AI settings | `d8r/storage.py` | `settings.json`; opaque API-key reference, never the key |
 | AI conversations per target | workspace snapshot | `workspace.json`, plaintext drafts |
 
 Hard boundaries that are *design*, not omission (see AGENTS.md and the gap
@@ -569,8 +569,9 @@ or any of the other advertised Ibis backend types through `connectors.py`.
 The generic Add Source form is driven by `BACKENDS`, with backend-specific fields
 and masked advanced JSON options. Its Test/Add/Cancel and saved-target lifecycle
 reuse the existing connection ownership/deadline guards. `backend_profiles` in
-`memory.json` store only backend/options/display; opaque `connection_key` values
-identify workspace/history targets without copying credentials. Password changes
+`memory.json` store backend/display, nonsecret declared fields, the original opaque
+connection identity, and a credential reference; masked fields and all advanced
+options live in the native OS keyring. Password changes
 retain identity; principal and namespace changes do not. Driver/runtime extras,
 Trino authentication examples and platform prerequisites are in the README's
 **Add Trino or another Ibis database** section. Discovery lists the selected
@@ -1895,8 +1896,8 @@ Worth stating explicitly because it fixes where each responsibility lives:
 - The Engine layer owns connections, dialects, compilation, execution, row
   conversion, and connection-level statements. It never truncates, never caches,
   never decides what the pane shows.
-- The AI & Storage layer persists D1 and PostgreSQL profiles (including tokens and
-  passwords, locally and in plaintext as authorized), validates them, and reuses
+- The AI & Storage layer validates database profiles, stores public metadata in JSON
+  and secrets through `d8r/credentials.py` into the native OS keyring, and reuses
   this module's `DIALECT_BY_NAME` to validate a saved dialect.
 - The AI layer calls `execute`/`execute_remote`/`capabilities_for` directly for its
   read-only `sample_rows` and `schema` tools, passing the same `tables` map, and it
@@ -2046,12 +2047,14 @@ Ordering matters, and it is what makes a session always parseable:
 
 ### 1.7 Paths and error surface
 
-- `storage_path` → the local JSON holding functions and saved database credentials.
+- `storage_path` → the local JSON holding functions and public database profile metadata/references.
 - `settings_path` → the editable JSON of preferences + AI configuration.
 - `workspace_path` → the autosaved draft/history file.
 - `memory_error` — newline-join of the memory, settings, and workspace read errors;
   `""` when all three read cleanly. `D8RApp.on_mount` turns it into a status line and
   an error notification.
+- `credential_warning` reports migration, missing-vault and cleanup issues separately
+  from malformed files. Missing secrets never discard otherwise-valid configuration.
 
 ### 1.8 `update_settings(**changes)`
 
@@ -2199,12 +2202,11 @@ Every mutation that changes tables or functions ends in this call.
   id hint has the password replaced by `"redacted"` when non-empty, so a secret can
   never reach a slug.
 
-`remember_d1(account_id, database, display, api_token="")` and
-`remember_postgres(profile)` upsert into `d1_profiles` / `postgres_profiles` and
-persist through `_save_memory` (Postgres port normalised to `int`→`str`;
-`kind` stripped). Both are called **only** from an explicit `Add`.
-`_save_memory` writes `{name, params, body, description}` per function plus both
-profile lists.
+`remember_d1`, `remember_postgres` and `remember_backend` upsert profiles after an
+explicit Add. Their `persist=False` path retains credentials for this session only;
+subsequent function saves cannot promote them to durable storage. The durable path
+writes metadata/references before replacing the live saved profile. PostgreSQL ports
+are normalized to strings; generic profile identities survive unavailable vaults.
 
 ### 1.15 Statements the query cannot carry
 
@@ -3349,10 +3351,10 @@ Per-category descriptions and the hint line:
 | ai | Select any value to edit your OpenAI-compatible provider. Changes are saved only when you choose Save in the editor. | `enter / click edit` |
 | keys | Keyboard shortcuts from the running app. This reference is read-only. | `read-only reference` |
 
-Every description additionally appends the settings file path and the warning
-`"Settings and connection backups contain plaintext API keys and D1 tokens. Keep them
-private."` The bottom hint is
-`"↑↓ navigate · {action} · tab switch panel · esc back / close"`.
+Descriptions append the settings file path and explain that remembered secrets use
+the system keyring while workspace files/backups remain sensitive plaintext. Credential
+warnings remain visible rather than being mislabeled as corrupt JSON. The bottom hint
+is `↑↓ navigate · {action} · tab switch panel · esc back / close`.
 
 ### 5.2 Navigation and acting
 
@@ -3555,8 +3557,8 @@ private copies of both profile lists, `_reconnect_fields`, `_shown_backend`.
 
 Title is contextual: `Reconnect local SQLite snapshot` (snapshot mode),
 `Connect saved data source` (profile mode), else `Add a data source`. The note under it
-states that Add saves credentials locally in plaintext, that backups should stay
-private, and that **Test and Cancel save nothing**.
+states that remembered credentials use the system keyring, not JSON; disabling
+Remember selects session-only use. **Test and Cancel save nothing**.
 
 - `#source-backend` — `Cloudflare D1 / local SQLite snapshot` (`d1`) or `PostgreSQL`
   (`postgres`); default `postgres` when reconnecting a Postgres profile, else `d1`.
@@ -3866,10 +3868,9 @@ AI provider screen (`d8r/tui/settings.py:438`). Its rules, verbatim from `d8r/ai
 5. On success return `AIConfig(base_url="https://yolo-auto.com/v1", model="yolo", api_key=key)`
    — the limits come from the dataclass defaults (`3 / 60.0 / 10 / 16 / 5`).
 
-**Import never writes anything.** `d8r/tui/settings.py:_import_ai` copies the three values into
-the form fields and prints `"Imported into this form only; Save persists these settings and the
-API key."` Nothing reaches `settings.json` until **Save** is pressed, and the module docstring is
-explicit: *"Optional, explicit import of the user's yolo provider key; never write it."*
+**Import never writes anything.** `_import_ai` fills the provider form only.
+Explicit Save stores the API key in the native keyring when Remember is enabled;
+with Remember off, the provider configuration is used only for this session.
 
 #### 1.3 The AI provider screen (`AIProviderScreen`, `d8r/tui/settings.py:352`)
 
@@ -3882,6 +3883,7 @@ Reached from **Settings → AI provider** (any row's editor) or from the panel's
 | Base URL | `ai-base-url` | placeholder `https://yolo-auto.com/v1`; label says "including /v1, or full /chat/completions URL" |
 | Model | `ai-model` | placeholder `yolo` |
 | API key | `ai-api-key` | `Input(password=True)` — masked echo |
+| Remember provider/key | `ai-remember-credentials` | enabled: metadata in JSON/key in OS vault; disabled: whole provider config is session-only |
 | AI turns/tool rounds (1–50) | `ai-tool-rounds` | integer; note explains rounds count model context batches, not chat messages, and that one final answer is requested with tools disabled after the budget |
 | Tool calls per round (1–16) | `ai-tool-calls` | integer; note: schema/sample/history/validation reads count as calls and may share a round |
 | Sample records per read (1–100) | `ai-sample-rows` | integer |
@@ -3895,15 +3897,12 @@ Two failure tiers on Save: a `ValueError` while coercing the numeric fields yiel
 `"Enter whole numbers for attempts, tool rounds, tool calls and sample records, and a number for
 the timeout."` and returns; then `config.validate()` followed by
 `session.update_settings(ai=config)` — any `ValueError` message (from either) is shown in place.
-Success dismisses the screen. The header text states the persistence contract:
-`"Save writes provider settings and the API key to <settings_path>. Settings and connection
-backups contain plaintext secrets; keep them private. Completed chats and drafts are saved
-locally. Sending a message shares the document and requested schema, samples and history with
-this provider. Use HTTPS for remote providers."`
-
-The Settings menu itself never displays a key: the AI rows show `"configured"` / `"not set"`
-for the API key (`d8r/tui/settings.py:198`), and the screen footer warns
-*"Settings and connection backups contain plaintext API keys and D1 tokens. Keep them private."*
+Success dismisses the screen. A keyring failure leaves the form open with safe,
+actionable guidance; users may unlock/configure their vault or explicitly choose
+session-only use. The notice explains that secrets use the keyring while chats/drafts
+remain plaintext and that sending a request shares permitted context with the provider.
+The Settings menu shows key status, never the key itself. An unavailable referenced
+key blocks provider requests; it is not silently treated as an unauthenticated provider.
 
 #### 1.4 `Session.update_settings` — persist first, apply second
 
@@ -3914,7 +3913,9 @@ explicitly named keyword arguments (`intellisense`, `panes` merged into the exis
 the registry raises `"The selected data source is not registered."`; omitting `dialect` with a
 `source` fills it from `default_dialect(source)`. Because the write happens first, a failed save
 leaves both the live session and the saved file untouched — there is no partially applied state.
-`asdict(ai)` is what puts `api_key` in plaintext JSON (see §6.6).
+`asdict(ai)` is runtime-only input: storage replaces the API key with an opaque reference
+before writing JSON. `persist_ai=False` changes only the session's AI configuration;
+later ordinary preference saves keep the previously persisted provider untouched.
 
 ---
 
@@ -4464,9 +4465,9 @@ successful provider reply into a failed request.
 
 ### 6. Local persistence — `d8r/storage.py`
 
-Module docstring: *"Local credential/settings storage with atomic writes and stale-session
-protection. New directories and files are owner-only on POSIX; Windows uses filesystem ACLs.
-JSON files (and their backups) contain plaintext credentials."*
+Local metadata/settings keep atomic writes and stale-session protection. New files
+and directories are owner-only on POSIX; Windows uses filesystem ACLs. Credentials
+are stored separately through Python `keyring`; JSON contains opaque references.
 
 #### 6.1 Where the files live
 
@@ -4516,6 +4517,10 @@ not** discard the file:
 overwrites a file it could not understand. `Session.memory_error` joins the memory, settings and
 workspace errors; `D8RApp.on_mount` puts it in the status bar and raises one
 `Saved data could not be loaded` error notification.
+
+Keyring availability is a separate state, not a JSON validation failure. A missing
+entry or locked/unavailable vault preserves functions, public profile metadata and
+references, but blocks connecting with incomplete credentials. See §6.5–6.6.
 
 #### 6.3 The atomic save — `_save()`
 
@@ -4568,97 +4573,56 @@ a minute is debris, not an in-flight save.
 older than `_STALE_SECONDS` — orphans of crashed saves — while deliberately leaving fresh temp
 files (a save in flight, ours or another instance's) alone. Directory-read `OSError` is ignored.
 
-#### 6.5 `memory.json` — definitions and credentials (schema v1)
+#### 6.5 `memory.json` — definitions and credential references (schema v2)
 
-`MemoryStore(data_dir=None)`; default
-`{"version": 1, "functions": [], "d1_profiles": [], "postgres_profiles": []}`; validator `_validate`.
-`save(functions, profiles, postgres_profiles=None)` writes
-`{"version": 1, "functions": ..., "d1_profiles": ..., "postgres_profiles": ...}` where `None` means
-"keep what is currently loaded" — so a D1-only save cannot erase PostgreSQL profiles.
+`MemoryStore` stores source-scoped function definitions, D1/PostgreSQL/generic profile
+metadata, and opaque native-keyring references. Runtime profiles are hydrated for
+existing engine callers; no secret-bearing runtime dictionary is serialized directly.
 
-Document keys — **exactly** `{version, functions, d1_profiles, postgres_profiles}` (`_record`
-rejects both missing and extra keys), except that a dict missing `postgres_profiles` is filled in
-for backward compatibility.
+| Profile | JSON metadata | Native keyring value |
+| --- | --- | --- |
+| D1 | account ID, database UUID, display, `credential_ref` | API token |
+| PostgreSQL | host, port, database, user, schema, SSL mode, display, `credential_ref` | password |
+| Generic Ibis | backend, display, nonsecret declared options, stable `connection_id`, `credential_ref` | secret fields and all advanced options as JSON |
 
-| Key | Rule |
-| --- | --- |
-| `version` | true `int`, must equal `1`; else `unsupported memory version (expected 1)` |
-| `functions` | list of records with **exactly** `{name, params, body, description}` |
-| `functions[].name` | non-empty string, unique across the list (`duplicate function name`) |
-| `functions[].params` | ordered list of non-empty unique strings (`function parameter`, `duplicate function parameter`) |
-| `functions[].body` | string (may be empty) — never parsed or executed at load time |
-| `functions[].description` | string (may be empty) |
-| `d1_profiles` | list; each record has **either** `{account_id, database, display}` **or** `{account_id, database, display, api_token}` — no other shape |
-| `d1_profiles[].account_id` | non-empty string |
-| `d1_profiles[].database` | non-empty string that **must parse as a UUID** (`D1 profile database must be a resolved database UUID`) |
-| `d1_profiles[].display` | non-empty string |
-| `d1_profiles[].api_token` | optional; string, may be empty. On success the returned document normalises every profile to include `api_token` (filled `""`) |
-| *(identity)* | `(account_id, UUID(database))` must be unique → `duplicate D1 profile` |
-| `postgres_profiles` | list; each record has **exactly** `{host, port, database, user, password, schema, sslmode, display}`, all strings |
-| `postgres_profiles[].host`, `database`, `user`, `schema`, `sslmode`, `display` | non-empty |
-| `postgres_profiles[].password` | string, may be empty (the only non-empty-exempt field) |
-| `postgres_profiles[].port` | stored as a **string**; must be ASCII digits and `1 … 65535` (`PostgreSQL port must be between 1 and 65535`) |
-| `postgres_profiles[].sslmode` | one of `disable, allow, prefer, require, verify-ca, verify-full` |
-| *(identity)* | `(host, port, database, user, schema, sslmode)` unique → `duplicate PostgreSQL profile` |
+Native entries are scoped to the canonical data directory. Each changed secret gets
+a fresh immutable reference and exact read-back verification before JSON replacement.
+A stale writer or failed file commit cleans up only that attempt's new entries, never
+an existing snapshot's credentials. Superseded entries are retired only after a
+successful commit; cleanup failure is a warning, not a failed save.
 
-The docstring is explicit that structure is validated but *"never parse/execute bodies against the
-active schema"* — `Session.__init__` therefore restores every saved function even while an
-unrelated source is active.
+Legacy version-1 documents are fully validated before migration. Successful migration
+replaces secret fields atomically with references, without creating plaintext backups.
+If vault or file operations fail, the original file remains intact and a warning says
+plaintext still remains. Invalid legacy files are preserved under the existing error
+rules. External backups and filesystem snapshots are not rewritten or securely erased.
 
-Write triggers (all through `Session._save_memory`, which writes **before** mutating live state, so
-a failed save leaves the registry untouched): `save_fn`, `delete_fn`, `remember_d1` (upsert by
-`(account_id, database)`, persisting an explicitly supplied `api_token`), and
-`remember_postgres` (upsert by profile id, after dropping the `kind` field and normalising
-`port` to `str(int(port))`, and only following an explicit **Add** in the Add-source modal).
+Missing referenced secrets preserve public metadata, function definitions and target
+identity. Unrelated saves retain references without reading or rewriting the vault;
+incomplete authentication never falls back to empty-password or ambient credentials.
+Explicit session-only profiles remain memory-only even during later function saves.
 
-#### 6.6 `settings.json` — editable preferences (schema v1)
+#### 6.6 `settings.json` — editable preferences (schema v2)
 
-`SettingsStore(data_dir=None)`; defaults and validator are both `_settings`; `save(document)` is a
-thin pass-through.
+Normal preferences retain their validated types/ranges: booleans for pane/AI/cache
+switches, known theme/dialect names, bounded integer dimensions/default rows/cache
+limits, and the existing AI request/tool/sample limits. Unknown keys are rejected;
+omitted supported fields use defaults. Workspace JSON remains schema v1.
 
-Defaults:
+Provider settings retain URL, model and limits, but the on-disk AI record has
+`api_key_ref`, not `api_key`. The key is resolved from the native store into the
+runtime `AIConfig`. A missing referenced key blocks validation/request dispatch with
+credential guidance; it is distinct from a deliberately keyless local provider.
+An intentionally empty key/password uses a null reference and does not access the
+vault, so passwordless targets and keyless local providers still work headlessly.
+Legacy `api_key` values migrate using the same verified-write/atomic-replace rules
+as database profiles.
 
-```python
-{"version": 1, "intellisense": True, "entry_screen": False,
- "panes": {"results": True, "sql": True, "history": True, "schema": True,
-           "agents": True, "ai": False},
- "source": "demo", "dialect": "duckdb", "default_rows": 50,
- "value_cache_enabled": True, "value_cache_limit": 1000,
- "ai_auto_accept": False,
- "ai": asdict(AIConfig())}
-```
-
-Validation is *fill-and-refuse-aliases*: the stored keys must be a **subset** of the default keys
-(`invalid settings fields`), then `defaults | value` fills omissions; the same subset rule applies
-recursively to `panes` and `ai` (`invalid {field} settings fields`). Unknown or legacy key names are
-therefore rejected, not quietly retained.
-
-| Key | Rule |
-| --- | --- |
-| `version` | true `int`, exactly `1` |
-| `intellisense` | true `bool` |
-| `entry_screen` | true `bool`, defaults to false |
-| `panes.results`, `panes.sql`, `panes.history`, `panes.schema`, `panes.agents`, `panes.ai` | each a true `bool` (`pane visibility must be a boolean`); agents defaults to visible, AI to hidden |
-| `source` | non-empty string (the active source id; must exist in the registry to be *applied*, validated at `update_settings`) |
-| `dialect` | non-empty string **and** a member of `DIALECT_BY_NAME` (`unsupported dialect`) |
-| `default_rows` | true `int`, `0 … 1_000_000`; `0` disables the implicit cap (`Default rows returned must be an integer between 0 and 1000000 (0 disables the default.)`) |
-| `value_cache_enabled` | true `bool`; persist the preference, never the cached values |
-| `value_cache_limit` | true `int`, 1 … 10,000; maximum distinct values retained/displayed per column |
-| `ai_auto_accept` | true `bool`; explicit opt-in to validated editor updates, never execution or function Save |
-| `ai.base_url`, `ai.model`, `ai.api_key` | strings (may be empty) |
-| `ai.max_attempts`, `ai.max_tool_rounds`, `ai.max_tool_calls`, `ai.sample_rows` | ints per §1.1 |
-| `ai.timeout` | positive finite number ≤ 300 |
-
-If **any** of `base_url`, `model`, `api_key` is non-empty the whole `AIConfig` is validated with
-`validate()` (so URL/model/key rules apply); with all three empty only `validate_limits()` runs —
-limits are always enforced, even for an unconfigured provider. `asdict(AIConfig())` is the on-disk
-shape, which is precisely how `api_key` lands in plaintext JSON.
-
-Write triggers: `Session.update_settings` only (§1.4) — i.e. explicit user actions: the Intellisense
-toggle, Auto accept AI updates toggle, pane-visibility toggles (`\results`, `\sql`, `\history`, `\schema`), source/dialect
-selection, the Default-rows screen's **Save**, and the AI provider screen's **Save**. Temporary
-source contexts (`target_source`) and unsaved provider forms never write. `D8RApp.update_settings`
-wraps it, reporting `Settings could not be saved` without changing the workspace.
+Only explicit provider Save changes the durable provider. With Remember disabled,
+`Session.update_settings(ai=..., persist_ai=False)` replaces runtime configuration
+without changing saved provider settings; unrelated preference saves cannot persist
+that session-only key. Import/Cancel never save. Vault failures leave the form usable
+for retry or explicit session-only operation, without a plaintext fallback.
 
 #### 6.7 `workspace.json` — autosaved drafts and histories (schema v1)
 
@@ -4801,27 +4765,28 @@ explicit focus/name/body were requested).
 
 ---
 
-### 7. Secrets & safety — where plaintext lives, and what is masked
+### 7. Secrets & safety — native keyring and plaintext boundaries
 
-Enumerated from the code, not from policy:
+`d8r/credentials.py` is a small adapter to [`keyring`](https://github.com/jaraco/keyring).
+The library handles discovery and OS APIs; D8R accepts only its built-in native
+Windows Credential Manager, macOS Keychain and Linux Secret Service/KWallet stores.
+If a library chain contains third-party backends, D8R uses only its highest-priority
+native member, never a plaintext fallback. There is no custom encryption, master
+password file, or installed `keyrings.alt` backend.
 
-**Plaintext on disk (unencrypted; protection is filesystem ownership, plus the warnings):**
+| Location | Contents/protection |
+| --- | --- |
+| Native OS credential store | AI key, D1 token, PostgreSQL password, generic secret/advanced options; OS-managed protection |
+| `memory.json` / `settings.json` | Public metadata, functions/preferences and opaque references; plaintext, owner permissions |
+| `workspace.json`, exported CSVs, old backups | Potentially sensitive queries/chats/data; not encrypted by the credential feature |
+| New atomic JSON temp files | Secret-free metadata/references, never hydrated credential values |
 
-| Location | Secret | Written by |
-| --- | --- | --- |
-| `settings.json` → `ai.api_key` | AI provider bearer token | `Session.update_settings(ai=…)` via `asdict(AIConfig)` |
-| `memory.json` → `d1_profiles[].api_token` | Cloudflare D1 API token (optional; only when the user typed one) | `remember_d1` |
-| `memory.json` → `postgres_profiles[].password` | PostgreSQL password | `remember_postgres` |
-| `.lock` / `.tmp` artefacts | none of their own, but a temp copy of the above exists briefly mid-save | `_save` |
-
-Mitigations actually implemented: the data directory is created `mode=0o700`, the lock `0o600`, and
-the payload travels through a `delete=False` temp file whose bytes are `fsync`ed before an atomic
-`os.replace` — so there is no window where a reader sees a half-written credential file. The module
-docstring states plainly that JSON files (and their backups) contain plaintext credentials and that
-POSIX relies on owner-only bits while Windows relies on ACLs. Nothing is encrypted, and D8R does
-not claim otherwise: the AI provider screen, the Settings footer, and the Add-source modal each
-warn the user in their own words (`Add saves connection credentials locally in plaintext; keep
-connection backups private.`, `Test and Cancel save nothing.`).
+Linux needs a usable unlocked native keyring and D-Bus session; KWallet may require
+the system `dbus-python` package. Missing/locked services, denied access, or native
+entry-size limits produce sanitized errors and explicit session-only use, never a
+silent plaintext write. Relocating JSON or changing OS account/machine does not
+transfer credentials; re-entry is required. The OS vault does not defend against
+malware in the same user account, administrators, or a compromised D8R process.
 
 **Never written:** `D8R_DATA_DIR` contents beyond the three files; transactions (`TxState` lives
 only in the process — "never part of saved local memory"), temp tables, connections, query results,

@@ -14,8 +14,9 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, Static
+from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
+from d8r.credentials import CredentialError
 from d8r.engine import D1Error, DataSource, PayloadError
 from d8r.engine.connectors import BACKENDS, profile_secrets, validate_profile
 from d8r.tui.connection import CONNECTION_TIMEOUT, ConnectionStatus, build_connection, release_source
@@ -46,6 +47,7 @@ class AddSourceModal(ModalScreen):
         self._reconnect_fields: tuple[str, ...] | None = None
         self._shown_backend: str | None = None
         self._advanced_drafts: dict[str, str] = {}
+        self._credentials_missing = False
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="add-source"):
@@ -54,8 +56,8 @@ class AddSourceModal(ModalScreen):
                         "Add a data source", id="add-source-title")
             yield Static(
                 "Open a local Parquet file or connect through Ibis, Cloudflare D1, or a SQLite snapshot. "
-                "Add saves connection credentials locally in plaintext; keep connection backups private. "
-                "Test and Cancel save nothing.",
+                "Remember credentials in your system keyring, or uncheck Remember for this session only. "
+                "Test and Cancel save nothing. Workspaces remain local plaintext.",
                 id="add-source-note",
                 markup=False,
             )
@@ -102,7 +104,7 @@ class AddSourceModal(ModalScreen):
                 yield Label("Database UUID or name", classes="field-label")
                 yield Input(placeholder="UUID recommended; not a Worker binding", id="database")
                 yield Label("API token · Account / D1 / Read", classes="field-label")
-                yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="api-token")
+                yield Input(placeholder="system keyring or this session only", password=True, id="api-token")
                 yield Label("Local snapshot · optional, overrides the live fields", classes="field-label")
                 yield Input(self._snapshot_path or "", placeholder="existing .sqlite path — skips the network", id="snapshot-path")
             with Vertical(id="postgres-fields"):
@@ -128,7 +130,7 @@ class AddSourceModal(ModalScreen):
                 yield Label("User", classes="field-label")
                 yield Input(placeholder="database role", id="postgres-user")
                 yield Label("Password", classes="field-label")
-                yield Input(placeholder="saved locally on Add; keep backups private", password=True, id="postgres-password")
+                yield Input(placeholder="system keyring or this session only", password=True, id="postgres-password")
                 yield Label("Schema", classes="field-label")
                 yield Input("public", id="postgres-schema")
                 yield Label("TLS / SSL mode", classes="field-label")
@@ -156,9 +158,11 @@ class AddSourceModal(ModalScreen):
                 yield Label("Advanced Ibis connection options · JSON object (masked)", classes="field-label")
                 yield Input("{}", password=True, id="backend-options")
                 yield Static("Use additional driver keyword arguments only; do not repeat filled fields above. "
-                             "Secrets in this JSON are saved with the connection on Add.", markup=False)
+                             "All advanced options are protected with the connection credentials.", markup=False)
             yield Label("Display name", classes="field-label")
             yield Input(placeholder="optional label for the datasource list", id="display-name")
+            yield Checkbox("Remember credentials in system keyring", value=True, id="remember-credentials")
+            yield Static(self.session.credential_warning, markup=False)
             yield Static("", id="add-source-message", markup=False)
             with Horizontal(id="add-source-buttons"):
                 yield Button("Test connection", id="test")
@@ -182,8 +186,9 @@ class AddSourceModal(ModalScreen):
             if self._initial_profile.get("kind") == "ibis":
                 with self.prevent(Select.Changed, Input.Changed):
                     self._fill_backend_profile(self._initial_profile)
-                self._reconnect_fields = self._fields()
-                self.call_after_refresh(self.action_add)
+                self._reconnect_fields = None if self._credentials_missing else self._fields()
+                if not self._credentials_missing:
+                    self.call_after_refresh(self.action_add)
                 return
             postgres = self._initial_profile.get("kind") == "postgres-live"
             profile = {key: value for key, value in self._initial_profile.items() if key != "kind"}
@@ -196,11 +201,11 @@ class AddSourceModal(ModalScreen):
                     self._fill_postgres_profile(profile)
                 else:
                     self._fill_profile(profile)
-            self._reconnect_fields = self._fields()
-            if postgres or profile.get("api_token"):
+            self._reconnect_fields = None if self._credentials_missing else self._fields()
+            if not self._credentials_missing and (postgres or profile.get("api_token")):
                 self.call_after_refresh(self.action_add)
             else:
-                self.query_one("#api-token", Input).focus()
+                self.query_one("#postgres-password" if postgres else "#api-token", Input).focus()
         elif self._snapshot_path:
             self.query_one("#snapshot-path", Input).focus()
             if self._auto_connect:
@@ -248,7 +253,9 @@ class AddSourceModal(ModalScreen):
                 self.query_one("#postgres-schema", Input).value.strip(),
                 str(self.query_one("#postgres-sslmode", Select).value),
                 json.dumps(options), self.query_one("#backend-options", Input).value,
-                self.query_one("#parquet-path", Input).value.strip())
+                self.query_one("#parquet-path", Input).value.strip(),
+                "remember" if self.query_one("#remember-credentials", Checkbox).value else "session",
+                "missing" if self._credentials_missing else "available")
 
     def _message(self, text: str, error: bool = False) -> None:
         secrets = [widget.value for widget in self.query(Input) if widget.password and widget.value]
@@ -295,6 +302,7 @@ class AddSourceModal(ModalScreen):
             self._set_busy(False)
 
     @on(Input.Changed)
+    @on(Checkbox.Changed, "#remember-credentials")
     def _fields_changed(self) -> None:
         if self._connection_form_closed:
             return
@@ -308,6 +316,9 @@ class AddSourceModal(ModalScreen):
     def _backend_selected(self) -> None:
         if self._connection_form_closed:
             return
+        if str(self.query_one("#source-backend", Select).value) != self._shown_backend:
+            self._credentials_missing = False
+            self._reconnect_fields = None
         self._show_backend()
         self._fields_changed()
 
@@ -325,13 +336,16 @@ class AddSourceModal(ModalScreen):
             self._fill_postgres_profile(profile)
 
     def _fill_postgres_profile(self, profile: dict[str, str]) -> None:
+        self._credentials_missing = bool(profile.get("credentials_missing"))
         defaults = {"host": "localhost", "port": "5432", "schema": "public"}
         for key in ("host", "port", "database", "user", "password", "schema"):
             self.query_one(f"#postgres-{key}", Input).value = profile.get(key, defaults.get(key, ""))
         self.query_one("#postgres-sslmode", Select).value = profile.get("sslmode", "prefer")
         self.query_one("#display-name", Input).value = profile.get("display", "")
         self._observed_fields = self._fields()
-        self._message("Saved PostgreSQL credentials loaded. Test or Add to connect." if profile else "")
+        self._reconnect_fields = self._fields() if profile and not self._credentials_missing else None
+        self._message("Saved credentials are unavailable. Re-enter the password to connect." if self._credentials_missing
+                      else "Saved PostgreSQL credentials loaded. Test or Add to connect." if profile else "")
 
     @staticmethod
     def _postgres_profile(fields: tuple[str, ...]) -> dict[str, str]:
@@ -353,6 +367,7 @@ class AddSourceModal(ModalScreen):
                 self._message("")
 
     def _fill_backend_profile(self, profile: dict) -> None:
+        self._credentials_missing = bool(profile.get("credentials_missing"))
         backend = profile["backend"]
         self.query_one("#source-backend", Select).value = backend
         self._show_backend()
@@ -363,7 +378,9 @@ class AddSourceModal(ModalScreen):
         self.query_one("#backend-options", Input).value = json.dumps(options)
         self.query_one("#display-name", Input).value = profile["display"]
         self._observed_fields = self._fields()
-        self._message("Saved credentials loaded. Test or Add to connect.")
+        self._reconnect_fields = self._fields() if profile.get("options") and not self._credentials_missing else None
+        self._message("Saved credentials are unavailable. Re-enter credentials and advanced options to connect."
+                      if self._credentials_missing else "Saved credentials loaded. Test or Add to connect.")
 
     @staticmethod
     def _backend_profile(fields: tuple[str, ...]) -> dict:
@@ -402,11 +419,13 @@ class AddSourceModal(ModalScreen):
         self._fill_profile(profile)
 
     def _fill_profile(self, profile: dict[str, str]) -> None:
+        self._credentials_missing = bool(profile.get("credentials_missing"))
         for name, key in (("account-id", "account_id"), ("database", "database"), ("display-name", "display")):
             self.query_one(f"#{name}", Input).value = profile.get(key, "")
         self.query_one("#api-token", Input).value = profile.get("api_token", "")
         self.query_one("#snapshot-path", Input).value = ""
         self._observed_fields = self._fields()
+        self._reconnect_fields = self._fields() if profile.get("api_token") and not self._credentials_missing else None
         self._message(
             "Saved API token loaded. Test or Add to connect." if profile.get("api_token")
             else "Enter an API token for this saved connection." if profile else ""
@@ -417,9 +436,15 @@ class AddSourceModal(ModalScreen):
         if fields[5] == "parquet":
             return self.session.build_parquet_source(fields[15], display)
         if fields[5] in BACKENDS:
+            if fields[17] == "missing":
+                options = json.loads(fields[13])
+                if not any(options[field.name] for field in BACKENDS[fields[5]].fields if field.secret) and fields[14].strip() in ("", "{}"):
+                    raise CredentialError("Re-enter the missing credentials or advanced options before connecting.")
             return self.session.build_backend_source(self._backend_profile(fields))
         if fields[5] == "postgres":
             profile = self._postgres_profile(fields)
+            if fields[17] == "missing" and not profile["password"]:
+                raise CredentialError("Re-enter the missing password before connecting.")
             if not all(profile[key] for key in ("host", "port", "database", "user", "schema")):
                 raise ValueError("Host, port, database, user and schema are required.")
             port = int(profile.pop("port"))
@@ -463,15 +488,21 @@ class AddSourceModal(ModalScreen):
                         raise ValueError("The Account ID, database and display name must not contain the API token.")
                     # Selecting an unchanged saved profile reconnects, not re-saves.
                     if fields != self._reconnect_fields:
-                        self.session.remember_d1(source.d1.account_id, source.d1.database_uuid, source.display, api_token=fields[2])
+                        self.session.remember_d1(source.d1.account_id, source.d1.database_uuid, source.display,
+                                                 api_token=fields[2], persist=fields[16] == "remember")
                 elif source.kind == "postgres-live" and fields != self._reconnect_fields:
                     profile = self._postgres_profile(fields)
                     profile["display"] = source.display
-                    self.session.remember_postgres(profile)
+                    self.session.remember_postgres(profile, persist=fields[16] == "remember")
                 elif source.kind == "ibis" and fields != self._reconnect_fields:
                     profile = self._backend_profile(fields)
                     profile["display"] = source.display
-                    self.session.remember_backend(profile)
+                    self.session.remember_backend(profile, persist=fields[16] == "remember")
+                if source.kind in ("d1-live", "postgres-live", "ibis"):
+                    detail = ("Connected using saved credentials." if fields == self._reconnect_fields else
+                              "Credentials saved in system keyring." if fields[16] == "remember" else
+                              "Connected for this session only; credentials were not saved.")
+                    self.app.notify(detail, title="Connection credentials")
                 self._built = None  # ownership passes to the app's dismissal callback
                 self._connection_form_closed = True
                 self.dismiss(source)
@@ -486,6 +517,10 @@ class AddSourceModal(ModalScreen):
         except TimeoutError:
             if not self._connection_form_closed and generation == self._generation and fields == self._fields():
                 self._message(f"Connection timed out after {self.CONNECTION_TIMEOUT:g}s. Retry to connect.", error=True)
+        except CredentialError as exc:
+            if not self._connection_form_closed and generation == self._generation and fields == self._fields():
+                self._message(f"{exc} Re-enter credentials or unlock your system keyring and retry; "
+                              "uncheck Remember to connect for this session only.", error=True)
         except (D1Error, PayloadError, OSError, RuntimeError, ValueError) as exc:
             if not self._connection_form_closed and generation == self._generation and fields == self._fields():
                 self._message(self._connection_error(fields) if fields[5] == "postgres" else str(exc), error=True)

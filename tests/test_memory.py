@@ -95,7 +95,7 @@ def test_failed_replace_preserves_file_registry_and_profiles(sources, monkeypatc
 
 @pytest.mark.parametrize("contents", [
     b'{"version":',
-    b'{"version":2,"functions":[],"d1_profiles":[]}',
+    b'{"version":3,"functions":[],"d1_profiles":[]}',
     b'{"version":true,"functions":[],"d1_profiles":[]}',
     b'{"version":1,"version":1,"functions":[],"d1_profiles":[]}',
     b'{"version":1,"functions":[{"name":"bad","params":{},"body":"","description":""}],"d1_profiles":[]}',
@@ -299,7 +299,7 @@ def test_settings_and_ai_credentials_survive_restart(sources):
     assert "first-key" not in restarted.settings_path.read_text(encoding="utf-8")
 
 
-def test_legacy_ai_settings_fill_limits_without_rewriting(sources, tmp_path):
+def test_legacy_ai_settings_migrate_and_fill_limits(sources, tmp_path):
     path = tmp_path / "settings.json"
     contents = json.dumps({"ai": {
         "base_url": "https://provider.example/v1", "model": "test-model",
@@ -316,7 +316,11 @@ def test_legacy_ai_settings_fill_limits_without_rewriting(sources, tmp_path):
     assert not session.ai_test_queries
     assert session.ai_allow_schema_refreshes
     assert not session.ai_auto_accept
-    assert path.read_bytes() == contents
+    assert b"existing-key" not in path.read_bytes()
+    assert json.loads(path.read_bytes())["version"] == 2
+    assert session.ai_config.api_key == "existing-key"
+    assert Session(sources, data_dir=tmp_path).ai_config == session.ai_config
+    assert "backups" in session.credential_warning
 
 
 @pytest.mark.parametrize("contents", [

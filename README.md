@@ -80,9 +80,10 @@ environment updated, and run it as a normal user rather than as administrator.
 - Use a **read-only database role** for review. For remote PostgreSQL, prefer
   **`verify-full`** with your provider's certificate configuration; the form's
   default `prefer` does not guarantee encryption or verify the server.
-- Saved passwords/API keys, query history, and AI chats are **plaintext** under
-  `~/.d8r` (or `D8R_DATA_DIR`). Protect that directory and its backups; do not
-  commit them or share exported results. See [Configuration and backups](#configuration-and-backups).
+- Saved passwords/API keys use the **OS credential store**, through Python's
+  `keyring` library. Query history, AI chats, and connection metadata remain
+  plaintext under `~/.d8r` (or `D8R_DATA_DIR`); protect them and exported results.
+  See [Configuration and backups](#configuration-and-backups).
 - Row limits bound returned data, **not query cost**. Large files, joins, and
   aggregations can still consume substantial memory, CPU, disk, or database
   resources. Start with small queries and appropriate database-side limits.
@@ -246,7 +247,9 @@ Open Settings with `ctrl+comma`, select **AI provider**, then press Enter or cli
 **Sample records per read**, **Maximum attempts**, or **Request timeout**.
 The provider form opens with that field focused. Edit an OpenAI-compatible
 **Chat Completions** base URL (including `/v1`), model, and masked API key, then
-choose **Save** to persist changes; **Cancel** or Escape discards them.
+choose **Save**. Leave **Remember** enabled to save the key in your system keyring;
+turn it off to use this provider configuration for the current session only.
+**Cancel** or Escape discards form changes.
 A full `/chat/completions` URL also works. This calls your provider;
 D8R does not host an endpoint or use OMP as a dependency. The separate OpenAI
 Responses API is not supported by this adapter.
@@ -804,8 +807,10 @@ Python-version support varies. DataFusion requires a native wheel. The form
 documents each backend's fields and additional requirements; unavailable drivers
 produce an actionable error, never a fallback to demo data.
 
-Only **Add** saves credentials in local plaintext `memory.json`. Test/Cancel save
-nothing. Saved connections participate in the same startup, source-picker and
+With **Remember credentials in system keyring** enabled, **Add** saves public
+connection metadata in `memory.json` and secrets in the OS credential store.
+Turn Remember off for a session-only connection. Test/Cancel save nothing.
+Saved connections participate in the same startup, source-picker and
 Run reconnection flow as PostgreSQL/D1. Workspace files store opaque target
 identities, not these credentials. Credential rotation keeps the target identity;
 changing the backend, catalog/schema or user creates a distinct target. Protect
@@ -847,9 +852,10 @@ Run and Compile can load metadata for newly created or otherwise unindexed
 PostgreSQL tables on demand. Compile never executes the query. Reconnect to
 refresh the explorer and IntelliSense after external schema changes.
 
-Use **Test connection** before **Add**. Only Add saves the profile and password
-in local `memory.json`; Test and Cancel save nothing. Password whitespace is
-preserved. Saved profiles restore disconnected; the selected profile reconnects
+Use **Test connection** before **Add**. With **Remember** enabled, Add saves
+the profile metadata in `memory.json` and the password in your system keyring;
+with Remember off, the connection is session-only. Test and Cancel save nothing.
+Password whitespace is preserved. Saved profiles restore disconnected; the selected profile reconnects
 after Mount without executing, and other profiles reconnect when selected or on
 Run. Changing the SQL dialect affects rendering, not the database on which Run executes.
 
@@ -910,12 +916,12 @@ Press `ctrl+o`, or open Settings (`ctrl+comma`) → **Data source** →
 4. Enter the **Account ID**, **Database UUID or name**, and masked **API token**.
    Optionally give the connection a display name. Leave **Local snapshot** blank
    to connect to hosted D1.
-5. **Test connection** discovers the real tables and row counts without
-   registering or saving anything. **Add** activates the live source and saves
-   its account ID, resolved database UUID, display name, and API token. Connection work runs
-   in the background; editing fields or cancelling discards the pending result.
-   Row counts are fetched in batches of at most five tables/views to respect
-   Cloudflare's compound-SELECT limit; larger schemas are discovered in full.
+5. **Test connection** performs a lightweight authenticated probe without
+   registering or saving anything. **Add** activates the live source. With
+   **Remember** enabled it saves connection metadata in JSON and the API token
+   in the system keyring; with Remember off it is session-only. Connection work
+   runs in the background; editing fields or cancelling discards the pending
+   result. Background schema indexing reads metadata, never row counts.
 
 On later launches, saved D1 profiles remain in the main **datasource dropdown**,
 Settings → **Data source**, and the function editor's source picker. Selecting a
@@ -943,8 +949,8 @@ builds a fresh file rather than reusing pages from an existing database.
 
 Live sources ship their compiled SQLite SQL to Cloudflare's D1 REST API and run
 on the real engine there; snapshots run on a real SQLite engine in-process. The
-**API token** is used per request and saved locally on **Add**, or on **Connect**
-when you change the saved profile's fields. It is never
+**API token** is used per request and stored in the system keyring on **Add**, or
+on **Connect** after fields change, only with **Remember** enabled. It is never
 logged or displayed unmasked. **Test connection** and **Cancel** save nothing.
 
 ## Configuration and backups
@@ -960,16 +966,17 @@ uv run d8r
 On macOS/Linux: `D8R_DATA_DIR=/path/to/d8r-home uv run d8r`.
 An explicit `Session(data_dir=...)` takes precedence for embedded/headless use.
 
-| File | Saved contents |
+| Storage | Saved contents |
 | --- | --- |
-| `settings.json` | Intellisense, pane visibility and `pane_sizes`, selected source/dialect, default returned rows, AI provider URL/model/API key, tool-round/call/sample limits, attempts, timeout, sample/schema permissions and automatic draft edits |
-| `memory.json` | Custom functions keyed by stable source identity; D1 profiles and API tokens; PostgreSQL and generic Ibis backend profiles and credentials |
+| `settings.json` | App preferences; AI provider URL/model/limits and an opaque API-key reference, not the key |
+| `memory.json` | Source-scoped functions; public database profile metadata and opaque credential references, not passwords/tokens/advanced options |
+| OS credential store | AI API keys, D1 tokens, PostgreSQL passwords, generic backend secret fields and advanced options |
 | `workspace.json` | Source-local last page/view/function draft, named pages and carets, query history, target-scoped AI conversations/composer drafts, source references and local SQLite/Parquet paths |
 
 These files are versioned, editable JSON. Toggle preferences save immediately;
 the provider and default-row forms require **Save**. Import only fills the
-provider form, and Cancel discards it. D1/PostgreSQL credentials save on **Add** or after
-edited fields are submitted with **Connect**; function definitions persist on
+provider form, and Cancel discards it. Remembered database credentials save to the
+system keyring on **Add**, or **Connect** after editing fields; function definitions persist on
 **Save**/**Run preview** or Delete, explicit user-requested main-chat saves, or
 manual **Save function** on workspace preview proposals. Workspace drafts and
 histories autosave independently. Session loading never connects, executes, or saves a
@@ -1000,11 +1007,11 @@ resets its dismissal. Whole-query offers never appear inside function bodies and
 respect the IntelliSense switch. Space and arrow keys retain their usual editing
 and suggestion-navigation roles.
 
-A `settings.json` example (omitted keys use defaults):
+A `settings.json` example (omitted preference fields use defaults):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "intellisense": true,
   "panes": {"results": true, "sql": true, "history": false, "schema": true},
   "source": "demo",
@@ -1016,7 +1023,7 @@ A `settings.json` example (omitted keys use defaults):
   "ai": {
     "base_url": "https://provider.example/v1",
     "model": "your-model",
-    "api_key": "",
+    "api_key_ref": null,
     "max_attempts": 3,
     "timeout": 60,
     "max_tool_rounds": 10,
@@ -1026,24 +1033,60 @@ A `settings.json` example (omitted keys use defaults):
 }
 ```
 
-Leave `ai` out for an unconfigured provider. Unknown keys or invalid values
-produce a startup error rather than being silently discarded. Changes made
-outside the app take effect on restart, not through live reload.
+Set the URL/model to empty strings and keep `api_key_ref: null` for an unconfigured
+provider. `null` explicitly means no saved key; configure real keys through the
+provider form rather than editing credential references. Unknown fields or invalid
+values produce a startup error instead of being silently discarded. External edits
+take effect on restart, not through live reload.
 
-**Back up all three JSON files to retain settings, functions, credentials, and
-your workspace. They are plaintext, not encrypted.** In addition to credentials
-in settings/memory, workspace chats can contain schema, sampled data, query text,
-and unsent drafts. Keep backups private and never commit them to source control.
-Restore files into the chosen home while D8R is closed. New directories/files
-are owner-only on POSIX; Windows uses filesystem ACLs. Result buffers, temporary
-tables, transactions, partial AI streams and diagnostic logs remain memory-only.
+**Back up the three JSON files to retain preferences, functions, profile metadata,
+and your workspace—not the credentials themselves.** They are not encrypted:
+workspace chats can contain schema, sampled data, query text, and unsent drafts.
+Keep backups private and never commit them to source control. Restore files while
+D8R is closed. New directories/files are owner-only on POSIX; Windows uses filesystem
+ACLs. Result buffers, temporary tables, transactions and partial AI streams remain memory-only.
+
+### Credential storage and migration
+
+D8R uses [`keyring`](https://github.com/jaraco/keyring), not custom encryption.
+The library automatically discovers native backends. D8R accepts its built-in
+Windows Credential Manager, macOS Keychain, and Linux Secret Service/KWallet
+implementations; null, plaintext-file, and arbitrary third-party backends are not
+accepted as secure storage. No `keyrings.alt`, master-password file, or application
+encryption key is installed.
+
+Linux needs an available, unlocked desktop credential service and its D-Bus session;
+KWallet's backend also needs the system `dbus-python` dependency. Installing a Python
+library cannot provision or unlock an OS vault. If none is available (including on
+headless machines), turn **Remember** off for explicit session-only use. A denied,
+locked, or oversized credential save stays in the form with an error—there is no
+silent plaintext fallback. OS entry-size limits apply, including to large advanced
+JSON options. Unrelated preference/function saves never persist session-only secrets.
+Deliberately passwordless connections and keyless local AI providers need no vault;
+their JSON reference is explicitly `null`, distinct from a missing saved secret.
+
+On loading legacy version-1 settings/memory, D8R validates the file, writes each
+secret to the keyring, and verifies read-back before atomically replacing plaintext
+fields with version-2 references. Failed migration leaves the original file intact
+and warns that plaintext still remains; unlock/configure your vault and restart to
+retry. It does not create a plaintext backup. **Existing backups, snapshots and
+previous exports are not erased or encrypted by migration.**
+
+Credential references are scoped to the resolved D8R data directory and your OS
+credential store. Moving JSON files to another directory, OS account, or machine
+does not transfer secrets: re-enter them in the connection/provider form. A missing
+reference preserves the saved target and draft but blocks automatic connection or
+an AI request rather than trying blank credentials. Native stores protect secrets
+at rest; they do not isolate D8R from malware running as you or an administrator.
+
 
 For an existing installation, copy `memory.json` from the former platform data
 directory into `~/.d8r`, or point `D8R_DATA_DIR` at that existing directory.
 Former defaults were `%LOCALAPPDATA%\d8r` on Windows,
 `~/Library/Application Support/d8r` on macOS, and `$XDG_DATA_HOME/d8r` (or
-`~/.local/share/d8r`) on Linux. No files are moved automatically. Old profiles
-without tokens load unchanged; their next **Add**/**Connect** saves the supplied token.
+`~/.local/share/d8r`) on Linux. No files are moved automatically. Legacy plaintext
+credentials migrate as described above; already-migrated profiles require their
+original vault/directory or re-entry. Token-free profiles still require a token.
 
 Writes use a temporary file, a save lock, and atomic replacement. Failed writes
 leave saved data and current settings unchanged; unsaved workspace drafts and

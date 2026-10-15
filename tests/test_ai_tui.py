@@ -8,7 +8,7 @@ from copy import deepcopy
 
 import httpx
 import pytest
-from textual.widgets import Button, Input, OptionList, Static, TabbedContent, TextArea
+from textual.widgets import Button, Checkbox, Input, OptionList, Static, TabbedContent, TextArea
 
 from d8r.ai import client
 from d8r.ai.client import AIConfig
@@ -171,9 +171,9 @@ def test_provider_fields_remain_keyboard_reachable_on_small_screen():
             app.push_screen(AIProviderScreen(app))
             await pilot.pause()
             form = app.screen
-            for field in ("ai-base-url", "ai-model", "ai-api-key", "ai-tool-rounds",
+            for field in ("ai-base-url", "ai-model", "ai-api-key", "ai-remember-credentials", "ai-tool-rounds",
                           "ai-tool-calls", "ai-sample-rows", "ai-attempts", "ai-timeout"):
-                control = form.query_one(f"#{field}", Input)
+                control = form.query_one(f"#{field}", Checkbox if field == "ai-remember-credentials" else Input)
                 assert app.focused is control
                 assert await pilot.click(control)
                 await pilot.press("tab")
@@ -381,6 +381,9 @@ def test_runtime_query_check_leaves_editor_history_and_visible_results_unchanged
             app.editor.focus()
             await pilot.press("ctrl+enter")
             await app.workers.wait_for_complete()
+            # Settle the deliberate editor change before measuring AI effects;
+            # its debounced autosave is independent of the query-check tool.
+            app._flush_workspace()
             table = app.query_one("#results-table", ResultsTable)
             visible = (list(table.raw_columns), deepcopy(table.raw_rows), table.result_total)
             assert list(table.raw_columns) == ["user_id"]

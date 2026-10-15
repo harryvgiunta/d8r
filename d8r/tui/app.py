@@ -353,6 +353,9 @@ class D8RApp(App):
         if self.session.memory_error:
             self._set_status(self.session.memory_error)
             self.notify(self.session.memory_error, title="Saved data could not be loaded", severity="error", timeout=15)
+        if self.session.credential_warning:
+            self._set_status(self.session.credential_warning)
+            self.notify(self.session.credential_warning, title="Credential storage", severity="warning", timeout=15)
         self.editor.focus()
         self._queue_workspace_save()
         self._flush_workspace()
@@ -1287,10 +1290,12 @@ class D8RApp(App):
         if self.refuse_busy("Connect data source"):
             return
         self.palette.close()
-        missing_credentials = (profile is not None and "account_id" in profile
-                               and not profile.get("api_token"))
+        missing_credentials = (profile is not None and
+                               (profile.get("credentials_missing") or
+                                ("account_id" in profile and not profile.get("api_token"))))
         if (profile is None and snapshot_path is None) or missing_credentials:
-            self._set_status("This source is disconnected. Add its connection details to reconnect.")
+            self._set_status("Saved credentials are unavailable. Re-enter them to reconnect." if missing_credentials else
+                             "This source is disconnected. Add its connection details to reconnect.")
             if prompt_for_credentials:
                 self.push_screen(AddSourceModal(self.session, profile=profile, snapshot_path=snapshot_path), connected)
             return

@@ -389,6 +389,11 @@ def _identity_value(value):
 
 def profile_id(profile: dict) -> str:
     """Stable opaque target identity: secrets/display excluded, principals retained."""
+    if profile.get("credentials_missing") is True:
+        identity = profile.get("connection_id")
+        if isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity):
+            return identity
+        raise BackendConnectionError("Saved credentials are unavailable; re-enter them before connecting")
     normalized = validate_profile(profile)
     identity = {"backend": normalized["backend"], "options": _identity_value(normalized["options"])}
     encoded = json.dumps(identity, sort_keys=True, ensure_ascii=True, separators=(",", ":"))

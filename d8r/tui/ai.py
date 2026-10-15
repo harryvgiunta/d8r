@@ -24,6 +24,7 @@ from textual.timer import Timer
 from d8r.ai import client
 from d8r.ai.context import AIContext, AIProposal, AIQuestion
 from d8r.ai.diagnostics import AIDiagnostics
+from d8r.credentials import CredentialError
 from d8r.engine.connectors import profile_secrets
 
 
@@ -314,6 +315,10 @@ class AIChats:
         ])
         try:
             config.validate()
+        except CredentialError as exc:
+            chat.status_text = str(exc)
+            self.changed(chat)
+            return False
         except ValueError:
             chat.status_text = "Configure Settings → AI provider with a valid URL, model and request options."
             self.changed(chat)

@@ -62,14 +62,13 @@ def test_document_restart_flushes_last_edit_and_restores_missing_live_target(tmp
             assert reopened.editor.cursor_location == (1, 8)
             assert reopened.session.source_key() == target
             assert reopened.query_one("#source-select", Select).value == reopened.session.active_id
-            assert "disconnected" in reopened.session.source.display
+            assert not reopened.session.source_connected()
             assert not reopened.query_one("#schema-tree").root.children
             assert reopened.query_one("#dialect-select", Select).value == "sqlite"
             assert reopened.query_one("#history-table", DataTable).row_count == 0
             assert reopened.query_one("#results-table", DataTable).row_count == 0
             assert reopened.query_one("#sql-text", TextArea).text == ""
             assert not isinstance(reopened.screen, AddSourceModal)
-            assert "connection details" in str(reopened.query_one("#status", Static).content)
             assert reopened._ai_target().identity == identity
 
     asyncio.run(restore())

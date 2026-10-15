@@ -59,6 +59,36 @@ def _isolated_memory(tmp_path, monkeypatch):
     monkeypatch.setenv("D8R_DATA_DIR", str(tmp_path / "d8r-data"))
 
 
+@pytest.fixture(autouse=True)
+def credential_backend(monkeypatch):
+    """Deterministic OS boundary; no test can read or write the user's keyring."""
+    from keyring.backend import KeyringBackend
+    from keyring.errors import PasswordDeleteError
+    from d8r import credentials
+
+    class MemoryKeyring(KeyringBackend):
+        priority = 1
+
+        def __init__(self):
+            self.values = {}
+
+        def get_password(self, service, username):
+            return self.values.get((service, username))
+
+        def set_password(self, service, username, password):
+            self.values[service, username] = password
+
+        def delete_password(self, service, username):
+            try:
+                del self.values[service, username]
+            except KeyError:
+                raise PasswordDeleteError("missing test credential") from None
+
+    backend = MemoryKeyring()
+    monkeypatch.setattr(credentials, "_secure_backend", lambda: backend)
+    return backend
+
+
 @pytest.fixture(scope="session")
 def sources() -> dict[str, DataSource]:
     """The registry the UI holds: `demo` first, then every mock, in order."""

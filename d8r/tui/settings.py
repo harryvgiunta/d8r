@@ -15,12 +15,13 @@ from textual.binding import Binding
 from textual.content import Content
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, Static
+from textual.widgets import Button, Checkbox, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from d8r.ai.client import AIConfig
 from d8r.ai.config import import_yolo_config
 
+from d8r.credentials import CredentialError
 from d8r.engine import DIALECT_BY_NAME, DIALECTS
 from d8r.themes import THEMES, theme_label
 
@@ -170,7 +171,8 @@ class SettingsScreen(ModalScreen[None]):
         }
         self.query_one("#settings-description", Static).update(
             f"{descriptions[self.menu]}\nSettings: {self.session.settings_path}\n"
-            "Settings and connection backups contain plaintext database credentials and API keys. Keep them private."
+            "Credentials use the system keyring when remembered. Workspaces and chats remain plaintext."
+            + (f"\n{self.session.credential_warning}" if self.session.credential_warning else "")
         )
         action = {
             "general": "enter / click toggle or edit",
@@ -506,8 +508,8 @@ class AIProviderScreen(ModalScreen[None]):
         with VerticalScroll(id="ai-settings"):
             yield Static("AI provider · OpenAI chat completions")
             yield Static(
-                f"Save writes provider settings and the API key to {self.ide.session.settings_path}. "
-                "Settings and connection backups contain plaintext secrets; keep them private. "
+                "Remember stores the API key in your system keyring and provider settings locally. "
+                "Uncheck Remember to use this entire configuration for this session only. "
                 "Completed chats and drafts are saved locally. Sending a message shares the document, "
                 "history and permitted schema/sample reads and query-check evidence with this provider. Use HTTPS for remote providers.", markup=False,
             )
@@ -517,6 +519,8 @@ class AIProviderScreen(ModalScreen[None]):
             yield Input(config.model, placeholder="yolo", id="ai-model")
             yield Static("API key (leave blank for an unauthenticated local provider)")
             yield Input(config.api_key, password=True, id="ai-api-key")
+            yield Checkbox("Remember key in system keyring and provider settings", value=True, id="ai-remember-credentials")
+            yield Static(self.ide.session.credential_warning, markup=False)
             yield Static("AI turns/tool rounds (1–50)")
             yield Input(str(config.max_tool_rounds), type="integer", id="ai-tool-rounds")
             yield Static("Rounds count model context batches, not chat messages. After the round budget, "
@@ -568,10 +572,22 @@ class AIProviderScreen(ModalScreen[None]):
             return
         try:
             config.validate()
-            self.ide.session.update_settings(ai=config)
+            if (self.ide.session.ai_credentials_missing and not config.api_key
+                    and config.base_url == self.ide.session.ai_config.base_url):
+                raise CredentialError("Re-enter the missing API key before applying this provider.")
+            remember = self.query_one("#ai-remember-credentials", Checkbox).value
+            self.ide.session.update_settings(ai=config, persist_ai=remember)
+        except CredentialError as exc:
+            self.query_one("#ai-settings-error", Static).update(
+                f"{exc} Unlock your system keyring and retry, or uncheck Remember for this session only."
+            )
+            return
         except ValueError as exc:
             self.query_one("#ai-settings-error", Static).update(str(exc))
             return
+        self.ide.notify("API key saved in system keyring; provider settings saved locally." if remember and config.api_key else
+                        "Provider settings saved locally." if remember else
+                        "Provider configuration applied for this session only; nothing saved.", title="AI provider")
         self.dismiss(None)
 
     @on(Button.Pressed, "#ai-settings-import")
@@ -584,7 +600,9 @@ class AIProviderScreen(ModalScreen[None]):
         self.query_one("#ai-base-url", Input).value = config.base_url
         self.query_one("#ai-model", Input).value = config.model
         self.query_one("#ai-api-key", Input).value = config.api_key
-        self.query_one("#ai-settings-error", Static).update("Imported into this form only; Save persists these settings and the API key.")
+        self.query_one("#ai-settings-error", Static).update(
+            "Imported into this form only; Save applies your Remember or session-only choice."
+        )
 
     @on(Button.Pressed, "#ai-settings-cancel")
     def action_cancel(self) -> None:

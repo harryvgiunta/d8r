@@ -10,6 +10,7 @@ dependencies = [
     "pyarrow-hotfix==0.7",
     "httpx==0.28.1",
     "textual==8.2.7",
+    "keyring==25.7.0",
 ]
 
 [project.optional-dependencies]

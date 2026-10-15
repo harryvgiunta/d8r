@@ -15,6 +15,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, LoadingIndicator, Static
 
+from d8r.credentials import CredentialError
 from d8r.engine import DataSource
 from d8r.engine.connectors import BackendConnectionError, close_backend_connection, profile_secrets
 
@@ -94,6 +95,8 @@ def build_saved_source(
     snapshot_path: str | None = None,
 ) -> DataSource:
     """Build only; callers own registration and stale-target checks."""
+    if profile is not None and profile.get("credentials_missing"):
+        raise CredentialError("Saved credentials are unavailable. Re-enter them before connecting.")
     if snapshot_path:
         return session.build_sqlite_source(snapshot_path)
     if profile is None:
