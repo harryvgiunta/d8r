@@ -1,8 +1,17 @@
 [project]
 name = "d8r"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "A keyboard-first IDE for querying data through Ibis, in the terminal"
 requires-python = ">=3.13"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Harry Giunta" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "ibis-framework[duckdb,postgres,sqlite,trino]==12.0.0",
     "psycopg[binary]==3.3.6",
@@ -34,6 +43,12 @@ risingwave = ["ibis-framework[risingwave]==12.0.0"]
 snowflake = ["ibis-framework[snowflake]==12.0.0"]
 sqlite = ["ibis-framework[sqlite]==12.0.0"]
 trino = ["ibis-framework[trino]==12.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/harryvgiunta/d8r"
+Documentation = "https://github.com/harryvgiunta/d8r/blob/master/README.md"
+Issues = "https://github.com/harryvgiunta/d8r/issues"
+Source = "https://github.com/harryvgiunta/d8r"
 
 [project.scripts]
 d8r = "d8r.tui.app:main"

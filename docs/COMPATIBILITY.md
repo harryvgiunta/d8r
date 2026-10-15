@@ -1,16 +1,15 @@
 # D8R — sectors, functionality, function compatibility
 
 The application-wide map: what each sector does, what the language can
-express, and — measured, not remembered — which catalog functions each
-dialect and each live backend can actually compile and run.
+express, and where compiler support differs from execution support.
 
-The compatibility facts here were produced by probing the installed
-ibis 12.0.0 directly (`uv run python probe_functions.py`, which compiles
-one representative call per function for all 19 compilable dialects and
-executes it on each live connection) and by reading each fact back off
-`capabilities_for` (`d8r/engine/datasources.py`), which derives the same
-answers from the app's own live probes. Where a function is advertised
-per source, the probe agrees with it.
+The tables summarize representative probes against ibis 12.0.0 and the
+capabilities advertised by `capabilities_for` (`d8r/engine/datasources.py`).
+Compiler probes establish rendering support, not successful execution on a
+vendor server. The offline tests execute local DuckDB and SQLite; D1 HTTP
+transport is mocked over a local SQLite engine. PostgreSQL integration is
+opt-in and was not exercised for this alpha. Generic adapters are not
+live-certified. See [public alpha evidence and limitations](ALPHA.md).
 
 ---
 
@@ -38,9 +37,9 @@ tokens ≤ 640 chars; ≤ 16 nested / 256 total function calls per parse.
 
 |Module|Functionality|
 |---|---|
-|`datasources.py`|The registry: `demo` (Parquet on DuckDB), four vendor mocks, runtime-added SQLite snapshots (`d1`), live Cloudflare D1 (`d1-live`), live PostgreSQL (`postgres-live`). `DIALECTS` (20 compile targets), `CAPABILITIES`, `capabilities_for` (per-source truth: function lists, operator lists, `supports` flags — live-probed per connection through `_probe_flags`/`_unrenderable_on`, plus a `pg_proc` check for extension-backed functions like `levenshtein`).|
-|`connectors.py`|Real `kind="ibis"` adapters for every advertised backend except the dedicated PostgreSQL path; backend form metadata, profile normalization/identity, safe credential handling, namespace-only discovery and owned-resource disposal. Optional drivers and native runtimes remain explicit prerequisites.|
-|`expression.py`|`build` — payload → `ir.Table`: select items (column / literal / aggregate / temporal / scalar call / regex / rank / window / case / subquery), the recursive `_condition_tree` for `\where` (ands, or-groups, `( … )` groups), joins incl. the lateral correlation hoisting + top-N rewrite, set ops, `compile_sql` (render-only, any dialect).|
+|`datasources.py`|The registry: `demo` (Parquet on DuckDB), four vendor mocks, runtime-added SQLite snapshots (`d1`), Cloudflare D1 (`d1-live`), PostgreSQL (`postgres-live`), local Parquet and generic Ibis sources. `DIALECTS` lists 20 compile targets. `capabilities_for` combines compiler probes, source-specific restrictions, and PostgreSQL extension discovery; these are not exhaustive execution tests.|
+|`connectors.py`|Real `kind="ibis"` adapters for every advertised backend except the dedicated PostgreSQL path; backend form metadata, profile normalization/identity, safe credential handling, namespace-only discovery and owned-resource disposal. Optional drivers and native runtimes remain explicit prerequisites; adapter availability is not live-integration certification.|
+|`expression.py`|`build` — payload → `ir.Table`: select items (column / literal / aggregate / temporal / scalar call / regex / rank / window / case / subquery), the recursive `_condition_tree` for `\where` (ands, or-groups, `( … )` groups), joins incl. the lateral correlation hoisting + top-N rewrite, set ops, `compile_sql` (render-only, subject to dialect and expression support).|
 |`execute.py`|`execute` (build → compile → run), `execute_remote` (live D1: the compiled SQLite SQL POSTed to D1's HTTP API), `materialize` (`\temp`).|
 |`tx.py`|Transactions, savepoints, temp tables — the only DDL in the app, issued through the backend handle (`CREATE TEMPORARY TABLE … AS`, temp-namespace-qualified).|
 |`d1api.py`|Cloudflare D1 REST client (the user's token, never logged).|
@@ -78,8 +77,9 @@ capability flags, §4.4).
 
 ## 3. Function catalog (the callable set)
 
-Everything the language can compute. Arity and argument kinds are enforced
-by the parser (`d8r/query/functions.py`); result kinds are ibis's.
+The scalar families covered by the tables below. Arity and argument kinds are
+enforced by the parser (`d8r/query/functions.py`); result kinds are ibis's.
+This is not an exhaustive compatibility matrix for every language feature.
 
 **Aggregates** (`\select <fn>(<col>)`, exactly five):
 `sum`, `avg`, `count`, `min`, `max` — over every dtype family the column
@@ -108,37 +108,38 @@ ibis layer, not the grammar.
 
 ## 4. Function × language compatibility
 
-Two independent questions, answered separately and measured live:
+Two independent questions:
 
-* **Compile** — `ctrl+k` renders the document's SQL for *any* of the 19
-  compilable dialects without executing anything (the 20th, PySpark, is
-  available only with its live Spark runtime). A function "compiles" for a dialect
-  when ibis has a rendering rule there.
-* **Execute** — a source runs a function only when its own connection
-  answers; `capabilities_for` hides what it cannot, and the palette stops
-  offering it.
+* **Compile** — `ctrl+k` renders supported expressions without executing the
+  query. There are 19 offline dialect targets; the 20th, PySpark, requires
+  its real Spark runtime. A rendering rule for one function does not mean
+  every document, argument type or combination compiles for that target.
+* **Execute** — Run uses the active source, not the selected rendering
+  dialect. A rendered expression can still fail because of server versions,
+  missing extensions/UDFs, types, permissions or runtime prerequisites.
+  `capabilities_for` filters known gaps; it is not a live certification suite.
 
-The execution matrices below describe the measured DuckDB/SQLite/PostgreSQL/D1
-baseline, not live-server certification of every new connector. Generic sources
-probe their own compilers offline and label their backend honestly. They enable
-transactions/temp tables only for the existing DuckDB/SQLite implementations.
-Connection setup and native prerequisites are documented in the README's
-**Add Trino or another Ibis database** section.
+The matrices below separate local execution, mocked transport, optional
+integration coverage and compiler-only evidence. Generic sources probe their
+compilers offline and enable transactions/temp tables only for the existing
+DuckDB/SQLite implementations. Connection setup and native prerequisites are
+documented in the [user guide](USER_GUIDE.md#add-trino-or-another-ibis-database).
 
-### 4.1 Universal (compiles 19/19 and executes on every live backend)
+### 4.1 Common functions are not universal guarantees
 
-`sum`, `avg`, `count`, `min`, `max` · `year`, `month`, `day`, `quarter`,
-`hour`, `minute`, `second` · `rank`, `dense_rank`, `row_number` ·
-`string`, `coalesce`, `nullif` · `concat`, `concat_ws`, `lower`, `upper`,
-`capitalize`, `length`, `strip`, `lstrip`, `rstrip`, `substr`, `left`,
-`right`, `replace`, `contains`, `startswith`, `endswith`, `repeat`,
-`reverse`, `lpad`, `rpad`, `find` (the last with `concat_ws` compiling
-everywhere except Exasol).
+Aggregates, temporal extraction, ranks, cross-type functions and many string
+functions have broad compiler support. They are not guaranteed to execute on
+every advertised backend. For example, `concat_ws` has an Exasol rendering
+gap, while D1 excludes `reverse`, `repeat`, `lpad` and `rpad` because their
+SQLite translations require UDFs unavailable to its remote execution path.
+Check the target-specific gaps below and test the actual query on the intended
+server before relying on it.
 
 ### 4.2 Compile matrix — per-dialect gaps
 
-Every language function compiles on every dialect **except** the gaps
-below (measured against ibis 12.0.0; `·`-listed = cannot render):
+Representative scalar calls have the following recorded rendering gaps against
+ibis 12.0.0 (`·`-listed = cannot render). This is compiler evidence only, not
+proof of arbitrary-query support or successful vendor-server execution.
 
 |Dialect|Does not compile|
 |---|---|
@@ -165,22 +166,24 @@ below (measured against ibis 12.0.0; `·`-listed = cannot render):
 
 Notes:
 
-* `convert_base` is effectively **render-only on this backend set**: no
-  live source of this app can run it, and only Impala can even compile
-  it. It remains in the catalog because custom functions may reach it.
+* `convert_base` has an offline rendering rule only for Impala in this matrix.
+  The local execution baseline cannot run it; live Impala was not exercised.
 * The SQLite compile gaps are about the *plain* dialect; the app's local
   snapshot connection closes some of them with registered UDFs (§4.3).
 
-### 4.3 Execution matrix — live backends
+### 4.3 Execution matrix — local baseline and integration expectations
 
-What each source actually runs, per function family
-(`uv run pytest` covers these cells in `tests/test_backend_matrix.py`;
-the columns are what `capabilities_for` advertises — measured by
-compiling/executing against that very connection):
+`✓` describes advertised support for the listed family, subject to types and
+runtime prerequisites; it does not certify every call. Local DuckDB/SQLite
+have executable coverage in `tests/test_backend_matrix.py`. **The D1 column
+uses `httpx.MockTransport` with real UDF-less local SQLite, not Cloudflare.**
+**The PostgreSQL column describes opt-in integration expectations; those tests
+were not run for this alpha.** No generic vendor connector is certified here.
 
-|Function family|demo + mocks<br>(DuckDB)|SQLite snapshot<br>(`kind="d1"`)|PostgreSQL live|Cloudflare D1<br>(live, over HTTP)|
+|Function family|demo + mocks<br>(local DuckDB)|SQLite snapshot<br>(local `kind="d1"`)|PostgreSQL<br>(opt-in; not exercised)|D1 path<br>(mocked HTTP / local SQLite)|
 |---|---|---|---|---|
-|5 aggregates, 7 temporal, 3 ranks, cross-type, plain string family|✓|✓|✓|✓|
+|5 aggregates, 7 temporal, 3 ranks, cross-type, string family excluding the rows below|✓|✓|✓|✓|
+|`reverse` / `repeat` / `lpad` / `rpad`|✓|✓|✓|✗ (UDF-dependent)|
 |`translate`|✓|✓ (UDF `_IBIS_TRANSLATE`)|✓|✗|
 |`levenshtein`|✓|✗|✗ unless `fuzzystrmatch` is installed (checked via `pg_proc`, never installed)|✗|
 |`as_date` / `as_timestamp`|✓|✗|✓|✗|
@@ -199,10 +202,12 @@ it compiles to `UPPER`/`SUBSTRING`).
 
 ### 4.4 Capability flags per source kind
 
-`supports` as advertised by `capabilities_for` (live-probed; `False`
-defaults unless the connection proves otherwise):
+`supports` as advertised by `capabilities_for`, using compiler probes and
+source-specific rules. These flags are not evidence that every operation has
+run successfully on a live server. PostgreSQL remains opt-in/unexercised in
+this alpha; D1 evidence remains mocked HTTP over local SQLite, as in §4.3.
 
-|Flag|demo / mocks<br>(DuckDB)|SQLite snapshot|PostgreSQL live|D1 live|
+|Flag|demo / mocks<br>(local DuckDB)|SQLite snapshot<br>(local)|PostgreSQL<br>(opt-in; not exercised)|D1 path<br>(mocked HTTP / local SQLite)|
 |---|---|---|---|---|
 |`groupBy` `orderBy` `limit` `distinct` `case` `cte` `like` `ilike` `window` `subquery` `lateral` `frame`|✓|✓|✓|✓|
 |`regex` (`~`, `!~`)|✓|✓ (UDF)|✓ on PostgreSQL ≥ 15 (`regexp_like`); hidden below|✗ (UDF-only rendering)|
@@ -234,11 +239,15 @@ faked D1 API whose far end is a real UDF-less SQLite engine.
 uv run python probe_functions.py > probe_matrix.json
 ```
 
-Compiles one representative ibis call per catalog function against all
-19 compilable dialects (`ibis.to_sql`, offline) and executes it on each
-live connection — demo DuckDB, the D1 snapshot, and PostgreSQL when
-`D8R_TEST_POSTGRES=1` with `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/
-`PGPASSWORD` set (the compose service: `docker compose up -d`,
-port 55433). The app's own answers come from the same mechanism at
-runtime (`_probe_flags` / `_unrenderable_on` / the `pg_proc` check), so
-palette and matrix cannot drift apart.
+Compiles one representative ibis call per catalog function against the
+19 offline dialects (`ibis.to_sql`) and executes against demo DuckDB and the
+local SQLite snapshot. PostgreSQL is added only with `D8R_TEST_POSTGRES=1`
+and `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` configured. Follow the
+canonical [development PostgreSQL setup](USER_GUIDE.md#local-postgresql-with-docker)
+for the gitignored password file, explicit Compose environment file and
+disposable integration database; a bare `docker compose up` is insufficient.
+
+This command is a reproduction procedure, not a claim that all optional
+integrations were run for the alpha. Runtime capability filtering uses
+compiler probes and the PostgreSQL `pg_proc` check; compare actual query
+results too, because advertised capabilities and execution can differ.

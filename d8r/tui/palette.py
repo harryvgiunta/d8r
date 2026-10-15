@@ -1243,7 +1243,9 @@ class CommandPalette(OptionList):
         self._sync_pending = True
         if not self._sync_scheduled:
             self._sync_scheduled = True
-            self.call_after_refresh(self._flush_queued_sync)
+            # Offer state must follow the message queue, not wait for a paint.
+            # Geometry is handled separately by reposition after layout.
+            self.call_later(self._flush_queued_sync)
 
     def _flush_queued_sync(self) -> None:
         self._sync_scheduled = False
